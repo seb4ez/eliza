@@ -11,6 +11,7 @@ import { logger } from "@elizaos/logger";
 import {
   clearStoredStewardToken,
   readStoredStewardToken,
+  type StewardTokenWriteAuthority,
   writeStoredStewardToken,
 } from "@elizaos/shared/steward-session-client";
 import {
@@ -110,8 +111,17 @@ export interface AndroidCloudClientOptions {
 
 export interface AndroidCloudCredentialStore {
   read(): Promise<string | null>;
-  write(token: string): Promise<void>;
-  clear(): Promise<void>;
+  write(
+    token: string,
+    options?: {
+      signal?: AbortSignal;
+      validate?: () => boolean;
+    },
+  ): Promise<StewardTokenWriteAuthority | null>;
+  clear(options: {
+    expectedToken: string;
+    validate?: () => boolean;
+  }): Promise<boolean>;
 }
 
 export interface AndroidCloudPendingLoginStore {
@@ -124,11 +134,11 @@ const browserCredentialStore: AndroidCloudCredentialStore = {
   async read() {
     return readStoredStewardToken()?.trim() || null;
   },
-  async write(token) {
-    await writeStoredStewardToken(token);
+  async write(token, options) {
+    return writeStoredStewardToken(token, options);
   },
-  async clear() {
-    await clearStoredStewardToken();
+  async clear(options) {
+    return clearStoredStewardToken(options);
   },
 };
 
@@ -143,6 +153,183 @@ const browserPendingLoginStore: AndroidCloudPendingLoginStore = {
     shellLocalStorage.removeItem(ANDROID_CLOUD_PENDING_LOGIN_KEY);
   },
 };
+
+const UNOBSERVED_PENDING_LOGIN = Symbol("unobserved-pending-login");
+
+interface AndroidCloudPendingLoginAuthority {
+  readonly state: string;
+  readonly value: string;
+  validate(): boolean;
+}
+
+interface PendingLoginRetirement {
+  retired: boolean;
+  superseded: boolean;
+}
+
+/**
+ * Coordinates every client instance backed by one pending-login store.
+ *
+ * Android creates a fresh client for begin, callback, cancel, and renderer
+ * recreation, while those clients share one Keystore adapter. The live value
+ * below changes synchronously before an awaited store mutation. The mutation
+ * queue then guarantees that an older clear finishes before a newer write, so
+ * an A callback can never erase B even when native plugin promises interleave.
+ */
+class AndroidCloudPendingLoginAuthorityStore {
+  private liveValue: string | null | typeof UNOBSERVED_PENDING_LOGIN =
+    UNOBSERVED_PENDING_LOGIN;
+  private mutationTail: Promise<void> = Promise.resolve();
+  private revision = 0;
+
+  constructor(private readonly store: AndroidCloudPendingLoginStore) {}
+
+  private serialize<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.mutationTail.then(operation);
+    // error-policy:J5 `result` is returned to the caller; this branch only
+    // keeps the subsequent mutation queue live after that same rejection.
+    this.mutationTail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  private setLiveValue(
+    value: string | null | typeof UNOBSERVED_PENDING_LOGIN,
+  ): number {
+    this.liveValue = value;
+    this.revision += 1;
+    return this.revision;
+  }
+
+  private isExactAuthority(value: string, revision: number): boolean {
+    return this.liveValue === value && this.revision === revision;
+  }
+
+  async readAuthority(): Promise<AndroidCloudPendingLoginAuthority | null> {
+    const stored = await this.serialize(() => this.store.read());
+    if (this.liveValue === UNOBSERVED_PENDING_LOGIN) {
+      this.setLiveValue(stored);
+    }
+    const value = this.liveValue;
+    if (value === UNOBSERVED_PENDING_LOGIN || value === null) return null;
+    const pending = parsePendingLogin(value);
+    if (!pending) return null;
+    const revision = this.revision;
+    return {
+      state: pending.state,
+      value,
+      validate: () => this.isExactAuthority(value, revision),
+    };
+  }
+
+  async persist(value: string): Promise<AndroidCloudPendingLoginAuthority> {
+    const previousValue = this.liveValue;
+    const revision = this.setLiveValue(value);
+    const pending = parsePendingLogin(value);
+    if (!pending) {
+      this.setLiveValue(previousValue);
+      throw new Error("Eliza Cloud could not create a valid sign-in attempt.");
+    }
+    const authority: AndroidCloudPendingLoginAuthority = {
+      state: pending.state,
+      value,
+      validate: () => this.isExactAuthority(value, revision),
+    };
+    try {
+      const persisted = await this.serialize(async () => {
+        if (!authority.validate()) return false;
+        await this.store.write(value);
+        if (!authority.validate()) return false;
+        const readback = await this.store.read();
+        if (!authority.validate()) return false;
+        if (readback !== value) {
+          throw new Error(
+            "Eliza Cloud could not durably preserve the pending sign-in.",
+          );
+        }
+        return true;
+      });
+      if (!persisted) {
+        throw new Error("A newer Eliza Cloud sign-in replaced this attempt.");
+      }
+      return authority;
+    } catch (error) {
+      if (authority.validate()) {
+        // A protected-store write can mutate before rejecting. Keep this
+        // attempt as the live fail-closed authority instead of reviving its
+        // predecessor without an exact native compare-and-swap result.
+        this.setLiveValue(value);
+      }
+      // error-policy:J2 preserve the protected-store cause while naming the
+      // pending-login boundary whose durable commit remained ambiguous.
+      throw new Error("Eliza Cloud could not preserve the pending sign-in.", {
+        cause: error,
+      });
+    }
+  }
+
+  async retire(
+    authority: AndroidCloudPendingLoginAuthority,
+  ): Promise<PendingLoginRetirement> {
+    if (!authority.validate()) {
+      return { retired: false, superseded: true };
+    }
+    const retirementRevision = this.setLiveValue(null);
+    try {
+      return await this.serialize(async () => {
+        if (this.revision !== retirementRevision || this.liveValue !== null) {
+          return { retired: false, superseded: true };
+        }
+        await this.store.clear();
+        const cleared = await this.store.read();
+        if (this.revision !== retirementRevision || this.liveValue !== null) {
+          return { retired: true, superseded: true };
+        }
+        if (cleared !== null) {
+          throw new Error(
+            "Eliza Cloud could not durably clear the pending sign-in.",
+          );
+        }
+        return { retired: true, superseded: false };
+      });
+    } catch (error) {
+      if (this.revision === retirementRevision && this.liveValue === null) {
+        this.setLiveValue(authority.value);
+      }
+      // error-policy:J2 preserve the protected-store cause while restoring
+      // the exact live authority that owns a retryable pending cleanup.
+      throw new Error("Eliza Cloud could not clear the pending sign-in.", {
+        cause: error,
+      });
+    }
+  }
+
+  hasExactValue(value: string): boolean {
+    return this.liveValue === value;
+  }
+
+  captureMutationValidator(): () => boolean {
+    const revision = this.revision;
+    return () => this.revision === revision;
+  }
+}
+
+const pendingLoginAuthorityStores = new WeakMap<
+  AndroidCloudPendingLoginStore,
+  AndroidCloudPendingLoginAuthorityStore
+>();
+
+function pendingLoginAuthorityStore(
+  store: AndroidCloudPendingLoginStore,
+): AndroidCloudPendingLoginAuthorityStore {
+  const existing = pendingLoginAuthorityStores.get(store);
+  if (existing) return existing;
+  const created = new AndroidCloudPendingLoginAuthorityStore(store);
+  pendingLoginAuthorityStores.set(store, created);
+  return created;
+}
 
 type JsonRecord = Record<string, unknown>;
 
@@ -264,6 +451,21 @@ function protocolFailure(
   });
 }
 
+function supersededLoginFailure(
+  authority: AndroidCloudPendingLoginAuthority,
+): AndroidCloudAuthError {
+  return new AndroidCloudAuthError(
+    "A newer Eliza Cloud sign-in replaced this callback.",
+    { attemptId: authority.state, disposition: "acknowledge" },
+  );
+}
+
+function assertPendingLoginAuthority(
+  authority: AndroidCloudPendingLoginAuthority,
+): void {
+  if (!authority.validate()) throw supersededLoginFailure(authority);
+}
+
 async function responseJson(response: Response): Promise<JsonRecord> {
   const text = await response.text();
   // An empty body is legitimate (204, and some error responses); a body that
@@ -377,15 +579,15 @@ export class AndroidCloudClient {
   readonly apiBase: string;
   private readonly fetchImpl: typeof fetch;
   private readonly credentialStore: AndroidCloudCredentialStore;
-  private readonly pendingLoginStore: AndroidCloudPendingLoginStore;
-  private pendingLogin: AndroidCloudPendingLogin | null = null;
+  private readonly pendingLoginAuthority: AndroidCloudPendingLoginAuthorityStore;
 
   constructor(options: AndroidCloudClientOptions = {}) {
     this.apiBase = resolveCanonicalDirectCloudApiBase(options.cloudApiBase);
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
     this.credentialStore = options.credentialStore ?? browserCredentialStore;
-    this.pendingLoginStore =
+    const pendingLoginStore =
       options.pendingLoginStore ?? browserPendingLoginStore;
+    this.pendingLoginAuthority = pendingLoginAuthorityStore(pendingLoginStore);
   }
 
   async readToken(): Promise<string | null> {
@@ -393,6 +595,8 @@ export class AndroidCloudClient {
   }
 
   async restoreSession(): Promise<AndroidCloudSession | null> {
+    const validatePendingLoginAuthority =
+      this.pendingLoginAuthority.captureMutationValidator();
     const token = await this.readToken();
     if (!token) return null;
     const response = await this.fetchImpl(
@@ -402,7 +606,10 @@ export class AndroidCloudClient {
       },
     );
     if (response.status === 401) {
-      await this.credentialStore.clear();
+      await this.credentialStore.clear({
+        expectedToken: token,
+        validate: validatePendingLoginAuthority,
+      });
       return null;
     }
     if (!response.ok) {
@@ -483,8 +690,7 @@ export class AndroidCloudClient {
       redirectUri,
       state,
     };
-    await this.pendingLoginStore.write(JSON.stringify(pendingLogin));
-    this.pendingLogin = pendingLogin;
+    await this.pendingLoginAuthority.persist(JSON.stringify(pendingLogin));
 
     const authorizePath = new URL(
       "/app-auth/authorize",
@@ -509,20 +715,19 @@ export class AndroidCloudClient {
   }
 
   async cancelLogin(expectedState?: string): Promise<boolean> {
-    if (expectedState) {
-      const storedPending = await this.pendingLoginStore.read();
-      const persisted = storedPending ? parsePendingLogin(storedPending) : null;
-      const currentState = persisted?.state ?? this.pendingLogin?.state ?? null;
-      if (currentState !== expectedState) return false;
+    const authority = await this.pendingLoginAuthority.readAuthority();
+    if (!authority || (expectedState && authority.state !== expectedState)) {
+      return false;
     }
-    this.pendingLogin = null;
-    await this.pendingLoginStore.clear();
-    return true;
+    const retirement = await this.pendingLoginAuthority.retire(authority);
+    return retirement.retired;
   }
 
-  private async clearTerminalLogin(expectedState: string): Promise<void> {
+  private async clearTerminalLogin(
+    authority: AndroidCloudPendingLoginAuthority,
+  ): Promise<void> {
     try {
-      await this.cancelLogin(expectedState);
+      await this.pendingLoginAuthority.retire(authority);
     } catch (err) {
       // error-policy:J6 terminal PKCE cleanup is best-effort after the protocol
       // has already decided the callback; the typed disposition must remain
@@ -539,18 +744,23 @@ export class AndroidCloudClient {
     signal?: AbortSignal,
   ): Promise<AndroidCloudLoginCompletion> {
     signal?.throwIfAborted();
-    const storedPending = await this.pendingLoginStore.read();
-    const pending =
-      (storedPending ? parsePendingLogin(storedPending) : null) ??
-      this.pendingLogin;
+    const authority = await this.pendingLoginAuthority.readAuthority();
+    signal?.throwIfAborted();
     const { callback, returnedState } = parseCanonicalCallback(callbackUrl);
-    if (!pending) {
+    if (!authority) {
       throw new AndroidCloudAuthError("No Eliza Cloud sign-in is waiting.", {
         attemptId: returnedState,
         disposition: "acknowledge",
       });
     }
-    if (!returnedState || returnedState !== pending.state) {
+    const pending = parsePendingLogin(authority.value);
+    if (!pending) {
+      throw new AndroidCloudAuthError(
+        "The pending Eliza Cloud sign-in could not be read.",
+        { attemptId: returnedState, disposition: "retry" },
+      );
+    }
+    if (!returnedState || returnedState !== authority.state) {
       throw new AndroidCloudAuthError(
         "Eliza Cloud sign-in state did not match this device.",
         { attemptId: returnedState, disposition: "acknowledge" },
@@ -558,7 +768,7 @@ export class AndroidCloudClient {
     }
     const callbackError = singleCallbackValue(callback, "error");
     if (callbackError) {
-      await this.clearTerminalLogin(pending.state);
+      await this.clearTerminalLogin(authority);
       throw new AndroidCloudAuthError(
         singleCallbackValue(callback, "error_description") ||
           "Eliza Cloud sign-in was cancelled.",
@@ -567,7 +777,7 @@ export class AndroidCloudClient {
     }
     const code = singleCallbackValue(callback, "code");
     if (!code) {
-      await this.clearTerminalLogin(pending.state);
+      await this.clearTerminalLogin(authority);
       throw new AndroidCloudAuthError(
         "Eliza Cloud returned no authorization code.",
         { attemptId: pending.state, disposition: "acknowledge" },
@@ -586,7 +796,9 @@ export class AndroidCloudClient {
       codeVerifier: pending.codeVerifier,
     };
     let terminalFailure = false;
+    let credentialRollback: StewardTokenWriteAuthority | null = null;
     try {
+      assertPendingLoginAuthority(authority);
       const tokenResponse = await this.fetchImpl(
         `${completionApiBase}/api/v1/app-auth/mobile/token`,
         {
@@ -596,7 +808,11 @@ export class AndroidCloudClient {
           body: JSON.stringify(tokenRequest),
         },
       );
+      signal?.throwIfAborted();
+      assertPendingLoginAuthority(authority);
       const exchanged = await responseJson(tokenResponse);
+      signal?.throwIfAborted();
+      assertPendingLoginAuthority(authority);
       if (!tokenResponse.ok) {
         const failure = protocolFailure(
           mobileAuthResponseError(
@@ -618,65 +834,79 @@ export class AndroidCloudClient {
         );
 
       signal?.throwIfAborted();
-      const previousSecret = await this.credentialStore.read();
-      try {
-        await this.credentialStore.write(secret);
-        if ((await this.credentialStore.read()) !== secret) {
-          throw new AndroidCloudAuthError(
-            "Eliza Cloud could not durably store the mobile session.",
-            { attemptId: pending.state, disposition: "retry" },
-          );
-        }
-        const acknowledgeResponse = await this.fetchImpl(
-          `${completionApiBase}/api/v1/app-auth/mobile/ack`,
-          {
-            method: "POST",
-            signal,
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              clientId: pending.clientId,
-              environment: pending.environment,
-              redirectUri: pending.redirectUri,
-              state: pending.state,
-              code,
-              codeVerifier: pending.codeVerifier,
-              credentialId,
-              secret,
-            }),
-          },
+      assertPendingLoginAuthority(authority);
+      credentialRollback = await this.credentialStore.write(secret, {
+        signal,
+        validate: authority.validate,
+      });
+      signal?.throwIfAborted();
+      assertPendingLoginAuthority(authority);
+      const storedSecret = await this.credentialStore.read();
+      signal?.throwIfAborted();
+      assertPendingLoginAuthority(authority);
+      if (storedSecret !== secret) {
+        throw new AndroidCloudAuthError(
+          "Eliza Cloud could not durably store the mobile session.",
+          { attemptId: pending.state, disposition: "retry" },
         );
-        const acknowledged = await responseJson(acknowledgeResponse);
-        if (!acknowledgeResponse.ok) {
-          const failure = protocolFailure(
-            mobileAuthResponseError(
-              acknowledged,
-              "Eliza Cloud could not activate the mobile session.",
-            ),
-            acknowledgeResponse.status,
-            pending.state,
-          );
-          terminalFailure = failure.disposition === "acknowledge";
-          throw failure;
-        }
-        if (
-          acknowledged.success !== true ||
-          acknowledged.status !== "acknowledged" ||
-          stringField(acknowledged.credentialId) !== credentialId
-        ) {
-          throw new AndroidCloudAuthError(
-            "Eliza Cloud returned an invalid mobile session acknowledgement.",
-            { attemptId: pending.state, disposition: "retry" },
-          );
-        }
-      } catch (error) {
-        if (previousSecret) await this.credentialStore.write(previousSecret);
-        else await this.credentialStore.clear();
-        throw error;
       }
+
+      const acknowledgeResponse = await this.fetchImpl(
+        `${completionApiBase}/api/v1/app-auth/mobile/ack`,
+        {
+          method: "POST",
+          signal,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            clientId: pending.clientId,
+            environment: pending.environment,
+            redirectUri: pending.redirectUri,
+            state: pending.state,
+            code,
+            codeVerifier: pending.codeVerifier,
+            credentialId,
+            secret,
+          }),
+        },
+      );
+      signal?.throwIfAborted();
+      assertPendingLoginAuthority(authority);
+      const acknowledged = await responseJson(acknowledgeResponse);
+      signal?.throwIfAborted();
+      assertPendingLoginAuthority(authority);
+      if (!acknowledgeResponse.ok) {
+        const failure = protocolFailure(
+          mobileAuthResponseError(
+            acknowledged,
+            "Eliza Cloud could not activate the mobile session.",
+          ),
+          acknowledgeResponse.status,
+          pending.state,
+        );
+        terminalFailure = failure.disposition === "acknowledge";
+        throw failure;
+      }
+      if (
+        acknowledged.success !== true ||
+        acknowledged.status !== "acknowledged" ||
+        stringField(acknowledged.credentialId) !== credentialId
+      ) {
+        throw new AndroidCloudAuthError(
+          "Eliza Cloud returned an invalid mobile session acknowledgement.",
+          { attemptId: pending.state, disposition: "retry" },
+        );
+      }
+
       let pendingCleanupRequired = false;
       try {
-        await this.cancelLogin(pending.state);
+        const retirement = await this.pendingLoginAuthority.retire(authority);
+        if (!retirement.retired || retirement.superseded) {
+          throw supersededLoginFailure(authority);
+        }
       } catch (err) {
+        if (!this.pendingLoginAuthority.hasExactValue(authority.value)) {
+          throw supersededLoginFailure(authority);
+        }
         // The credential write and server acknowledgement are the commit point.
         // A protected-store cleanup failure must not roll back an activated
         // session; callers retain this explicit signal for later cleanup.
@@ -688,14 +918,36 @@ export class AndroidCloudClient {
         );
         pendingCleanupRequired = true;
       }
+      credentialRollback = null;
       return {
         apiBase: completionApiBase,
         pendingCleanupRequired,
         state: pending.state,
       };
     } catch (error) {
-      if (terminalFailure) await this.clearTerminalLogin(pending.state);
+      if (credentialRollback) {
+        try {
+          await credentialRollback.restorePredecessor();
+        } catch (rollbackError) {
+          // error-policy:J2 a callback cannot be replayed as ordinary auth
+          // failure when its exact protected credential compensation failed.
+          throw new AndroidCloudAuthError(
+            "Eliza Cloud could not safely roll back the interrupted mobile session.",
+            {
+              attemptId: pending.state,
+              cause: new AggregateError(
+                [error, rollbackError],
+                "Android Cloud credential compensation failed",
+              ),
+              disposition: "retry",
+            },
+          );
+        }
+      }
+      if (terminalFailure) await this.clearTerminalLogin(authority);
       if (error instanceof AndroidCloudAuthError) throw error;
+      // error-policy:J1 the native callback boundary exposes one typed replay
+      // disposition while retaining the underlying transport/storage cause.
       throw new AndroidCloudAuthError(
         "Eliza Cloud sign-in was interrupted. Please try again.",
         { attemptId: pending.state, cause: error, disposition: "retry" },
@@ -768,6 +1020,8 @@ export class AndroidCloudClient {
   }
 
   async signOut(): Promise<void> {
+    const validatePendingLoginAuthority =
+      this.pendingLoginAuthority.captureMutationValidator();
     const token = await this.readToken();
     if (!token) return;
     const response = await this.fetchImpl(
@@ -786,7 +1040,10 @@ export class AndroidCloudClient {
         ),
       );
     }
-    await this.credentialStore.clear();
+    await this.credentialStore.clear({
+      expectedToken: token,
+      validate: validatePendingLoginAuthority,
+    });
   }
 
   async getConversationMessages(
