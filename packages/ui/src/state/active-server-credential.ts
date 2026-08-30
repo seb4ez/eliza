@@ -4,19 +4,22 @@
  * target. Pairing and bootstrap exchange both route through this boundary.
  */
 
-import { setStorageValue } from "../bridge/storage-bridge";
+import { setStorageValueIfCurrent } from "../bridge/storage-bridge";
 import {
   getActiveProfile,
+  loadAgentProfileRegistry,
+  persistAgentProfileConnectionDurably,
   updateAgentProfile,
-  upsertAndActivateAgentProfile,
 } from "./agent-profiles";
 import {
   createPersistedActiveServer,
   loadPersistedActiveServer,
   savePersistedActiveServer,
+  savePersistedActiveServerDurably,
 } from "./persistence";
 
 const ACTIVE_SERVER_STORAGE_KEY = "elizaos:active-server";
+const AGENT_PROFILE_STORAGE_KEY = "elizaos:agent-profiles";
 
 export async function persistActiveServerCredential(
   token: string,
@@ -38,18 +41,6 @@ export async function persistActiveServerCredential(
     (activeServer && activeServer.kind !== "local"
       ? { ...activeServer, accessToken: token }
       : null);
-  if (credentialTarget) {
-    const authenticatedServer = credentialTarget;
-    savePersistedActiveServer(authenticatedServer);
-    // Native storage mirroring is normally fire-and-forget, but pairing reloads
-    // immediately after this boundary. Await the authoritative Preferences write
-    // so hydration cannot restore the pre-pair, tokenless server on the next boot.
-    await setStorageValue(
-      ACTIVE_SERVER_STORAGE_KEY,
-      JSON.stringify(authenticatedServer),
-    );
-  }
-
   const activeProfile = getActiveProfile();
   const sameCredentialTarget =
     activeProfile &&
@@ -57,15 +48,27 @@ export async function persistActiveServerCredential(
     activeProfile.kind === credentialTarget.kind &&
     activeProfile.apiBase?.replace(/\/+$/, "") ===
       credentialTarget.apiBase?.replace(/\/+$/, "");
-  if (sameCredentialTarget && activeProfile) {
-    updateAgentProfile(activeProfile.id, { accessToken: token });
-  } else if (credentialTarget?.kind === "remote") {
-    upsertAndActivateAgentProfile({
-      kind: "remote",
-      label: credentialTarget.label,
-      apiBase: credentialTarget.apiBase,
-      accessToken: token,
-    });
+  if (!credentialTarget) return;
+
+  const profile = sameCredentialTarget
+    ? (() => {
+        const { id: _id, createdAt: _createdAt, ...rest } = activeProfile;
+        return { ...rest, accessToken: token };
+      })()
+    : credentialTarget.kind === "remote"
+      ? {
+          kind: "remote" as const,
+          label: credentialTarget.label,
+          apiBase: credentialTarget.apiBase,
+          accessToken: token,
+        }
+      : null;
+
+  const persisted = profile
+    ? await persistAgentProfileConnectionDurably(profile, credentialTarget)
+    : await savePersistedActiveServerDurably(credentialTarget);
+  if (!persisted) {
+    throw new Error("The authenticated runtime target could not be saved.");
   }
 }
 
@@ -88,4 +91,77 @@ export function scrubRejectedActiveServerCredential(token: string): void {
   if (activeProfile?.accessToken === rejected) {
     updateAgentProfile(activeProfile.id, { accessToken: undefined });
   }
+}
+
+/**
+ * Remove a definitively rejected bearer from the exact active-server/profile
+ * records observed by this probe. These are terminal CAS transforms: once A is
+ * scrubbed it is never restored, while a concurrent account/runtime B makes
+ * the compare fail and remains untouched.
+ */
+export async function scrubRejectedActiveServerCredentialDurably(
+  token: string,
+): Promise<boolean> {
+  const rejected = token.trim();
+  if (!rejected || typeof localStorage === "undefined") return false;
+
+  const registry = loadAgentProfileRegistry();
+  const registryRaw = localStorage.getItem(AGENT_PROFILE_STORAGE_KEY);
+  const activeServer = loadPersistedActiveServer();
+  const activeServerRaw = localStorage.getItem(ACTIVE_SERVER_STORAGE_KEY);
+  const activeProfileIndex = registry.profiles.findIndex(
+    (profile) =>
+      profile.id === registry.activeProfileId &&
+      profile.accessToken === rejected,
+  );
+  const scrubServer = activeServer?.accessToken === rejected;
+  const scrubProfile = activeProfileIndex >= 0;
+  if (!scrubServer && !scrubProfile) return true;
+
+  const nextRegistry = scrubProfile
+    ? {
+        ...registry,
+        profiles: registry.profiles.map((profile, index) => {
+          if (index !== activeProfileIndex) return profile;
+          const { accessToken: _accessToken, ...rest } = profile;
+          return rest;
+        }),
+      }
+    : registry;
+  const scrubs: Promise<boolean>[] = [];
+  if (scrubProfile && registryRaw) {
+    scrubs.push(
+      setStorageValueIfCurrent(
+        AGENT_PROFILE_STORAGE_KEY,
+        registryRaw,
+        JSON.stringify(nextRegistry),
+        { compensateOnValidationFailure: false },
+      ),
+    );
+  }
+  if (scrubServer && activeServer && activeServerRaw) {
+    const { accessToken: _accessToken, ...serverWithoutToken } = activeServer;
+    scrubs.push(
+      setStorageValueIfCurrent(
+        ACTIVE_SERVER_STORAGE_KEY,
+        activeServerRaw,
+        JSON.stringify(serverWithoutToken),
+        { compensateOnValidationFailure: false },
+      ),
+    );
+  }
+  await Promise.allSettled(scrubs);
+
+  // A false CAS can mean either a safe newer B won or protected persistence
+  // failed without mutation. Re-read both records and retry auth only when the
+  // rejected A bearer is provably absent from every active credential mirror.
+  const currentServer = loadPersistedActiveServer();
+  const currentRegistry = loadAgentProfileRegistry();
+  const currentProfile = currentRegistry.profiles.find(
+    (profile) => profile.id === currentRegistry.activeProfileId,
+  );
+  return (
+    currentServer?.accessToken !== rejected &&
+    currentProfile?.accessToken !== rejected
+  );
 }

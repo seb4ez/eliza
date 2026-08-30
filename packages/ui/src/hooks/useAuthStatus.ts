@@ -28,7 +28,7 @@ import {
   authMe,
 } from "../api/auth-client";
 import { getBootConfig, setBootConfig } from "../config/boot-config-store";
-import { scrubRejectedActiveServerCredential } from "../state/active-server-credential";
+import { scrubRejectedActiveServerCredentialDurably } from "../state/active-server-credential";
 import { scrubPersistedAgentProfileTokens } from "../state/agent-profiles";
 import { loadPersistedActiveServer } from "../state/persistence";
 import { clearSharedCloudAccountBinding } from "../state/shared-cloud-account-binding";
@@ -122,7 +122,9 @@ async function authMeWithRejectedBearerRecovery() {
   // server can return the unauthenticated pairing/password contract instead of
   // seeing the same rejected Authorization header twice.
   setBootConfig({ ...getBootConfig(), apiToken: undefined });
-  scrubRejectedActiveServerCredential(apiToken);
+  if (!(await scrubRejectedActiveServerCredentialDurably(apiToken))) {
+    return result;
+  }
   return authMe();
 }
 

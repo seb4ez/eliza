@@ -6,10 +6,12 @@
  * covering the durable server and profile records without network mocks.
  */
 
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import * as storageBridge from "../bridge/storage-bridge";
 import {
   persistActiveServerCredential,
   scrubRejectedActiveServerCredential,
+  scrubRejectedActiveServerCredentialDurably,
 } from "./active-server-credential";
 import { getActiveProfile, loadAgentProfileRegistry } from "./agent-profiles";
 import {
@@ -105,5 +107,76 @@ describe("persistActiveServerCredential", () => {
     });
     expect(loadPersistedActiveServer()?.accessToken).toBeUndefined();
     expect(getActiveProfile()?.accessToken).toBeUndefined();
+  });
+
+  it("durably scrubs the rejected bearer from both active mirrors", async () => {
+    savePersistedActiveServer(
+      createPersistedActiveServer({
+        kind: "remote",
+        apiBase: "https://runtime.example.test",
+        accessToken: "stale-token",
+      }),
+    );
+    await persistActiveServerCredential("stale-token");
+
+    await expect(
+      scrubRejectedActiveServerCredentialDurably("stale-token"),
+    ).resolves.toBe(true);
+
+    expect(loadPersistedActiveServer()?.accessToken).toBeUndefined();
+    expect(getActiveProfile()?.accessToken).toBeUndefined();
+  });
+
+  it("preserves a newer runtime B when rejected-A scrubs lose their exact compares", async () => {
+    savePersistedActiveServer(
+      createPersistedActiveServer({
+        kind: "remote",
+        apiBase: "https://runtime-a.example.test",
+        accessToken: "account-a",
+      }),
+    );
+    await persistActiveServerCredential("account-a");
+    const registryA = loadAgentProfileRegistry();
+    const profileA = getActiveProfile();
+    if (!profileA) throw new Error("expected account-A profile");
+    let plantedB = false;
+    vi.spyOn(storageBridge, "setStorageValueIfCurrent").mockImplementation(
+      async () => {
+        if (!plantedB) {
+          plantedB = true;
+          const profileB = {
+            ...profileA,
+            id: "runtime-b",
+            apiBase: "https://runtime-b.example.test",
+            accessToken: "account-b",
+          };
+          localStorage.setItem(
+            "elizaos:agent-profiles",
+            JSON.stringify({
+              ...registryA,
+              activeProfileId: profileB.id,
+              profiles: [profileB],
+            }),
+          );
+          localStorage.setItem(
+            "elizaos:active-server",
+            JSON.stringify({
+              id: "remote:https://runtime-b.example.test",
+              kind: "remote",
+              label: "runtime-b.example.test",
+              apiBase: "https://runtime-b.example.test",
+              accessToken: "account-b",
+            }),
+          );
+        }
+        return false;
+      },
+    );
+
+    await expect(
+      scrubRejectedActiveServerCredentialDurably("account-a"),
+    ).resolves.toBe(true);
+    expect(loadPersistedActiveServer()?.accessToken).toBe("account-b");
+    expect(getActiveProfile()?.accessToken).toBe("account-b");
   });
 });

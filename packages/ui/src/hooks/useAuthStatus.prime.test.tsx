@@ -15,6 +15,7 @@ import {
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { authMe } from "../api/auth-client";
+import * as storageBridge from "../bridge/storage-bridge";
 import { clearStaleStewardSession } from "../cloud/shell/StewardProviderShared";
 import { getBootConfig, setBootConfig } from "../config/boot-config-store";
 import {
@@ -158,7 +159,7 @@ describe("primeAuthStatusProbe + activation reuse", () => {
     expect(getBootConfig().apiBase).toBe(apiBase);
   });
 
-  it("clears a cookie-only shared binding once after authoritative refresh rejection", async () => {
+  it("preserves a cookie-only shared binding after a bare non-authoritative 401", async () => {
     const apiBase = "https://api.eliza.app/api/v1/eliza/agents/shared-agent";
     setBootConfig({ branding: {}, apiBase });
     savePersistedActiveServer({
@@ -175,14 +176,15 @@ describe("primeAuthStatusProbe + activation reuse", () => {
     const { result } = renderHook(() => useAuthStatus({ pollIntervalMs: 0 }));
 
     await waitFor(() =>
-      expect(result.current.state).toMatchObject({
-        phase: "unauthenticated",
-        reason: "remote_auth_required",
-      }),
+      expect(result.current.state.phase).toBe("server_unavailable"),
     );
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(loadPersistedActiveServer()).toBeNull();
-    expect(getBootConfig().apiBase).toBeUndefined();
+    expect(loadPersistedActiveServer()).toMatchObject({
+      id: "cloud:shared-agent",
+      apiBase,
+      accessToken: "stale-token-mirror",
+    });
+    expect(getBootConfig().apiBase).toBe(apiBase);
   });
 
   it("preserves a cookie-only shared binding when refresh is temporarily unavailable", async () => {
@@ -465,6 +467,47 @@ describe("primeAuthStatusProbe + activation reuse", () => {
     expect(firstHeaders.get("Authorization")).toBe("Bearer stale-token");
     expect(retryHeaders.has("Authorization")).toBe(false);
     expect(loadPersistedActiveServer()?.accessToken).toBeUndefined();
+  });
+
+  it("does not retry auth when the rejected bearer remains in protected storage", async () => {
+    setBootConfig({
+      branding: {},
+      apiBase: "https://runtime.example.test",
+      apiToken: "stale-token",
+    });
+    savePersistedActiveServer(
+      createPersistedActiveServer({
+        kind: "remote",
+        apiBase: "https://runtime.example.test",
+        accessToken: "stale-token",
+      }),
+    );
+    vi.spyOn(storageBridge, "setStorageValueIfCurrent").mockRejectedValue(
+      new Error("protected store unavailable"),
+    );
+    const unauthorized = {
+      reason: "remote_auth_required",
+      access: {
+        mode: "remote",
+        passwordConfigured: true,
+        ownerConfigured: false,
+      },
+    };
+    fetchMock.mockResolvedValue(jsonResponse(401, unauthorized));
+
+    await act(async () => {
+      primeAuthStatusProbe();
+    });
+    const { result } = renderHook(() => useAuthStatus({ pollIntervalMs: 0 }));
+    await waitFor(() =>
+      expect(result.current.state).toMatchObject({
+        phase: "unauthenticated",
+        reason: "remote_auth_required",
+      }),
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(loadPersistedActiveServer()?.accessToken).toBe("stale-token");
   });
 
   it("discards a mid-boot 503 prime and the activation fetch re-probes", async () => {
