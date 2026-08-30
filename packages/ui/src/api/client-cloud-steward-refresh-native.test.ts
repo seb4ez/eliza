@@ -38,6 +38,18 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+function makeJwt(exp: number): string {
+  const header = btoa(JSON.stringify({ alg: "none", typ: "JWT" }))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+  const payload = btoa(JSON.stringify({ exp }))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+  return `${header}.${payload}.sig`;
+}
+
 describe("refreshCloudStewardSession native bearer refresh", () => {
   const realFetch = globalThis.fetch;
 
@@ -145,6 +157,48 @@ describe("refreshCloudStewardSession native bearer refresh", () => {
     ).resolves.toBeNull();
 
     expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("still-valid-token");
+  });
+
+  it("retires an unchanged expired native bearer after a bounded retry", async () => {
+    const expiredToken = makeJwt(Math.floor(Date.now() / 1000) - 60);
+    localStorage.setItem(STEWARD_TOKEN_KEY, expiredToken);
+    globalThis.fetch = vi.fn(async () => ({
+      ok: true,
+    })) as unknown as typeof fetch;
+    capacitorMocks.request.mockResolvedValue({
+      status: 401,
+      data: { code: "invalid_token" },
+    });
+
+    await expect(
+      refreshCloudStewardSession({
+        endpoint: "https://api.elizacloud.ai/api/auth/steward-refresh",
+      }),
+    ).resolves.toBeNull();
+
+    expect(capacitorMocks.request).toHaveBeenCalledTimes(2);
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+  });
+
+  it("preserves a newer native bearer that wins during invalid_token parsing", async () => {
+    const expiredToken = makeJwt(Math.floor(Date.now() / 1000) - 60);
+    localStorage.setItem(STEWARD_TOKEN_KEY, expiredToken);
+    capacitorMocks.request.mockImplementationOnce(async () => {
+      localStorage.setItem(STEWARD_TOKEN_KEY, "account-b");
+      return {
+        status: 401,
+        data: { code: "invalid_token" },
+      };
+    });
+
+    await expect(
+      refreshCloudStewardSession({
+        endpoint: "https://api.elizacloud.ai/api/auth/steward-refresh",
+      }),
+    ).resolves.toBeNull();
+
+    expect(capacitorMocks.request).toHaveBeenCalledOnce();
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("account-b");
   });
 
   it("serializes native refresh publication before a newer login transaction", async () => {

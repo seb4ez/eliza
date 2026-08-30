@@ -707,6 +707,110 @@ describe("refreshCloudStewardSession (web/fetch branch)", () => {
     expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("still-valid-token");
   });
 
+  it("retries one invalid_token and accepts the concurrent rotation winner", async () => {
+    const expiredToken = makeJwt(Math.floor(Date.now() / 1000) - 60);
+    localStorage.setItem(STEWARD_TOKEN_KEY, expiredToken);
+    const fetchMock = vi
+      .fn(
+        async (
+          _input: RequestInfo | URL,
+          _init?: RequestInit,
+        ): Promise<Response> =>
+          new Response(JSON.stringify({ token: "rotation-winner-token" }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ code: "invalid_token" }), {
+          status: 401,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      refreshCloudStewardSession({
+        commitRefreshedSession: async (session, authority) => {
+          if (session.token) {
+            await writeStoredStewardToken(session.token, {
+              validate: authority.validate,
+            });
+          }
+        },
+      }),
+    ).resolves.toEqual({ token: "rotation-winner-token" });
+
+    const postCalls = fetchMock.mock.calls.filter(
+      ([, init]) => init?.method === "POST",
+    );
+    expect(postCalls).toHaveLength(2);
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(
+      "rotation-winner-token",
+    );
+  });
+
+  it("clears an unchanged expired token after two invalid_token responses", async () => {
+    const expiredToken = makeJwt(Math.floor(Date.now() / 1000) - 60);
+    localStorage.setItem(STEWARD_TOKEN_KEY, expiredToken);
+    savePersistedActiveServer({
+      id: "cloud:dead-session-agent",
+      kind: "cloud",
+      label: "Dead session agent",
+      apiBase: "https://dead-session-agent.example.test",
+      accessToken: "dead-session-bearer",
+    });
+    const fetchMock = vi.fn(
+      async (_input: RequestInfo | URL, init?: RequestInit) =>
+        init?.method === "DELETE"
+          ? { ok: true, status: 200, json: async () => ({ ok: true }) }
+          : {
+              ok: false,
+              status: 401,
+              json: async () => ({ code: "invalid_token" }),
+            },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(refreshCloudStewardSession()).resolves.toBeNull();
+
+    const postCalls = fetchMock.mock.calls.filter(
+      ([, init]) => init?.method === "POST",
+    );
+    expect(postCalls).toHaveLength(2);
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(loadPersistedActiveServer()?.accessToken).toBeUndefined();
+  });
+
+  it("does not retry or tear down when a newer token wins during invalid_token parsing", async () => {
+    const expiredToken = makeJwt(Math.floor(Date.now() / 1000) - 60);
+    localStorage.setItem(STEWARD_TOKEN_KEY, expiredToken);
+    savePersistedActiveServer({
+      id: "cloud:account-b-agent",
+      kind: "cloud",
+      label: "Account B agent",
+      apiBase: "https://account-b-agent.example.test",
+      accessToken: "account-b-agent-token",
+    });
+    const fetchMock = vi.fn(async () => ({
+      ok: false,
+      status: 401,
+      json: async () => {
+        localStorage.setItem(STEWARD_TOKEN_KEY, "account-b");
+        return { code: "invalid_token" };
+      },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(refreshCloudStewardSession()).resolves.toBeNull();
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("account-b");
+    expect(loadPersistedActiveServer()?.accessToken).toBe(
+      "account-b-agent-token",
+    );
+  });
+
   it("surfaces a typed transient failure when the caller must preserve auth state", async () => {
     vi.stubGlobal(
       "fetch",

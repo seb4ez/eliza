@@ -472,9 +472,11 @@ async function managedCloudAuthMe(
     } else {
       const canonical = readStoredStewardToken()?.trim() || null;
       if (canonical !== null) {
-        // A bare refresh rejection cannot retire an expired token, and a
-        // different canonical value belongs to a newer completed login. In
-        // both cases preserve every binding and retry from a fresh probe.
+        // refreshCloudStewardSession retries a structured invalid_token once
+        // under this lease and retires an exact, still-expired token only after
+        // the second rejection. Anything still canonical here is therefore
+        // ambiguous (bare/malformed rejection) or belongs to a newer login;
+        // preserve every binding and retry from a fresh probe.
         return cloudAuthUnavailable();
       }
       // Structured `session_ended` already performed the exact terminal clear.

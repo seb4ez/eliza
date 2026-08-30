@@ -914,6 +914,32 @@ describe("authMe against a managed shared-agent base", () => {
     });
   });
 
+  it("reports signed-out after repeated invalid_token retires the exact expired token", async () => {
+    let storedToken: string | null = "expired-token";
+    readStoredStewardTokenMock.mockImplementation(() => storedToken);
+    cloudTokenSecsRemainingMock.mockReturnValue(-5);
+    refreshCloudStewardSessionMock.mockImplementationOnce(async () => {
+      // The real helper reaches this state only after its bounded second
+      // invalid_token response and exact-token teardown.
+      storedToken = null;
+      return null;
+    });
+
+    await expect(authMe()).resolves.toMatchObject({
+      ok: false,
+      status: 401,
+      reason: "remote_auth_required",
+    });
+    expect(refreshCloudStewardSessionMock).toHaveBeenCalledWith({
+      throwOnTransientHttpFailure: true,
+      mutationLease: expect.any(Object),
+      commitRefreshedSession: expect.any(Function),
+    });
+    expect(clearSharedCloudAccountBindingDurablyMock).toHaveBeenCalledWith({
+      validate: expect.any(Function),
+    });
+  });
+
   it("preserves a cookie-only binding when refresh returns no token without clearing the cookie hint", async () => {
     hasStewardAuthedCookieMock.mockReturnValue(true);
     refreshCloudStewardSessionMock.mockResolvedValueOnce(null);

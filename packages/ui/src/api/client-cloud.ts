@@ -674,7 +674,7 @@ async function clearStoredStewardTokenIfCurrent(
   return cleared;
 }
 
-async function clearEndedStewardAccountIfCurrent(
+async function clearRejectedStewardAccountIfCurrent(
   expectedToken: string | null,
   mutationLease: StewardSessionMutationLease,
   validateAuthority: () => boolean,
@@ -696,6 +696,80 @@ async function clearEndedStewardAccountIfCurrent(
     expectedToken,
     validate: validateAuthority,
   });
+}
+
+const DEAD_STEWARD_REFRESH_RETRY_DELAY_MS = 100;
+
+function expiredStewardTokenIsStillCurrent(
+  expectedToken: string | null,
+  validateAuthority: () => boolean,
+): expectedToken is string {
+  if (!expectedToken || !validateAuthority()) return false;
+  if ((readStoredStewardToken()?.trim() || null) !== expectedToken)
+    return false;
+  const secondsRemaining = cloudTokenSecsRemaining(expectedToken);
+  return secondsRemaining !== null && secondsRemaining <= 0;
+}
+
+async function waitForDeadStewardRefreshRetry(): Promise<void> {
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, DEAD_STEWARD_REFRESH_RETRY_DELAY_MS);
+  });
+}
+
+type StewardRefreshAttempt<T> = {
+  response: T;
+  failureCode: string | null;
+};
+
+async function retryRejectedExpiredStewardSession<T>(options: {
+  request: () => Promise<StewardRefreshAttempt<T>>;
+  expectedToken: string | null;
+  mutationLease: StewardSessionMutationLease;
+  validateAuthority: () => boolean;
+}): Promise<StewardRefreshAttempt<T> | null> {
+  const first = await options.request();
+  if (
+    first.failureCode !== "invalid_token" ||
+    !expiredStewardTokenIsStillCurrent(
+      options.expectedToken,
+      options.validateAuthority,
+    )
+  ) {
+    return first;
+  }
+
+  // A single-use refresh race can reject its loser even though the winner is
+  // publishing a newer session. Give that publication one bounded chance to
+  // settle, then re-read both the recovery generation and exact local token.
+  await waitForDeadStewardRefreshRetry();
+  if (
+    !expiredStewardTokenIsStillCurrent(
+      options.expectedToken,
+      options.validateAuthority,
+    )
+  ) {
+    return null;
+  }
+
+  const second = await options.request();
+  if (
+    second.failureCode === "invalid_token" &&
+    expiredStewardTokenIsStillCurrent(
+      options.expectedToken,
+      options.validateAuthority,
+    )
+  ) {
+    // Two exact rejections prove the expired session is not merely the loser
+    // of a rotation. The CAS guard prevents an old account-A response from
+    // erasing account B.
+    await clearRejectedStewardAccountIfCurrent(
+      options.expectedToken,
+      options.mutationLease,
+      options.validateAuthority,
+    );
+  }
+  return second;
 }
 
 function readDirectCloudToken(client: ElizaClient): string | null {
@@ -793,29 +867,42 @@ export async function refreshCloudStewardSession(opts?: {
   if (shouldUseNativeStewardRefreshHttp(endpoint)) {
     const token = readStoredStewardToken()?.trim();
     if (!token) return null;
-    const response = await withDirectCloudHttpTimeout(
-      CapacitorHttp.request({
-        url: endpoint,
-        method: "POST",
-        headers: {
-          Accept: "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        responseType: "json",
-        connectTimeout: 10_000,
-        readTimeout: 10_000,
-      }),
-      { method: "POST", url: endpoint },
-    );
+    const attempt = await retryRejectedExpiredStewardSession({
+      expectedToken: token,
+      mutationLease: opts.mutationLease,
+      validateAuthority: refreshAuthority.validate,
+      request: async () => {
+        const response = await withDirectCloudHttpTimeout(
+          CapacitorHttp.request({
+            url: endpoint,
+            method: "POST",
+            headers: {
+              Accept: "application/json",
+              Authorization: `Bearer ${token}`,
+            },
+            responseType: "json",
+            connectTimeout: 10_000,
+            readTimeout: 10_000,
+          }),
+          { method: "POST", url: endpoint },
+        );
+        const failure =
+          response.status === 401
+            ? (parseDirectCloudJsonSafe(response.data) as {
+                code?: string;
+              } | null)
+            : null;
+        return { response, failureCode: failure?.code ?? null };
+      },
+    });
+    if (!attempt) return null;
+    const { response, failureCode } = attempt;
     if (response.status < 200 || response.status >= 300) {
-      const failure = parseDirectCloudJsonSafe(response.data) as {
-        code?: string;
-      } | null;
-      if (response.status === 401 && failure?.code === "session_ended") {
+      if (response.status === 401 && failureCode === "session_ended") {
         // Only the server's explicit cross-host logout verdict is
         // authoritative while a JWT is still valid. Keep the compare guard so
         // a delayed response for account A cannot erase a newer account B.
-        await clearEndedStewardAccountIfCurrent(
+        await clearRejectedStewardAccountIfCurrent(
           token,
           opts.mutationLease,
           refreshAuthority.validate,
@@ -870,37 +957,49 @@ export async function refreshCloudStewardSession(opts?: {
   const { signal: stewardSignal, dispose: disposeStewardSignal } =
     createTimeoutSignal(DIRECT_CLOUD_HTTP_TIMEOUT_MS);
   try {
-    const response = await fetch(endpoint, {
-      method: "POST",
-      credentials: "include",
-      // This is a cookie-authenticated mutation. Match the canonical Cloud
-      // login helper: a custom non-simple marker lets the Worker reject
-      // cross-site form POSTs without exposing the host-only refresh cookie to
-      // JavaScript. The body remains empty and the cookie remains browser-only.
-      headers: {
-        "Content-Type": "application/json",
-        "X-Eliza-CSRF": "1",
+    const attempt = await retryRejectedExpiredStewardSession({
+      expectedToken: tokenAtDispatch,
+      mutationLease: opts.mutationLease,
+      validateAuthority: refreshAuthority.validate,
+      request: async () => {
+        const response = await fetch(endpoint, {
+          method: "POST",
+          credentials: "include",
+          // This is a cookie-authenticated mutation. Match the canonical Cloud
+          // login helper: a custom non-simple marker lets the Worker reject
+          // cross-site form POSTs without exposing the host-only refresh cookie
+          // to JavaScript. The body remains empty and the cookie remains
+          // browser-only.
+          headers: {
+            "Content-Type": "application/json",
+            "X-Eliza-CSRF": "1",
+          },
+          signal: stewardSignal,
+        });
+        const failure =
+          response.status === 401
+            ? ((await response.json().catch((err: unknown) => {
+                if (isTimeoutAbortError(err)) throw err;
+                return null;
+              })) as { code?: string } | null)
+            : null;
+        return { response, failureCode: failure?.code ?? null };
       },
-      signal: stewardSignal,
     });
+    if (!attempt) return null;
+    const { response, failureCode } = attempt;
     if (!response.ok) {
-      if (response.status === 401) {
-        const failure = (await response.json().catch((err: unknown) => {
-          if (isTimeoutAbortError(err)) throw err;
-          return null;
-        })) as { code?: string } | null;
-        if (failure?.code === "session_ended") {
-          // A bare 401 can be a stale proxy or refresh-rotation loser. The
-          // structured logout code is the sole authority to retire a still-
-          // valid local mirror, and the exact-token guard protects a newer
-          // login that won while this request was settling.
-          await clearEndedStewardAccountIfCurrent(
-            tokenAtDispatch,
-            opts.mutationLease,
-            refreshAuthority.validate,
-          );
-          return null;
-        }
+      if (response.status === 401 && failureCode === "session_ended") {
+        // A bare 401 can be a stale proxy or refresh-rotation loser. The
+        // structured logout code is the sole authority to retire a still-
+        // valid local mirror, and the exact-token guard protects a newer login
+        // that won while this request was settling.
+        await clearRejectedStewardAccountIfCurrent(
+          tokenAtDispatch,
+          opts.mutationLease,
+          refreshAuthority.validate,
+        );
+        return null;
       }
       if (
         opts?.throwOnTransientHttpFailure &&
