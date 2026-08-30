@@ -13,6 +13,15 @@
 import { verifyMessage } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  beginStewardSessionRecovery,
+  completeStewardSessionRecovery,
+  readStewardSessionRecovery,
+} from "../cloud/lib/steward-session-recovery-marker";
+import {
+  configuredStewardTenantId,
+  DEFAULT_STEWARD_TENANT_ID,
+} from "../cloud/shell/steward-config";
 
 const mocks = vi.hoisted(() => ({
   isStoreBuild: vi.fn(() => false),
@@ -71,6 +80,22 @@ const NONCE_RESPONSE = {
   statement: "Sign in to Eliza Cloud",
   chainId: HARNESS_CHAIN_ID,
 };
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function recoverySnapshot() {
+  return readStewardSessionRecovery(
+    configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID),
+  );
+}
 
 function mockFetch(): {
   calls: Array<{ url: string; init?: RequestInit }>;
@@ -235,6 +260,7 @@ describe("e2e wallet + SIWE login", () => {
       "eliza_test_api_key",
     );
     expect(tokenSync).toHaveBeenCalledTimes(1);
+    expect(recoverySnapshot().receipts).toEqual([]);
 
     // The nonce request binds the wallet's ACTUAL connected chain (#18458):
     // the harness wallet reports Base (8453), so the query string must carry it.
@@ -294,6 +320,71 @@ describe("e2e wallet + SIWE login", () => {
       siweLoginWithInjectedWallet("https://api.test"),
     ).rejects.toThrow(/verify failed: 401/);
     expect(window.localStorage.getItem("steward_session_token")).toBeNull();
+    expect(recoverySnapshot().receipts).toEqual([]);
+  });
+
+  it("keeps a newer login authoritative when an older wallet prompt resumes", async () => {
+    window.localStorage.setItem(E2E_WALLET_KEY_STORAGE_KEY, PRIVATE_KEY);
+    await installE2eWalletIfRequested();
+    const provider = getInjectedEthereumProvider();
+    if (!provider) throw new Error("Expected the e2e wallet provider");
+    const originalRequest = provider.request.bind(provider);
+    const signatureRequested = deferred<void>();
+    const releaseSignature = deferred<void>();
+    provider.request = vi.fn(async (args) => {
+      if (args.method === "personal_sign") {
+        signatureRequested.resolve();
+        await releaseSignature.promise;
+      }
+      return originalRequest(args);
+    });
+    const fetchMock = mockFetch();
+
+    const olderLogin = siweLoginWithInjectedWallet("https://api.test");
+    await signatureRequested.promise;
+    expect(recoverySnapshot().receipts).toHaveLength(1);
+
+    const tenantId = configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID);
+    const newerLogin = beginStewardSessionRecovery(tenantId, "provider");
+    window.localStorage.setItem("steward_session_token", "account-b-token");
+    completeStewardSessionRecovery(newerLogin);
+    releaseSignature.resolve();
+
+    await expect(olderLogin).resolves.toBeNull();
+    expect(window.localStorage.getItem("steward_session_token")).toBe(
+      "account-b-token",
+    );
+    expect(
+      fetchMock.calls.some(({ url }) => url.endsWith("/api/auth/siwe/verify")),
+    ).toBe(false);
+    expect(recoverySnapshot().receipts).toEqual([]);
+  });
+
+  it("retains its durable receipt when SIWE verification loses the response", async () => {
+    window.localStorage.setItem(E2E_WALLET_KEY_STORAGE_KEY, PRIVATE_KEY);
+    await installE2eWalletIfRequested();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("/api/auth/siwe/nonce")) {
+          return new Response(JSON.stringify(NONCE_RESPONSE), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        throw new TypeError("verify response lost");
+      }),
+    );
+
+    await expect(
+      siweLoginWithInjectedWallet("https://api.test"),
+    ).rejects.toThrow(/verify response lost/);
+    expect(window.localStorage.getItem("steward_session_token")).toBeNull();
+    expect(recoverySnapshot()).toMatchObject({
+      storageAvailable: true,
+      receipts: [expect.any(String)],
+    });
   });
 
   it("retries a transient 503 nonce store outage, then completes the handshake", async () => {

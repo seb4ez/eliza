@@ -13,6 +13,15 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { client } from "../api";
+import {
+  beginStewardSessionRecovery,
+  completeStewardSessionRecovery,
+  readStewardSessionRecovery,
+} from "../cloud/lib/steward-session-recovery-marker";
+import {
+  configuredStewardTenantId,
+  DEFAULT_STEWARD_TENANT_ID,
+} from "../cloud/shell/steward-config";
 import { getBootConfig, setBootConfig } from "../config/boot-config";
 import {
   markCloudLoginPending,
@@ -67,6 +76,31 @@ function jsonResponse(status: number, body: unknown): Response {
     statusText: status >= 200 && status < 300 ? "OK" : "Error",
     text: async () => JSON.stringify(body),
   } as Response;
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function recoverySnapshot() {
+  return readStewardSessionRecovery(
+    configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID),
+  );
+}
+
+function completeNewerLogin(token: string): void {
+  const recovery = beginStewardSessionRecovery(
+    configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID),
+    "provider",
+  );
+  localStorage.setItem("steward_session_token", token);
+  completeStewardSessionRecovery(recovery);
 }
 
 function restorePinnedRemote(): void {
@@ -560,6 +594,53 @@ describe("useCloudState — handleCloudLogin same-tab fallback on hosted web", (
     expect(params.setActionNotice).not.toHaveBeenCalled();
   });
 
+  it("keeps login B authoritative when a delayed same-tab return for A settles", async () => {
+    const search =
+      "?elizaCloudLogin=complete&elizaCloudLoginSession=sess-delayed-a";
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: {
+        ...window.location,
+        href: `https://cloud.eliza.app/chat${search}`,
+        pathname: "/chat",
+        search,
+        assign: assignSpy,
+      },
+    });
+    const delayedPoll = deferred<{
+      status: "authenticated";
+      token: string;
+      userId: string;
+    }>();
+    cloudLoginPollDirectSpy.mockImplementation(() => delayedPoll.promise);
+
+    const { result } = renderHook(() => useCloudState(makeParams()));
+    await waitFor(() => {
+      expect(cloudLoginPollDirectSpy).toHaveBeenCalledWith(
+        "https://api.eliza.app",
+        "sess-delayed-a",
+      );
+      expect(recoverySnapshot().receipts).toHaveLength(1);
+    });
+
+    completeNewerLogin("account-b-token");
+    delayedPoll.resolve({
+      status: "authenticated",
+      token: "account-a-token",
+      userId: "account-a-user",
+    });
+
+    await waitFor(() => {
+      expect(result.current.elizaCloudLoginBusy).toBe(false);
+    });
+    expect(localStorage.getItem("steward_session_token")).toBe(
+      "account-b-token",
+    );
+    expect(setTokenSpy).not.toHaveBeenCalledWith("account-a-token");
+    expect(result.current.elizaCloudConnected).toBe(false);
+    expect(recoverySnapshot().receipts).toEqual([]);
+  });
+
   it("claims a hosted staging return without replacing the localhost backend", async () => {
     const search =
       "?elizaCloudLogin=complete&elizaCloudLoginSession=staging-return";
@@ -719,6 +800,71 @@ describe("useCloudState — handleCloudLogin same-tab fallback on hosted web", (
       expect(popup.close).toHaveBeenCalled();
       expect(openSpy).toHaveBeenCalledWith("", CLOUD_LOGIN_POPUP_NAME);
 
+      unmount();
+      vi.clearAllTimers();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps login B authoritative when a delayed device-code poll for A settles", async () => {
+    vi.useFakeTimers();
+    const popup = {
+      closed: false,
+      close: vi.fn(() => {
+        (popup as { closed: boolean }).closed = true;
+      }),
+      location: { href: "" },
+      opener: {},
+    } as unknown as Window;
+    vi.spyOn(window, "open").mockReturnValue(popup);
+    cloudLoginDirectSpy.mockResolvedValue({
+      ok: true,
+      apiBase: "https://api.eliza.app",
+      browserUrl: "https://eliza.app/auth/cli-login?session=sess-delayed-a",
+      sessionId: "sess-delayed-a",
+    });
+    const delayedPoll = deferred<{
+      status: "authenticated";
+      token: string;
+      userId: string;
+    }>();
+    cloudLoginPollDirectSpy.mockImplementation(() => delayedPoll.promise);
+
+    try {
+      const { result, unmount } = renderHook(() => useCloudState(makeParams()));
+      let login: Promise<void> = Promise.resolve();
+      await act(async () => {
+        login = result.current.handleCloudLogin(popup);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      await act(async () => {
+        vi.advanceTimersByTime(1_000);
+        await Promise.resolve();
+      });
+      expect(cloudLoginPollDirectSpy).toHaveBeenCalledWith(
+        "https://api.eliza.app",
+        "sess-delayed-a",
+      );
+      expect(recoverySnapshot().receipts).toHaveLength(1);
+
+      completeNewerLogin("account-b-token");
+      delayedPoll.resolve({
+        status: "authenticated",
+        token: "account-a-token",
+        userId: "account-a-user",
+      });
+      await act(async () => {
+        await login;
+      });
+
+      expect(localStorage.getItem("steward_session_token")).toBe(
+        "account-b-token",
+      );
+      expect(setTokenSpy).not.toHaveBeenCalledWith("account-a-token");
+      expect(result.current.elizaCloudConnected).toBe(false);
+      expect(recoverySnapshot().receipts).toEqual([]);
       unmount();
       vi.clearAllTimers();
     } finally {

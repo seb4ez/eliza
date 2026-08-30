@@ -10,6 +10,15 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  beginStewardSessionRecovery,
+  completeStewardSessionRecovery,
+  readStewardSessionRecovery,
+} from "../cloud/lib/steward-session-recovery-marker";
+import {
+  configuredStewardTenantId,
+  DEFAULT_STEWARD_TENANT_ID,
+} from "../cloud/shell/steward-config";
 import { ElizaClient } from "./client-base";
 import {
   cloudTokenSecsRemaining,
@@ -21,6 +30,16 @@ import {
 } from "./client-cloud";
 
 const STEWARD_TOKEN_KEY = "steward_session_token";
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 
 function makeJwt(exp: number | null): string {
   const header = btoa(JSON.stringify({ alg: "none", typ: "JWT" }))
@@ -97,6 +116,63 @@ describe("getCloudAuthToken (Cloud = Steward everywhere)", () => {
       expect(syncs).toBe(2);
     } finally {
       window.removeEventListener("steward-token-sync", handler);
+    }
+  });
+});
+
+describe("selectOrProvisionCloudAgent Steward authority publication", () => {
+  it("does not let a delayed selection for A overwrite completed login B", async () => {
+    localStorage.removeItem(STEWARD_TOKEN_KEY);
+    const originalLocks = Object.getOwnPropertyDescriptor(navigator, "locks");
+    const lockRequested = deferred<void>();
+    const releaseLock = deferred<void>();
+    Object.defineProperty(navigator, "locks", {
+      configurable: true,
+      value: {
+        request: vi.fn(
+          async (
+            _name: string,
+            _options: { mode: "exclusive" },
+            callback: () => Promise<unknown>,
+          ) => {
+            lockRequested.resolve();
+            await releaseLock.promise;
+            return callback();
+          },
+        ),
+      },
+    });
+
+    try {
+      const client = new ElizaClient("https://api.eliza.app");
+      const delayedSelection = client.selectOrProvisionCloudAgent({
+        cloudApiBase: "https://api.eliza.app",
+        authToken: "account-a-token",
+        name: "Eliza",
+        knownAgents: [],
+      });
+      await lockRequested.promise;
+
+      const tenantId = configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID);
+      expect(readStewardSessionRecovery(tenantId).receipts).toHaveLength(1);
+      const newerLogin = beginStewardSessionRecovery(tenantId, "provider");
+      localStorage.setItem(STEWARD_TOKEN_KEY, "account-b-token");
+      completeStewardSessionRecovery(newerLogin);
+      releaseLock.resolve();
+
+      await expect(delayedSelection).rejects.toMatchObject({
+        code: "STEWARD_SESSION_SUPERSEDED",
+      });
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("account-b-token");
+      expect(readStewardSessionRecovery(tenantId).receipts).toEqual([]);
+    } finally {
+      releaseLock.resolve();
+      if (originalLocks) {
+        Object.defineProperty(navigator, "locks", originalLocks);
+      } else {
+        Reflect.deleteProperty(navigator, "locks");
+      }
+      localStorage.removeItem(STEWARD_TOKEN_KEY);
     }
   });
 });

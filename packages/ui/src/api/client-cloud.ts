@@ -18,6 +18,17 @@ import {
   startCloudConversationHandoff,
 } from "../cloud/handoff/cloud-handoff-supervisor";
 import { isRetryableHandoffHttpStatus } from "../cloud/handoff/conversation-handoff";
+import { enqueueStewardSessionMutation } from "../cloud/lib/steward-session-mutation-queue";
+import {
+  beginStewardSessionRecovery,
+  completeStewardSessionRecovery,
+  isStewardSessionRecoveryReceiptLive,
+  rejectStewardSessionRecovery,
+} from "../cloud/lib/steward-session-recovery-marker";
+import {
+  configuredStewardTenantId,
+  DEFAULT_STEWARD_TENANT_ID,
+} from "../cloud/shell/steward-config";
 import { getBootConfig } from "../config/boot-config";
 import { isTrustedCloudApiBaseUrl } from "../state/runtime-url-trust";
 import {
@@ -5196,6 +5207,61 @@ ElizaClient.prototype.ensurePersonalDedicatedEliza = async function (
   }
 };
 
+async function persistCloudSelectionStewardAuthority(
+  token: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  // Non-renderer callers have no shared browser origin to coordinate. Preserve
+  // the established server/test behavior there; every browser/native renderer
+  // uses the durable receipt + origin lease below.
+  if (typeof window === "undefined") {
+    await writeStoredStewardToken(token, { signal });
+    return;
+  }
+
+  const expectedStoredToken = readStoredStewardToken()?.trim() || null;
+  if (expectedStoredToken && expectedStoredToken !== token) {
+    throw new ElizaError(
+      "Cloud session selection no longer matches the active login.",
+      { code: "STEWARD_SESSION_SUPERSEDED" },
+    );
+  }
+  const recovery = beginStewardSessionRecovery(
+    configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID),
+    "provider",
+  );
+  let writeStarted = false;
+  try {
+    const committed = await enqueueStewardSessionMutation(async () => {
+      signal?.throwIfAborted();
+      if (!isStewardSessionRecoveryReceiptLive(recovery)) return false;
+      if ((readStoredStewardToken()?.trim() || null) !== expectedStoredToken) {
+        return false;
+      }
+      writeStarted = true;
+      await writeStoredStewardToken(token, { signal });
+      signal?.throwIfAborted();
+      if (!isStewardSessionRecoveryReceiptLive(recovery)) return false;
+      completeStewardSessionRecovery(recovery);
+      return true;
+    });
+    if (!committed) {
+      throw new ElizaError(
+        "Cloud session selection was superseded by a newer login.",
+        { code: "STEWARD_SESSION_SUPERSEDED" },
+      );
+    }
+  } catch (error) {
+    // A cancellation/lock failure before protected storage was touched is a
+    // definitive local rejection. Once the write begins, retain the receipt:
+    // secure-store response loss cannot prove which credential became durable.
+    if (!writeStarted && isStewardSessionRecoveryReceiptLive(recovery)) {
+      rejectStewardSessionRecovery(recovery);
+    }
+    throw error;
+  }
+}
+
 ElizaClient.prototype.selectOrProvisionCloudAgent = async function (
   this: ElizaClient,
   options,
@@ -5221,7 +5287,7 @@ ElizaClient.prototype.selectOrProvisionCloudAgent = async function (
   // dedicated agent, the caller's fallback may be that agent's bearer, which
   // must never be relabeled as a control-plane credential.
   if (authToken && !isDedicatedCloudAgentClient(this)) {
-    await writeStoredStewardToken(authToken);
+    await persistCloudSelectionStewardAuthority(authToken, options.signal);
   }
 
   // Reuse an existing agent unless the caller explicitly forces a new one. This
