@@ -18,8 +18,12 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invokeDesktopBridgeRequest } from "../bridge/electrobun-rpc";
 import { isElectrobunRuntime } from "../bridge/electrobun-runtime";
+import {
+  isStewardSessionRecoverySnapshotLive,
+  readStewardSessionRecovery,
+} from "../cloud/lib/steward-session-recovery-marker";
 import { getBootConfig } from "../config/boot-config";
-import { clearSharedCloudAccountBinding } from "../state/shared-cloud-account-binding";
+import { clearSharedCloudAccountBindingDurably } from "../state/shared-cloud-account-binding";
 import { isManagedCloudSharedAgentBase } from "../utils/cloud-agent-base";
 import {
   authChangePassword,
@@ -52,9 +56,13 @@ vi.mock("../bridge/electrobun-rpc", () => ({
 vi.mock("../bridge/electrobun-runtime", () => ({
   isElectrobunRuntime: vi.fn(),
 }));
+vi.mock("../cloud/lib/steward-session-recovery-marker", () => ({
+  isStewardSessionRecoverySnapshotLive: vi.fn(),
+  readStewardSessionRecovery: vi.fn(),
+}));
 vi.mock("../platform", () => ({ isNative: false }));
 vi.mock("../state/shared-cloud-account-binding", () => ({
-  clearSharedCloudAccountBinding: vi.fn(),
+  clearSharedCloudAccountBindingDurably: vi.fn(),
 }));
 vi.mock("../utils/cloud-agent-base", () => ({
   isManagedCloudSharedAgentBase: vi.fn(),
@@ -76,8 +84,12 @@ const clearStoredStewardTokenMock = vi.mocked(clearStoredStewardToken);
 const hasStewardAuthedCookieMock = vi.mocked(hasStewardAuthedCookie);
 const invokeDesktopBridgeRequestMock = vi.mocked(invokeDesktopBridgeRequest);
 const isElectrobunRuntimeMock = vi.mocked(isElectrobunRuntime);
-const clearSharedCloudAccountBindingMock = vi.mocked(
-  clearSharedCloudAccountBinding,
+const isStewardSessionRecoverySnapshotLiveMock = vi.mocked(
+  isStewardSessionRecoverySnapshotLive,
+);
+const readStewardSessionRecoveryMock = vi.mocked(readStewardSessionRecovery);
+const clearSharedCloudAccountBindingDurablyMock = vi.mocked(
+  clearSharedCloudAccountBindingDurably,
 );
 const isManagedCloudSharedAgentBaseMock = vi.mocked(
   isManagedCloudSharedAgentBase,
@@ -677,12 +689,22 @@ describe("authMe against a managed shared-agent base", () => {
     isManagedCloudSharedAgentBaseMock.mockReturnValue(true);
     isDesktopExternalApiBaseUrlMock.mockReturnValue(false);
     readStoredStewardTokenMock.mockReturnValue(null);
-    writeStoredStewardTokenMock.mockResolvedValue(undefined);
-    clearStoredStewardTokenMock.mockResolvedValue(undefined);
+    writeStoredStewardTokenMock.mockResolvedValue(null);
+    clearStoredStewardTokenMock.mockResolvedValue(true);
     hasStewardAuthedCookieMock.mockReturnValue(false);
-    clearSharedCloudAccountBindingMock.mockClear();
+    clearSharedCloudAccountBindingDurablyMock
+      .mockReset()
+      .mockResolvedValue(true);
     isElectrobunRuntimeMock.mockReturnValue(false);
+    getBootConfigMock.mockReturnValue({ branding: {} });
     getElizaApiTokenMock.mockReturnValue(undefined);
+    readStewardSessionRecoveryMock.mockReset().mockReturnValue({
+      tenantId: "elizacloud",
+      receipts: [],
+      hasOAuth: false,
+      storageAvailable: true,
+    });
+    isStewardSessionRecoverySnapshotLiveMock.mockReset().mockReturnValue(true);
     cloudTokenSecsRemainingMock.mockReset();
     refreshCloudStewardSessionMock.mockReset();
     refreshCloudStewardSessionMock.mockResolvedValue(null);
@@ -731,7 +753,7 @@ describe("authMe against a managed shared-agent base", () => {
   it("requires re-auth with a remote access hint when no token and no authed cookie exist", async () => {
     const result = await authMe();
 
-    expect(clearSharedCloudAccountBindingMock).toHaveBeenCalled();
+    expect(clearSharedCloudAccountBindingDurablyMock).toHaveBeenCalled();
     expect(result).toEqual({
       ok: false,
       status: 401,
@@ -746,10 +768,39 @@ describe("authMe against a managed shared-agent base", () => {
     expect(fetchWithCsrfMock).not.toHaveBeenCalled();
   });
 
+  it("does not report signed-out until the shared binding is durably cleared", async () => {
+    let releaseClear!: (value: boolean) => void;
+    clearSharedCloudAccountBindingDurablyMock.mockReturnValueOnce(
+      new Promise<boolean>((resolve) => {
+        releaseClear = resolve;
+      }),
+    );
+    let settled = false;
+    const result = authMe().then((value) => {
+      settled = true;
+      return value;
+    });
+
+    await Promise.resolve();
+    expect(clearSharedCloudAccountBindingDurablyMock).toHaveBeenCalledOnce();
+    expect(settled).toBe(false);
+
+    releaseClear(true);
+    await expect(result).resolves.toMatchObject({
+      ok: false,
+      status: 401,
+      reason: "remote_auth_required",
+    });
+  });
+
   it("refreshes from the authed cookie, persists the trimmed token, and authenticates", async () => {
     hasStewardAuthedCookieMock.mockReturnValue(true);
-    refreshCloudStewardSessionMock.mockResolvedValueOnce({
-      token: "  fresh-stew  ",
+    refreshCloudStewardSessionMock.mockImplementationOnce(async (options) => {
+      const session = { token: "  fresh-stew  " };
+      await options?.commitRefreshedSession?.(session, {
+        validate: () => true,
+      });
+      return session;
     });
     cloudTokenSecsRemainingMock.mockReturnValue(300);
 
@@ -757,8 +808,12 @@ describe("authMe against a managed shared-agent base", () => {
 
     expect(refreshCloudStewardSessionMock).toHaveBeenCalledWith({
       throwOnTransientHttpFailure: true,
+      mutationLease: expect.any(Object),
+      commitRefreshedSession: expect.any(Function),
     });
-    expect(writeStoredStewardTokenMock).toHaveBeenCalledWith("fresh-stew");
+    expect(writeStoredStewardTokenMock).toHaveBeenCalledWith("fresh-stew", {
+      validate: expect.any(Function),
+    });
     expect(cloudTokenSecsRemainingMock).toHaveBeenCalledWith("fresh-stew");
     expect(result).toEqual({
       ok: true,
@@ -792,14 +847,24 @@ describe("authMe against a managed shared-agent base", () => {
   it("accepts a successful refresh for an expired token and continues authenticated", async () => {
     readStoredStewardTokenMock.mockReturnValue("stale-token");
     cloudTokenSecsRemainingMock.mockReturnValue(0);
-    refreshCloudStewardSessionMock.mockResolvedValueOnce({
-      token: "renewed-stew",
+    refreshCloudStewardSessionMock.mockImplementationOnce(async (options) => {
+      const session = { token: "renewed-stew" };
+      await options?.commitRefreshedSession?.(session, {
+        validate: () => true,
+      });
+      return session;
     });
 
     const result = await authMe();
 
-    expect(refreshCloudStewardSessionMock).toHaveBeenCalledWith();
-    expect(writeStoredStewardTokenMock).toHaveBeenCalledWith("renewed-stew");
+    expect(refreshCloudStewardSessionMock).toHaveBeenCalledWith({
+      throwOnTransientHttpFailure: true,
+      mutationLease: expect.any(Object),
+      commitRefreshedSession: expect.any(Function),
+    });
+    expect(writeStoredStewardTokenMock).toHaveBeenCalledWith("renewed-stew", {
+      validate: expect.any(Function),
+    });
     expect(result).toEqual({
       ok: true,
       identity: { id: "cloud", displayName: "Eliza Cloud", kind: "machine" },
@@ -812,7 +877,7 @@ describe("authMe against a managed shared-agent base", () => {
     });
   });
 
-  it("clears stored state and reports remote_auth_required when an expired token cannot be refreshed", async () => {
+  it("preserves stored state and reports cloud_unavailable when an expired token refresh is transient", async () => {
     readStoredStewardTokenMock.mockReturnValue("stale-token");
     cloudTokenSecsRemainingMock.mockReturnValue(-5);
     refreshCloudStewardSessionMock.mockRejectedValueOnce(
@@ -821,17 +886,111 @@ describe("authMe against a managed shared-agent base", () => {
 
     const result = await authMe();
 
-    expect(clearStoredStewardTokenMock).toHaveBeenCalledTimes(1);
-    expect(clearSharedCloudAccountBindingMock).toHaveBeenCalled();
+    expect(clearStoredStewardTokenMock).not.toHaveBeenCalled();
+    expect(clearSharedCloudAccountBindingDurablyMock).not.toHaveBeenCalled();
     expect(result).toEqual({
+      ok: false,
+      status: 503,
+      reason: "cloud_unavailable",
+    });
+  });
+
+  it("reports signed-out after a structured terminal refresh already removed the exact expired token", async () => {
+    readStoredStewardTokenMock
+      .mockReturnValueOnce("stale-token")
+      .mockReturnValue(null);
+    cloudTokenSecsRemainingMock.mockReturnValue(-5);
+    refreshCloudStewardSessionMock.mockResolvedValueOnce(null);
+
+    await expect(authMe()).resolves.toMatchObject({
       ok: false,
       status: 401,
       reason: "remote_auth_required",
-      access: {
-        mode: "remote",
-        passwordConfigured: false,
-        ownerConfigured: true,
+    });
+    expect(clearStoredStewardTokenMock).not.toHaveBeenCalled();
+    expect(clearSharedCloudAccountBindingDurablyMock).toHaveBeenCalledWith({
+      validate: expect.any(Function),
+    });
+  });
+
+  it("preserves a cookie-only binding when refresh returns no token without clearing the cookie hint", async () => {
+    hasStewardAuthedCookieMock.mockReturnValue(true);
+    refreshCloudStewardSessionMock.mockResolvedValueOnce(null);
+
+    await expect(authMe()).resolves.toEqual({
+      ok: false,
+      status: 503,
+      reason: "cloud_unavailable",
+    });
+    expect(clearSharedCloudAccountBindingDurablyMock).not.toHaveBeenCalled();
+  });
+
+  it("blocks an auth probe while a durable account-B recovery receipt is active", async () => {
+    vi.stubGlobal("window", {
+      location: { origin: "https://cloud.eliza.app" },
+    });
+    readStewardSessionRecoveryMock.mockReturnValue({
+      tenantId: "elizacloud",
+      receipts: ["account-b"],
+      hasOAuth: false,
+      storageAvailable: true,
+    });
+
+    await expect(authMe()).resolves.toEqual({
+      ok: false,
+      status: 503,
+      reason: "cloud_unavailable",
+    });
+    expect(refreshCloudStewardSessionMock).not.toHaveBeenCalled();
+    expect(clearSharedCloudAccountBindingDurablyMock).not.toHaveBeenCalled();
+  });
+
+  it("does not clear a cookie-only binding when account B appears during refresh", async () => {
+    vi.stubGlobal("window", {
+      location: { origin: "https://cloud.eliza.app" },
+    });
+    hasStewardAuthedCookieMock.mockReturnValue(true);
+    refreshCloudStewardSessionMock.mockImplementationOnce(async () => {
+      isStewardSessionRecoverySnapshotLiveMock.mockReturnValue(false);
+      return null;
+    });
+
+    await expect(authMe()).resolves.toEqual({
+      ok: false,
+      status: 503,
+      reason: "cloud_unavailable",
+    });
+    expect(clearSharedCloudAccountBindingDurablyMock).not.toHaveBeenCalled();
+  });
+
+  it("does not publish signed-out when account B appears during durable binding cleanup", async () => {
+    vi.stubGlobal("window", {
+      location: { origin: "https://cloud.eliza.app" },
+    });
+    clearSharedCloudAccountBindingDurablyMock.mockImplementationOnce(
+      async (options) => {
+        expect(options?.validate?.()).toBe(true);
+        isStewardSessionRecoverySnapshotLiveMock.mockReturnValue(false);
+        return false;
       },
+    );
+
+    await expect(authMe()).resolves.toEqual({
+      ok: false,
+      status: 503,
+      reason: "cloud_unavailable",
+    });
+  });
+
+  it("reports cloud_unavailable when durable binding cleanup fails", async () => {
+    clearSharedCloudAccountBindingDurablyMock.mockRejectedValueOnce(
+      new Error("protected storage unavailable"),
+    );
+
+    await expect(authMe()).resolves.toEqual({
+      ok: false,
+      status: 503,
+      reason: "cloud_unavailable",
     });
   });
 
@@ -845,7 +1004,7 @@ describe("authMe against a managed shared-agent base", () => {
     const result = await authMe();
 
     expect(refreshCloudStewardSessionMock).not.toHaveBeenCalled();
-    expect(clearSharedCloudAccountBindingMock).not.toHaveBeenCalled();
+    expect(clearSharedCloudAccountBindingDurablyMock).not.toHaveBeenCalled();
     expect(result).toEqual({
       ok: true,
       identity: { id: "cloud", displayName: "Eliza Cloud", kind: "machine" },

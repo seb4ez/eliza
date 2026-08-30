@@ -11,7 +11,6 @@
 import type { RoleGateRole } from "@elizaos/core";
 import { getElizaApiToken } from "@elizaos/shared";
 import {
-  clearStoredStewardToken,
   hasStewardAuthedCookie,
   readStoredStewardToken,
   writeStoredStewardToken,
@@ -19,9 +18,21 @@ import {
 import { invokeDesktopBridgeRequest } from "../bridge/electrobun-rpc";
 import { isElectrobunRuntime } from "../bridge/electrobun-runtime";
 import { normalizeCloudApiKeyToken } from "../cloud/lib/cloud-api-key-token";
+import {
+  enqueueStewardSessionMutation,
+  type StewardSessionMutationLease,
+} from "../cloud/lib/steward-session-mutation-queue";
+import {
+  isStewardSessionRecoverySnapshotLive,
+  readStewardSessionRecovery,
+} from "../cloud/lib/steward-session-recovery-marker";
+import {
+  configuredStewardTenantId,
+  DEFAULT_STEWARD_TENANT_ID,
+} from "../cloud/shell/steward-config";
 import { getBootConfig } from "../config/boot-config";
 import { isNative } from "../platform";
-import { clearSharedCloudAccountBinding } from "../state/shared-cloud-account-binding";
+import { clearSharedCloudAccountBindingDurably } from "../state/shared-cloud-account-binding";
 import { isManagedCloudSharedAgentBase } from "../utils/cloud-agent-base";
 import { rememberCsrfTokenForUrl } from "./auth/csrf-cookie";
 import {
@@ -384,6 +395,122 @@ export async function authLogout(): Promise<AuthLogoutResult> {
   return { ok: true };
 }
 
+const cloudAuthUnavailable = (): AuthMeResult => ({
+  ok: false,
+  status: 503,
+  reason: "cloud_unavailable",
+});
+
+async function managedCloudAuthMe(
+  mutationLease: StewardSessionMutationLease,
+): Promise<AuthMeResult> {
+  const tenantId = configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID);
+  const authoritySnapshot =
+    typeof window === "undefined" ? null : readStewardSessionRecovery(tenantId);
+  const validateAuthority = () =>
+    authoritySnapshot === null ||
+    isStewardSessionRecoverySnapshotLive(authoritySnapshot);
+  if (
+    authoritySnapshot &&
+    (!authoritySnapshot.storageAvailable ||
+      authoritySnapshot.receipts.length > 0)
+  ) {
+    return cloudAuthUnavailable();
+  }
+
+  let token = readStoredStewardToken()?.trim();
+  const hasNativeOwnerApiKey =
+    (isNative || isElectrobunRuntime()) &&
+    Boolean(
+      normalizeCloudApiKeyToken(getBootConfig().apiToken) ??
+        normalizeCloudApiKeyToken(getElizaApiToken()),
+    );
+  const commitRefreshedSession = async (
+    session: { token?: string },
+    refreshAuthority: { validate: () => boolean },
+  ) => {
+    const validate = () => refreshAuthority.validate() && validateAuthority();
+    if (!validate()) return;
+    const fresh = session.token?.trim();
+    if (fresh) {
+      await writeStoredStewardToken(fresh, { validate });
+    }
+  };
+
+  if (!token && !hasNativeOwnerApiKey && hasStewardAuthedCookie()) {
+    const refreshed = await refreshCloudStewardSession({
+      throwOnTransientHttpFailure: true,
+      mutationLease,
+      commitRefreshedSession,
+    });
+    if (!validateAuthority()) return cloudAuthUnavailable();
+    token = refreshed?.token?.trim() || undefined;
+    if (!token && hasStewardAuthedCookie()) {
+      // An unstructured 401 or malformed response is not logout authority. A
+      // real terminal response clears this hint and performs the exact-token
+      // teardown inside refreshCloudStewardSession.
+      return cloudAuthUnavailable();
+    }
+  }
+
+  const secondsRemaining = token ? cloudTokenSecsRemaining(token) : null;
+  if (
+    token &&
+    secondsRemaining !== null &&
+    secondsRemaining <= 0 &&
+    !hasNativeOwnerApiKey
+  ) {
+    const refreshed = await refreshCloudStewardSession({
+      throwOnTransientHttpFailure: true,
+      mutationLease,
+      commitRefreshedSession,
+    });
+    if (!validateAuthority()) return cloudAuthUnavailable();
+    const fresh = refreshed?.token?.trim();
+    if (fresh) {
+      token = fresh;
+    } else {
+      const canonical = readStoredStewardToken()?.trim() || null;
+      if (canonical !== null) {
+        // A bare refresh rejection cannot retire an expired token, and a
+        // different canonical value belongs to a newer completed login. In
+        // both cases preserve every binding and retry from a fresh probe.
+        return cloudAuthUnavailable();
+      }
+      // Structured `session_ended` already performed the exact terminal clear.
+      token = undefined;
+    }
+  }
+
+  if (!token && !hasNativeOwnerApiKey) {
+    if (!validateAuthority()) return cloudAuthUnavailable();
+    await clearSharedCloudAccountBindingDurably({
+      validate: validateAuthority,
+    });
+    if (!validateAuthority()) return cloudAuthUnavailable();
+    return {
+      ok: false,
+      status: 401,
+      reason: "remote_auth_required",
+      access: {
+        mode: "remote",
+        passwordConfigured: false,
+        ownerConfigured: true,
+      },
+    };
+  }
+  return {
+    ok: true,
+    identity: { id: "cloud", displayName: "Eliza Cloud", kind: "machine" },
+    session: { id: "cloud", kind: "machine", expiresAt: null },
+    access: {
+      mode: "session",
+      passwordConfigured: true,
+      ownerConfigured: true,
+    },
+  };
+}
+
 /**
  * GET /api/auth/me — returns the current identity + session, or 401.
  *
@@ -398,73 +525,13 @@ export async function authMe(): Promise<AuthMeResult> {
   // shell "authenticated", allowing protected pollers and chat sends to loop
   // on 401 while stale agent content remained visible.
   if (isManagedCloudSharedAgentBase(authBase())) {
-    let token = readStoredStewardToken()?.trim();
-    const hasNativeOwnerApiKey =
-      (isNative || isElectrobunRuntime()) &&
-      Boolean(
-        normalizeCloudApiKeyToken(getBootConfig().apiToken) ??
-          normalizeCloudApiKeyToken(getElizaApiToken()),
-      );
-    if (!token && !hasNativeOwnerApiKey && hasStewardAuthedCookie()) {
-      try {
-        const refreshed = await refreshCloudStewardSession({
-          throwOnTransientHttpFailure: true,
-        });
-        token = refreshed?.token?.trim() || undefined;
-        if (token) await writeStoredStewardToken(token);
-      } catch {
-        // error-policy:J1 a transport, throttle, or server outage is not
-        // authoritative logout; preserve the binding and expose unavailability.
-        // "cloud_unavailable" (not "server_error") keeps this outcome out of
-        // the local-agent boot 503 retry budget so one transient refresh never
-        // becomes an amplified POST storm against a throttling endpoint.
-        return { ok: false, status: 503, reason: "cloud_unavailable" };
-      }
+    try {
+      return await enqueueStewardSessionMutation(managedCloudAuthMe);
+    } catch {
+      // error-policy:J1 a transport, protected-storage, or origin-lock failure
+      // cannot prove logout. Preserve account B and expose unavailability.
+      return cloudAuthUnavailable();
     }
-    const secondsRemaining = token ? cloudTokenSecsRemaining(token) : null;
-    if (
-      token &&
-      secondsRemaining !== null &&
-      secondsRemaining <= 0 &&
-      !hasNativeOwnerApiKey
-    ) {
-      try {
-        const refreshed = await refreshCloudStewardSession();
-        token = refreshed?.token?.trim() || undefined;
-        if (token) await writeStoredStewardToken(token);
-      } catch {
-        // error-policy:J1 this auth boundary translates a failed terminal
-        // refresh into the same explicit signed-out state as a rejected one.
-        token = undefined;
-      }
-      if (!token) {
-        await clearStoredStewardToken();
-        clearSharedCloudAccountBinding();
-      }
-    }
-    if (!token && !hasNativeOwnerApiKey) {
-      clearSharedCloudAccountBinding();
-      return {
-        ok: false,
-        status: 401,
-        reason: "remote_auth_required",
-        access: {
-          mode: "remote",
-          passwordConfigured: false,
-          ownerConfigured: true,
-        },
-      };
-    }
-    return {
-      ok: true,
-      identity: { id: "cloud", displayName: "Eliza Cloud", kind: "machine" },
-      session: { id: "cloud", kind: "machine", expiresAt: null },
-      access: {
-        mode: "session",
-        passwordConfigured: true,
-        ownerConfigured: true,
-      },
-    };
   }
   // Prefer typed Electrobun RPC. The bun-side composer throws
   // AgentNotReadyError if the agent has no port yet — we catch and
