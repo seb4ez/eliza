@@ -273,9 +273,9 @@ describe("Steward session storage transitions", () => {
     localStorage.setItem(STEWARD_TOKEN_KEY, "steward-token");
     localStorage.setItem(STEWARD_REFRESH_TOKEN_KEY, "legacy-refresh-token");
     const storageFailure = new Error("legacy refresh storage unavailable");
-    const originalRemoveItem = window.localStorage.removeItem;
+    const originalRemoveItem = Storage.prototype.removeItem;
     const removeItem = vi
-      .spyOn(window.localStorage, "removeItem")
+      .spyOn(Storage.prototype, "removeItem")
       .mockImplementation(function (this: Storage, key: string) {
         if (key === STEWARD_REFRESH_TOKEN_KEY) throw storageFailure;
         return Reflect.apply(originalRemoveItem, this, [key]);
@@ -312,7 +312,7 @@ describe("Steward session storage transitions", () => {
     };
     window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
     const setItem = vi
-      .spyOn(window.localStorage, "setItem")
+      .spyOn(Storage.prototype, "setItem")
       .mockImplementation(() => {
         throw storageFailure;
       });
@@ -330,7 +330,7 @@ describe("Steward session storage transitions", () => {
     }
 
     const removeItem = vi
-      .spyOn(window.localStorage, "removeItem")
+      .spyOn(Storage.prototype, "removeItem")
       .mockImplementation(() => {
         throw storageFailure;
       });
@@ -546,7 +546,7 @@ describe("Steward session storage transitions", () => {
   it("does not disguise a failed canonical read as a missing session", () => {
     const storageFailure = new Error("canonical storage unavailable");
     const getItem = vi
-      .spyOn(window.localStorage, "getItem")
+      .spyOn(Storage.prototype, "getItem")
       .mockImplementation(() => {
         throw storageFailure;
       });

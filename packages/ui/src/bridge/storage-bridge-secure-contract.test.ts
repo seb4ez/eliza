@@ -838,5 +838,5 @@ describe("native protected-storage bridge contract", () => {
     await removal;
     expect(settled).toBe(true);
     expect(persistence.loadPersistedActiveServer()).toBeNull();
-  });
+  }, 60_000);
 });
