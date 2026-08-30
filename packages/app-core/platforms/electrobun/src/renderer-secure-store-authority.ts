@@ -31,7 +31,20 @@ import type {
   RendererSecureStoreSetResult,
 } from "./rpc-schema";
 
-export type RendererSecureStoreOwner = symbol;
+/**
+ * Opaque renderer-document identity. Owners must be objects so the released
+ * deny tombstone can be weak: a late closure keeps its own owner denied, while
+ * completed reloads do not accumulate process-lifetime strong references.
+ */
+export interface RendererSecureStoreOwner {
+  readonly identity: symbol;
+}
+
+export function createRendererSecureStoreOwner(
+  label = "renderer-secure-store-owner",
+): RendererSecureStoreOwner {
+  return Object.freeze({ identity: Symbol(label) });
+}
 
 interface SlotRollbackAuthority {
   cancelled: boolean;
@@ -101,7 +114,9 @@ const DEFAULT_JOURNAL_CAPACITY = 512;
 const DEFAULT_JOURNAL_TTL_MS = 31 * 60_000;
 const DEFAULT_MAX_PENDING_RECEIPTS_PER_SLOT = 256;
 const LIVE_SET_JOURNAL_WEIGHT = 2;
-const defaultOwner = Symbol("renderer-secure-store-default-owner");
+const defaultOwner = createRendererSecureStoreOwner(
+  "renderer-secure-store-default-owner",
+);
 
 const rollbackVerificationFailure = {
   ok: false,
@@ -141,7 +156,7 @@ export class RendererSecureStoreAuthority {
   private readonly now: () => number;
   private nextOwnerId = 0;
   private readonly ownerIds = new Map<RendererSecureStoreOwner, number>();
-  private readonly releasedOwners = new Set<RendererSecureStoreOwner>();
+  private readonly releasedOwners = new WeakSet<RendererSecureStoreOwner>();
   private readonly slotStates = new Map<string, SlotAuthorityState>();
   private readonly slotTails = new Map<string, Promise<void>>();
 
@@ -200,7 +215,6 @@ export class RendererSecureStoreAuthority {
     this.slotTails.set(slot, tail);
     void tail.then(() => {
       if (this.slotTails.get(slot) === tail) this.slotTails.delete(slot);
-      this.pruneReleasedOwnerIdentities();
     });
     return result;
   }
@@ -375,15 +389,39 @@ export class RendererSecureStoreAuthority {
     return false;
   }
 
-  private pruneReleasedOwnerIdentities(): void {
-    for (const owner of this.releasedOwners) {
+  private forgetReleasedOwnerIdentities(
+    owners: Iterable<RendererSecureStoreOwner>,
+  ): void {
+    for (const owner of owners) {
       if (
+        this.releasedOwners.has(owner) &&
         !this.activeOwnerOperations.has(owner) &&
         !this.ownerHasReceipts(owner)
       ) {
         this.forgetOwnerJournal(owner);
       }
     }
+  }
+
+  private clearRollbacks(state: SlotAuthorityState): void {
+    const owners = new Set(
+      Array.from(state.rollbacks.values(), (rollback) => rollback.owner),
+    );
+    state.rollbacks.clear();
+    this.forgetReleasedOwnerIdentities(owners);
+  }
+
+  private deleteRollbacks(
+    state: SlotAuthorityState,
+    receipts: Iterable<string>,
+  ): void {
+    const owners = new Set<RendererSecureStoreOwner>();
+    for (const receipt of receipts) {
+      const rollback = state.rollbacks.get(receipt);
+      if (rollback) owners.add(rollback.owner);
+      state.rollbacks.delete(receipt);
+    }
+    this.forgetReleasedOwnerIdentities(owners);
   }
 
   private discardCurrentRollback(
@@ -394,6 +432,7 @@ export class RendererSecureStoreAuthority {
     if (state.currentReceipt === rollback.receipt) {
       state.currentReceipt = rollback.parentReceipt;
     }
+    this.forgetReleasedOwnerIdentities([rollback.owner]);
   }
 
   /** Resolve past ancestors that have already lost publication authority. */
@@ -421,8 +460,18 @@ export class RendererSecureStoreAuthority {
   get(
     vaultId: string,
     kind: SecureStoreSecretKind,
+    owner: RendererSecureStoreOwner = defaultOwner,
   ): Promise<SecureStoreGetResult> {
-    return this.serialize(vaultId, kind, () => this.store.get(vaultId, kind));
+    return this.serialize(vaultId, kind, async () => {
+      if (this.releasedOwners.has(owner)) return releasedOwnerFailure;
+      return this.store.get(vaultId, kind);
+    });
+  }
+
+  assertOwnerActive(owner: RendererSecureStoreOwner): void {
+    if (this.releasedOwners.has(owner)) {
+      throw new Error(releasedOwnerFailure.message);
+    }
   }
 
   set(
@@ -504,7 +553,7 @@ export class RendererSecureStoreAuthority {
           : null;
         if (currentRollback && currentRollback.value !== predecessor) {
           state.currentReceipt = null;
-          state.rollbacks.clear();
+          this.clearRollbacks(state);
         }
         if (state.rollbacks.size >= this.maxPendingReceiptsPerSlot) {
           const result = {
@@ -560,7 +609,7 @@ export class RendererSecureStoreAuthority {
           } else {
             // Never overwrite a value placed by an authority outside this chain.
             state.currentReceipt = null;
-            state.rollbacks.clear();
+            this.clearRollbacks(state);
           }
           result = writeResult.ok ? writeVerificationFailure : writeResult;
         } else {
@@ -606,7 +655,7 @@ export class RendererSecureStoreAuthority {
       } else if (state.currentReceipt === rollbackReceipt) {
         const effective = this.effectivePredecessor(state, committed);
         state.currentReceipt = null;
-        state.rollbacks.clear();
+        this.clearRollbacks(state);
         result = { ok: true, committed: true };
         this.rememberCommit(journalKey, {
           compensation: {
@@ -782,7 +831,7 @@ export class RendererSecureStoreAuthority {
       if (result.ok || result.reason === "not_found") {
         const state = this.stateFor(this.slotKey(vaultId, kind), vaultId, kind);
         state.currentReceipt = null;
-        state.rollbacks.clear();
+        this.clearRollbacks(state);
       }
       return result;
     }).finally(() => this.endOwnerOperation(owner));
@@ -882,7 +931,7 @@ export class RendererSecureStoreAuthority {
             kind,
           );
           state.currentReceipt = null;
-          state.rollbacks.clear();
+          this.clearRollbacks(state);
           return finish({
             ok: true,
             deleted: true,
@@ -1025,7 +1074,7 @@ export class RendererSecureStoreAuthority {
           // predecessor chain so endpoint cleanup can still roll A back.
           const state = this.stateFor(slot, vaultId, kind);
           state.currentReceipt = null;
-          state.rollbacks.clear();
+          this.clearRollbacks(state);
           return finish({
             ok: true,
             applied: true,
@@ -1061,7 +1110,7 @@ export class RendererSecureStoreAuthority {
       const current = await this.store.get(vaultId, kind);
       if (!current.ok && current.reason === "not_found") {
         state.currentReceipt = null;
-        state.rollbacks.clear();
+        this.clearRollbacks(state);
         return { ok: true, restored: false, value: null };
       }
       return current.ok
@@ -1072,13 +1121,13 @@ export class RendererSecureStoreAuthority {
     const current = await this.store.get(vaultId, kind);
     if (!current.ok && current.reason === "not_found") {
       state.currentReceipt = null;
-      state.rollbacks.clear();
+      this.clearRollbacks(state);
       return { ok: true, restored: false, value: null };
     }
     if (!current.ok) return current;
     if (current.value !== rollback.value) {
       state.currentReceipt = null;
-      state.rollbacks.clear();
+      this.clearRollbacks(state);
       return { ok: true, restored: false, value: current.value };
     }
 
@@ -1094,7 +1143,7 @@ export class RendererSecureStoreAuthority {
       const deletion = await this.store.delete(vaultId, kind);
       const verified = await this.store.get(vaultId, kind);
       if (!verified.ok && verified.reason === "not_found") {
-        for (const receipt of consumedReceipts) state.rollbacks.delete(receipt);
+        this.deleteRollbacks(state, consumedReceipts);
         state.currentReceipt = parentReceipt;
         return { ok: true, restored: true, value: null };
       }
@@ -1105,7 +1154,7 @@ export class RendererSecureStoreAuthority {
     const restoration = await this.store.set(vaultId, kind, predecessor);
     const verified = await this.store.get(vaultId, kind);
     if (verified.ok && verified.value === predecessor) {
-      for (const receipt of consumedReceipts) state.rollbacks.delete(receipt);
+      this.deleteRollbacks(state, consumedReceipts);
       state.currentReceipt = parentReceipt;
       return { ok: true, restored: true, value: predecessor };
     }
@@ -1213,9 +1262,8 @@ export class RendererSecureStoreAuthority {
       !this.ownerHasReceipts(owner)
     ) {
       this.ownerIds.delete(owner);
-      // Keep releasedOwners as a permanent process-lifetime deny tombstone.
-      // Late closures still hold the symbol after every receipt and retry
-      // journal entry drains; deleting it would silently re-authorize them.
+      // The weak released-owner tombstone remains while any late closure still
+      // holds this owner, without retaining completed document generations.
     }
   }
 

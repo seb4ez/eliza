@@ -149,16 +149,20 @@ type TrayPopoverBrowserWindowOptions = ElectrobunBrowserWindowOptions;
  */
 type TrayPopoverRpc = NonNullable<TrayPopoverBrowserWindowOptions["rpc"]>;
 
+interface TrayPopoverRpcEndpoint {
+  rpc: TrayPopoverRpc;
+  bindRendererLifecycle?: (lifecycle: BrowserWindow["webview"]) => void;
+  wireRpc?: (window: BrowserWindow) => void;
+  release: () => void;
+}
+
 interface TrayPopoverConfig {
   url: string;
   preload: string;
   partition?: string | null;
-  rpc?: TrayPopoverRpc;
-  bindRendererLifecycle?: (lifecycle: BrowserWindow["webview"]) => void;
+  createRpcEndpoint: () => TrayPopoverRpcEndpoint;
   injectApiBase?: (window: BrowserWindow) => void;
-  wireRpc?: (window: BrowserWindow) => void;
   onWindowFocused?: (window: BrowserWindow) => void;
-  onWindowClosed?: () => void;
 }
 
 interface ShowItemInFolderOptions {
@@ -2448,6 +2452,13 @@ X-GNOME-Autostart-enabled=true
 
     const buildConfig = await BuildConfig.get();
     const renderer = this.resolvePreferredBrowserRenderer(buildConfig);
+    const endpoint = config.createRpcEndpoint();
+    let endpointReleased = false;
+    const releaseEndpoint = (): void => {
+      if (endpointReleased) return;
+      endpointReleased = true;
+      endpoint.release();
+    };
     const options: TrayPopoverBrowserWindowOptions = {
       title: `${getBrandConfig().appName}`,
       url: config.url,
@@ -2457,11 +2468,17 @@ X-GNOME-Autostart-enabled=true
       transparent: true,
       titleBarStyle: "hidden",
       ...(config.partition ? { partition: config.partition } : {}),
-      ...(config.rpc ? { rpc: config.rpc } : {}),
+      rpc: endpoint.rpc,
     };
-    const win = createElectrobunBrowserWindow(options);
-    config.bindRendererLifecycle?.(win.webview);
-    config.wireRpc?.(win);
+    let win: BrowserWindow;
+    try {
+      win = createElectrobunBrowserWindow(options);
+      endpoint.bindRendererLifecycle?.(win.webview);
+      endpoint.wireRpc?.(win);
+    } catch (error) {
+      releaseEndpoint();
+      throw error;
+    }
     win.webview.on("dom-ready", () => {
       config.injectApiBase?.(win);
     });
@@ -2486,11 +2503,13 @@ X-GNOME-Autostart-enabled=true
     });
 
     win.on("close", () => {
-      config.onWindowClosed?.();
-      this.trayPopoverWindow = null;
-      this.trayPopoverVisible = false;
-      this.trayPopoverLastAnchorBounds = null;
-      this.clearTrayPopoverBlurTimer();
+      releaseEndpoint();
+      if (this.trayPopoverWindow === win) {
+        this.trayPopoverWindow = null;
+        this.trayPopoverVisible = false;
+        this.trayPopoverLastAnchorBounds = null;
+        this.clearTrayPopoverBlurTimer();
+      }
     });
 
     this.trayPopoverWindow = win;

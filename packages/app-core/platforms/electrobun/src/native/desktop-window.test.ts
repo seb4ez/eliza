@@ -815,17 +815,36 @@ describe("DesktopManager main window controls", () => {
   it("opens tray popover as an app renderer with preload, rpc, partition, and API injection", async () => {
     const manager = new DesktopManager();
     const rpc = { request: {}, send: {}, setTransport: vi.fn() };
+    const reopenedRpc = { request: {}, send: {}, setTransport: vi.fn() };
+    const bindRendererLifecycle = vi.fn();
+    const bindReopenedRendererLifecycle = vi.fn();
     const injectApiBase = vi.fn();
     const wireRpc = vi.fn();
+    const wireReopenedRpc = vi.fn();
+    const releaseRpc = vi.fn();
+    const releaseReopenedRpc = vi.fn();
     const onWindowFocused = vi.fn();
+    const createRpcEndpoint = vi
+      .fn()
+      .mockReturnValueOnce({
+        rpc,
+        bindRendererLifecycle,
+        wireRpc,
+        release: releaseRpc,
+      })
+      .mockReturnValueOnce({
+        rpc: reopenedRpc,
+        bindRendererLifecycle: bindReopenedRendererLifecycle,
+        wireRpc: wireReopenedRpc,
+        release: releaseReopenedRpc,
+      });
 
     manager.configureTrayPopover({
       url: "http://127.0.0.1:5173/?shellMode=tray-popover",
       preload: "// preload",
       partition: "persist:eliza-main",
-      rpc,
+      createRpcEndpoint,
       injectApiBase,
-      wireRpc,
       onWindowFocused,
     });
 
@@ -849,6 +868,8 @@ describe("DesktopManager main window controls", () => {
       height: 480,
     });
     expect(win.webview.remove).not.toHaveBeenCalled();
+    expect(createRpcEndpoint).toHaveBeenCalledOnce();
+    expect(bindRendererLifecycle).toHaveBeenCalledWith(win.webview);
     expect(wireRpc).toHaveBeenCalledWith(win);
     expect(onWindowFocused).toHaveBeenCalledWith(win);
     expect(win.setAlwaysOnTop).toHaveBeenCalledWith(true);
@@ -886,12 +907,24 @@ describe("DesktopManager main window controls", () => {
     });
 
     manager.closeTrayPopover();
+    expect(releaseRpc).toHaveBeenCalledOnce();
     expect(manager.getTrayPopoverDiagnostics()).toMatchObject({
       configured: true,
       windowPresent: false,
       visible: false,
       lastAnchorBounds: null,
     });
+
+    await manager.toggleTrayPopover();
+    const reopened = electrobunMock.browserWindowInstances[1];
+    expect(createRpcEndpoint).toHaveBeenCalledTimes(2);
+    expect(electrobunMock.BrowserWindow).toHaveBeenCalledTimes(2);
+    expect(reopened.options).toMatchObject({ rpc: reopenedRpc });
+    expect(bindReopenedRendererLifecycle).toHaveBeenCalledWith(
+      reopened.webview,
+    );
+    expect(wireReopenedRpc).toHaveBeenCalledWith(reopened);
+    expect(releaseReopenedRpc).not.toHaveBeenCalled();
   });
 
   it("awaits tray teardown during dispose", async () => {

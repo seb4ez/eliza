@@ -21,11 +21,25 @@ import { ensureElectrobunGlobal } from "./electrobun-stub.js";
 type RendererRequestHandler = (params: unknown) => Promise<unknown>;
 type RendererBridgeRpc = {
   request: Record<string, RendererRequestHandler>;
+  send: (message: string, payload?: unknown) => void;
   setTransport: (transport: unknown) => void;
 };
 
 const listenersByRpcMessage: Record<string, Set<RpcMessageListener>> = {};
 const RENDERER_LOG_MIRROR_KEY = "__ELIZA_ELECTROBUN_LOG_MIRROR__";
+const SECURE_STORE_CAPABILITY_CALLBACK =
+  "__ELIZA_ACCEPT_SECURE_STORE_DOCUMENT_CAPABILITY__";
+const DOCUMENT_SCOPED_SECURE_STORE_REQUESTS = new Set([
+  "secureStoreGet",
+  "secureStoreRevision",
+  "secureStoreSet",
+  "secureStoreCommitReceipt",
+  "secureStoreCompensateCommittedReceipt",
+  "secureStoreDelete",
+  "secureStoreCompareAndDelete",
+  "secureStoreCompareAndSet",
+  "secureStoreCompareAndRestore",
+]);
 
 function readRecord(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object") {
@@ -138,9 +152,63 @@ const rpc = Electroview.defineRPC({
       "*": handleWildcardMessage,
     },
   },
-}) as RendererBridgeRpc;
+}) as unknown as RendererBridgeRpc;
 
 new Electroview({ rpc });
+
+let secureStoreDocumentCapability: string | null = null;
+let secureStoreDocumentGeneration = -1;
+let resolveSecureStoreCapability: () => void = () => {};
+const secureStoreCapabilityReady = new Promise<void>((resolve) => {
+  resolveSecureStoreCapability = resolve;
+});
+
+Object.defineProperty(window, SECURE_STORE_CAPABILITY_CALLBACK, {
+  configurable: true,
+  enumerable: false,
+  value: (payload: unknown): void => {
+    if (!payload || typeof payload !== "object") return;
+    const candidate = payload as {
+      documentCapability?: unknown;
+      generation?: unknown;
+    };
+    if (
+      typeof candidate.documentCapability !== "string" ||
+      candidate.documentCapability.length === 0 ||
+      candidate.documentCapability.length > 128 ||
+      !Number.isSafeInteger(candidate.generation) ||
+      (candidate.generation as number) < secureStoreDocumentGeneration
+    ) {
+      return;
+    }
+    if (
+      candidate.generation === secureStoreDocumentGeneration &&
+      secureStoreDocumentCapability !== null &&
+      candidate.documentCapability !== secureStoreDocumentCapability
+    ) {
+      return;
+    }
+    secureStoreDocumentGeneration = candidate.generation as number;
+    secureStoreDocumentCapability = candidate.documentCapability;
+    resolveSecureStoreCapability();
+  },
+  writable: false,
+});
+
+// A ready message is only a bounded, fire-and-forget resend hint. It cannot
+// mint or return a capability over the shared renderer socket; the host injects
+// its current capability into the native document after an authenticated
+// lifecycle commit and complete predecessor rollback.
+for (const delayMs of [0, 25, 100, 500]) {
+  setTimeout(() => {
+    if (typeof window === "undefined" || secureStoreDocumentCapability) return;
+    try {
+      rpc.send("secureStoreDocumentReady", {});
+    } catch {
+      // A later bounded hint or the next document reload retries publication.
+    }
+  }, delayMs);
+}
 
 function summarizeDiagnosticValue(value: unknown): unknown {
   if (value instanceof Error) {
@@ -162,6 +230,20 @@ const instrumentedRequest = new Proxy(rpc.request, {
 
     return async (params: unknown) => {
       try {
+        if (
+          typeof prop === "string" &&
+          DOCUMENT_SCOPED_SECURE_STORE_REQUESTS.has(prop)
+        ) {
+          await secureStoreCapabilityReady;
+          if (!secureStoreDocumentCapability) {
+            throw new Error("Secure credential document capability is absent.");
+          }
+          const record = readRecord(params);
+          return await value.call(target, {
+            ...record,
+            documentCapability: secureStoreDocumentCapability,
+          });
+        }
         return await value.call(target, params);
       } catch (error) {
         void rpc.request

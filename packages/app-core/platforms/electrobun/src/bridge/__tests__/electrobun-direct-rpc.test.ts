@@ -42,6 +42,9 @@ type TestWindow = ElectrobunBootConfigWindow & {
   __ELIZA_ELECTROBUN_RPC__?: RpcBridge;
   __ELIZA_DESKTOP_EXTERNAL_API_BASE__?: string;
   __ELIZA_ELECTROBUN_LOG_MIRROR__?: boolean;
+  __ELIZA_ACCEPT_SECURE_STORE_DOCUMENT_CAPABILITY__?: (
+    payload: unknown,
+  ) => void;
   fetch?: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
   addEventListener: (
     type: string,
@@ -84,6 +87,7 @@ const harness = vi.hoisted(() => {
   const bunRequest: Record<string, unknown> = {
     version: 1,
   };
+  const bunSend = vi.fn();
   const state = {
     maxRequestTime: 0,
     constructed: 0,
@@ -92,7 +96,9 @@ const harness = vi.hoisted(() => {
       | ((messageName: unknown, payload: unknown) => void)
       | undefined,
     bunRequest,
+    bunSend,
     diagnostics,
+    secureStoreSetCalls: [] as unknown[],
     reportDiagnosticShouldFail: false,
     fetchImpl: async (
       _input: RequestInfo | URL,
@@ -105,6 +111,10 @@ const harness = vi.hoisted(() => {
       throw new Error("diagnostic transport failed");
     }
     diagnostics.push(params);
+  };
+  bunRequest.secureStoreSet = async (params: unknown) => {
+    state.secureStoreSetCalls.push(params);
+    return { ok: true, rollbackReceipt: "test-receipt", changed: true };
   };
   bunRequest.echo = async (params: unknown) => params;
   bunRequest.fail = async () => {
@@ -133,6 +143,7 @@ vi.mock("electrobun/view", () => {
       harness.wildcardMessage = config.handlers.messages["*"];
       return {
         request: harness.bunRequest,
+        send: harness.bunSend,
         setTransport: (_transport: unknown) => {},
       };
     }
@@ -235,6 +246,39 @@ afterAll(() => {
 });
 
 describe("electrobun-direct-rpc preload", () => {
+  it("blocks secure RPC until the host injects a capability and overwrites a forged capability", async () => {
+    const secureRequest = rpc().request.secureStoreSet({
+      documentCapability: "forged-capability",
+      kind: "session.steward_token",
+      mutationId: "mutation-1",
+      value: "opaque-value",
+    });
+    await Promise.resolve();
+    expect(harness.secureStoreSetCalls).toHaveLength(0);
+    await vi.waitFor(() => {
+      expect(harness.bunSend).toHaveBeenCalledWith(
+        "secureStoreDocumentReady",
+        {},
+      );
+    });
+
+    const window = (globalThis as unknown as { window: TestWindow }).window;
+    window.__ELIZA_ACCEPT_SECURE_STORE_DOCUMENT_CAPABILITY__?.({
+      documentCapability: "host-capability-a",
+      generation: 1,
+    });
+    await expect(secureRequest).resolves.toMatchObject({ ok: true });
+    expect(harness.secureStoreSetCalls).toEqual([
+      {
+        documentCapability: "host-capability-a",
+        kind: "session.steward_token",
+        mutationId: "mutation-1",
+        value: "opaque-value",
+      },
+    ]);
+    expect(rpc().request.secureStoreOpenDocument).toBeUndefined();
+  });
+
   it("installs the public RPC bridge and constructs Electroview with a 600s timeout", () => {
     const bridge = rpc();
     expect(typeof bridge.request).toBe("object");

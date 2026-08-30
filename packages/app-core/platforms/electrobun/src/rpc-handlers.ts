@@ -343,6 +343,21 @@ const rendererSecureStoreKinds = new Set<RendererSecureStoreKind>([
 const RENDERER_SECURE_STORE_MAX_VALUE_BYTES = 256 * 1024;
 const RENDERER_SECURE_STORE_MAX_RECEIPT_BYTES = 512;
 const RENDERER_SECURE_STORE_MAX_MUTATION_ID_BYTES = 128;
+const RENDERER_SECURE_STORE_MAX_DOCUMENT_CAPABILITY_BYTES = 128;
+
+export interface RendererSecureStoreDocumentAuthority {
+  run<T>(
+    documentCapability: string,
+    operation: (owner: RendererSecureStoreOwner) => Promise<T>,
+  ): Promise<T>;
+}
+
+const unavailableRendererSecureStoreDocuments: RendererSecureStoreDocumentAuthority =
+  {
+    run: async () => {
+      throw new Error("Secure credential document authority is unavailable.");
+    },
+  };
 
 function requireRendererSecureStoreKind(
   value: unknown,
@@ -386,6 +401,18 @@ function requireRendererSecureStoreMutationId(value: unknown): string {
       RENDERER_SECURE_STORE_MAX_MUTATION_ID_BYTES
   ) {
     throw new Error("secure-store mutation id is missing or too large");
+  }
+  return value;
+}
+
+function requireRendererSecureStoreDocumentCapability(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    Buffer.byteLength(value, "utf8") >
+      RENDERER_SECURE_STORE_MAX_DOCUMENT_CAPABILITY_BYTES
+  ) {
+    throw new Error("secure-store document capability is missing or too large");
   }
   return value;
 }
@@ -481,18 +508,20 @@ async function configureRemoteTargetForCurrentLoopback(): Promise<void> {
 export function buildBunRpcHandlers({
   sendToWebview,
   shellControllerEndpoint,
-  secureStoreOwner = Symbol("legacy-renderer-secure-store-owner"),
+  secureStoreDocuments = unavailableRendererSecureStoreDocuments,
 }: {
   sendToWebview: SendToWebview;
   shellControllerEndpoint?: ShellControllerEndpoint;
-  secureStoreOwner?:
-    | RendererSecureStoreOwner
-    | (() => Promise<RendererSecureStoreOwner>);
+  secureStoreDocuments?: RendererSecureStoreDocumentAuthority;
 }): BunRpcHandlers {
-  const resolveSecureStoreOwner =
-    typeof secureStoreOwner === "function"
-      ? secureStoreOwner
-      : async () => secureStoreOwner;
+  const runWithSecureStoreOwner = <T>(
+    params: { documentCapability?: unknown },
+    operation: (owner: RendererSecureStoreOwner) => Promise<T>,
+  ): Promise<T> =>
+    secureStoreDocuments.run(
+      requireRendererSecureStoreDocumentCapability(params?.documentCapability),
+      operation,
+    );
   const agent = getAgentManager();
   const camera = getCameraManager();
   const canvas = getCanvasManager();
@@ -1484,201 +1513,205 @@ export function buildBunRpcHandlers({
     secureStoreGet: async (params) => {
       // A new renderer document cannot hydrate secure state until the host has
       // rolled back every uncommitted receipt owned by its predecessor.
-      await resolveSecureStoreOwner();
-      const vaultId = deriveAgentVaultId();
-      const kind = requireRendererSecureStoreKind(params?.kind);
-      return rendererSecureStoreRevisions.run(
-        vaultId,
-        kind,
-        () => rendererSecureStoreAuthority.get(vaultId, kind),
-        { invalidates: () => false },
-      );
+      return runWithSecureStoreOwner(params, async (owner) => {
+        const vaultId = deriveAgentVaultId();
+        const kind = requireRendererSecureStoreKind(params?.kind);
+        return rendererSecureStoreRevisions.run(
+          vaultId,
+          kind,
+          () => rendererSecureStoreAuthority.get(vaultId, kind, owner),
+          { invalidates: () => false },
+        );
+      });
     },
-    secureStoreRevision: async (params) => {
-      await resolveSecureStoreOwner();
-      const vaultId = deriveAgentVaultId();
-      const kind = requireRendererSecureStoreKind(params?.kind);
-      return rendererSecureStoreRevisions.run(
-        vaultId,
-        kind,
-        async () => ({ ok: true as const }),
-        { invalidates: () => false },
-      );
-    },
-    secureStoreSet: async (params) => {
-      const owner = await resolveSecureStoreOwner();
-      const vaultId = deriveAgentVaultId();
-      const kind = requireRendererSecureStoreKind(params?.kind);
-      const value = requireRendererSecureStoreValue(params?.value);
-      const mutationId = requireRendererSecureStoreMutationId(
-        params?.mutationId,
-      );
-      return rendererSecureStoreRevisions.run(
-        vaultId,
-        kind,
-        () =>
-          rendererSecureStoreAuthority.set(
-            vaultId,
-            kind,
-            value,
-            owner,
-            mutationId,
-          ),
-        {
-          invalidates: (result) => result.changed !== false,
-          invalidatesOnError: true,
-        },
-      );
-    },
-    secureStoreCommitReceipt: async (params) => {
-      const owner = await resolveSecureStoreOwner();
-      const vaultId = deriveAgentVaultId();
-      const kind = requireRendererSecureStoreKind(params?.kind);
-      const receipt = requireRendererSecureStoreRollbackReceipt(
-        params?.rollbackReceipt,
-      );
-      return rendererSecureStoreRevisions.run(
-        vaultId,
-        kind,
-        () =>
-          rendererSecureStoreAuthority.commitReceipt(
-            vaultId,
-            kind,
-            receipt,
-            owner,
-          ),
-        { invalidates: () => false },
-      );
-    },
-    secureStoreCompensateCommittedReceipt: async (params) => {
-      const owner = await resolveSecureStoreOwner();
-      const vaultId = deriveAgentVaultId();
-      const kind = requireRendererSecureStoreKind(params?.kind);
-      const receipt = requireRendererSecureStoreRollbackReceipt(
-        params?.rollbackReceipt,
-      );
-      const expectedRevision = requireRendererSecureStoreRevision(
-        params?.expectedRevision,
-      );
-      return rendererSecureStoreRevisions.runWithRevision(
-        vaultId,
-        kind,
-        (currentRevision) =>
-          rendererSecureStoreAuthority.compensateCommittedReceipt(
-            vaultId,
-            kind,
-            receipt,
-            expectedRevision,
-            currentRevision,
-            owner,
-          ),
-        {
-          invalidates: (result) => result.ok && result.changed,
-          invalidatesOnError: true,
-        },
-      );
-    },
-    secureStoreDelete: async (params) => {
-      const owner = await resolveSecureStoreOwner();
-      const vaultId = deriveAgentVaultId();
-      const kind = requireRendererSecureStoreKind(params?.kind);
-      return rendererSecureStoreRevisions.run(
-        vaultId,
-        kind,
-        () => rendererSecureStoreAuthority.delete(vaultId, kind, owner),
-        { invalidates: () => true, invalidatesOnError: true },
-      );
-    },
-    secureStoreCompareAndDelete: async (params) => {
-      const owner = await resolveSecureStoreOwner();
-      const vaultId = deriveAgentVaultId();
-      const kind = requireRendererSecureStoreKind(params?.kind);
-      const expectedValue =
-        params?.expectedValue === null
-          ? null
-          : requireRendererSecureStoreValue(params?.expectedValue);
-      const expectedRevision = requireRendererSecureStoreRevision(
-        params?.expectedRevision,
-      );
-      const mutationId = requireRendererSecureStoreMutationId(
-        params?.mutationId,
-      );
-      return rendererSecureStoreRevisions.runWithRevision(
-        vaultId,
-        kind,
-        (currentRevision) =>
-          rendererSecureStoreAuthority.compareAndDelete(
-            vaultId,
-            kind,
-            expectedValue,
-            expectedRevision,
-            currentRevision,
-            owner,
-            mutationId,
-          ),
-        {
-          invalidates: (result) => result.changed !== false,
-          invalidatesOnError: true,
-        },
-      );
-    },
-    secureStoreCompareAndSet: async (params) => {
-      const owner = await resolveSecureStoreOwner();
-      const vaultId = deriveAgentVaultId();
-      const kind = requireRendererSecureStoreKind(params?.kind);
-      const expectedValue = requireRendererSecureStoreValue(
-        params?.expectedValue,
-      );
-      const value = requireRendererSecureStoreValue(params?.value);
-      const expectedRevision = requireRendererSecureStoreRevision(
-        params?.expectedRevision,
-      );
-      const mutationId = requireRendererSecureStoreMutationId(
-        params?.mutationId,
-      );
-      return rendererSecureStoreRevisions.runWithRevision(
-        vaultId,
-        kind,
-        (currentRevision) =>
-          rendererSecureStoreAuthority.compareAndSet(
-            vaultId,
-            kind,
-            expectedValue,
-            value,
-            expectedRevision,
-            currentRevision,
-            owner,
-            mutationId,
-          ),
-        {
-          invalidates: (result) => result.changed !== false,
-          invalidatesOnError: true,
-        },
-      );
-    },
-    secureStoreCompareAndRestore: async (params) => {
-      const owner = await resolveSecureStoreOwner();
-      const vaultId = deriveAgentVaultId();
-      const kind = requireRendererSecureStoreKind(params?.kind);
-      const receipt = requireRendererSecureStoreRollbackReceipt(
-        params?.rollbackReceipt,
-      );
-      return rendererSecureStoreRevisions.run(
-        vaultId,
-        kind,
-        () =>
-          rendererSecureStoreAuthority.compareAndRestore(
-            vaultId,
-            kind,
-            receipt,
-            owner,
-          ),
-        // A stale rollback can still cancel an abandoned ancestor. Broadcast
-        // its returned host snapshot as an invalidation even when no value was
-        // restored, so every renderer drops credentials from an older epoch.
-        { invalidates: () => true, invalidatesOnError: true },
-      );
-    },
+    secureStoreRevision: async (params) =>
+      runWithSecureStoreOwner(params, async (owner) => {
+        const vaultId = deriveAgentVaultId();
+        const kind = requireRendererSecureStoreKind(params?.kind);
+        return rendererSecureStoreRevisions.run(
+          vaultId,
+          kind,
+          async () => {
+            rendererSecureStoreAuthority.assertOwnerActive(owner);
+            return { ok: true as const };
+          },
+          { invalidates: () => false },
+        );
+      }),
+    secureStoreSet: async (params) =>
+      runWithSecureStoreOwner(params, async (owner) => {
+        const vaultId = deriveAgentVaultId();
+        const kind = requireRendererSecureStoreKind(params?.kind);
+        const value = requireRendererSecureStoreValue(params?.value);
+        const mutationId = requireRendererSecureStoreMutationId(
+          params?.mutationId,
+        );
+        return rendererSecureStoreRevisions.run(
+          vaultId,
+          kind,
+          () =>
+            rendererSecureStoreAuthority.set(
+              vaultId,
+              kind,
+              value,
+              owner,
+              mutationId,
+            ),
+          {
+            invalidates: (result) => result.changed !== false,
+            invalidatesOnError: true,
+          },
+        );
+      }),
+    secureStoreCommitReceipt: async (params) =>
+      runWithSecureStoreOwner(params, async (owner) => {
+        const vaultId = deriveAgentVaultId();
+        const kind = requireRendererSecureStoreKind(params?.kind);
+        const receipt = requireRendererSecureStoreRollbackReceipt(
+          params?.rollbackReceipt,
+        );
+        return rendererSecureStoreRevisions.run(
+          vaultId,
+          kind,
+          () =>
+            rendererSecureStoreAuthority.commitReceipt(
+              vaultId,
+              kind,
+              receipt,
+              owner,
+            ),
+          { invalidates: () => false },
+        );
+      }),
+    secureStoreCompensateCommittedReceipt: async (params) =>
+      runWithSecureStoreOwner(params, async (owner) => {
+        const vaultId = deriveAgentVaultId();
+        const kind = requireRendererSecureStoreKind(params?.kind);
+        const receipt = requireRendererSecureStoreRollbackReceipt(
+          params?.rollbackReceipt,
+        );
+        const expectedRevision = requireRendererSecureStoreRevision(
+          params?.expectedRevision,
+        );
+        return rendererSecureStoreRevisions.runWithRevision(
+          vaultId,
+          kind,
+          (currentRevision) =>
+            rendererSecureStoreAuthority.compensateCommittedReceipt(
+              vaultId,
+              kind,
+              receipt,
+              expectedRevision,
+              currentRevision,
+              owner,
+            ),
+          {
+            invalidates: (result) => result.ok && result.changed,
+            invalidatesOnError: true,
+          },
+        );
+      }),
+    secureStoreDelete: async (params) =>
+      runWithSecureStoreOwner(params, async (owner) => {
+        const vaultId = deriveAgentVaultId();
+        const kind = requireRendererSecureStoreKind(params?.kind);
+        return rendererSecureStoreRevisions.run(
+          vaultId,
+          kind,
+          () => rendererSecureStoreAuthority.delete(vaultId, kind, owner),
+          { invalidates: () => true, invalidatesOnError: true },
+        );
+      }),
+    secureStoreCompareAndDelete: async (params) =>
+      runWithSecureStoreOwner(params, async (owner) => {
+        const vaultId = deriveAgentVaultId();
+        const kind = requireRendererSecureStoreKind(params?.kind);
+        const expectedValue =
+          params?.expectedValue === null
+            ? null
+            : requireRendererSecureStoreValue(params?.expectedValue);
+        const expectedRevision = requireRendererSecureStoreRevision(
+          params?.expectedRevision,
+        );
+        const mutationId = requireRendererSecureStoreMutationId(
+          params?.mutationId,
+        );
+        return rendererSecureStoreRevisions.runWithRevision(
+          vaultId,
+          kind,
+          (currentRevision) =>
+            rendererSecureStoreAuthority.compareAndDelete(
+              vaultId,
+              kind,
+              expectedValue,
+              expectedRevision,
+              currentRevision,
+              owner,
+              mutationId,
+            ),
+          {
+            invalidates: (result) => result.changed !== false,
+            invalidatesOnError: true,
+          },
+        );
+      }),
+    secureStoreCompareAndSet: async (params) =>
+      runWithSecureStoreOwner(params, async (owner) => {
+        const vaultId = deriveAgentVaultId();
+        const kind = requireRendererSecureStoreKind(params?.kind);
+        const expectedValue = requireRendererSecureStoreValue(
+          params?.expectedValue,
+        );
+        const value = requireRendererSecureStoreValue(params?.value);
+        const expectedRevision = requireRendererSecureStoreRevision(
+          params?.expectedRevision,
+        );
+        const mutationId = requireRendererSecureStoreMutationId(
+          params?.mutationId,
+        );
+        return rendererSecureStoreRevisions.runWithRevision(
+          vaultId,
+          kind,
+          (currentRevision) =>
+            rendererSecureStoreAuthority.compareAndSet(
+              vaultId,
+              kind,
+              expectedValue,
+              value,
+              expectedRevision,
+              currentRevision,
+              owner,
+              mutationId,
+            ),
+          {
+            invalidates: (result) => result.changed !== false,
+            invalidatesOnError: true,
+          },
+        );
+      }),
+    secureStoreCompareAndRestore: async (params) =>
+      runWithSecureStoreOwner(params, async (owner) => {
+        const vaultId = deriveAgentVaultId();
+        const kind = requireRendererSecureStoreKind(params?.kind);
+        const receipt = requireRendererSecureStoreRollbackReceipt(
+          params?.rollbackReceipt,
+        );
+        return rendererSecureStoreRevisions.run(
+          vaultId,
+          kind,
+          () =>
+            rendererSecureStoreAuthority.compareAndRestore(
+              vaultId,
+              kind,
+              receipt,
+              owner,
+            ),
+          // A stale rollback can still cancel an abandoned ancestor. Broadcast
+          // its returned host snapshot as an invalidation even when no value
+          // was restored, so every renderer drops credentials from an older epoch.
+          { invalidates: () => true, invalidatesOnError: true },
+        );
+      }),
     secureStoreStatus: async () =>
       describeNodePlatformSecureStore(rendererSecureStore),
     runtimeCredentialStore: async (params) =>

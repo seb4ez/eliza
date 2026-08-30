@@ -16,3 +16,94 @@ index c1a5327280b3c88ab6b14e7629838116b93066a0..68486adbaceb35b75f60ddc7da8a966d
  	},
  	"dependencies": {},
  	"trustedDependencies": []
+
+diff --git a/dist/api/bun/proc/native.ts b/dist/api/bun/proc/native.ts
+--- a/dist/api/bun/proc/native.ts
++++ b/dist/api/bun/proc/native.ts
+@@ -2577 +2577,12 @@
+-				webviewEventHandler(payload.id, payload.eventName, payload.detail);
++				if (
++					payload?.id !== _id ||
++					![
++						"dom-ready",
++						"did-navigate-in-page",
++						"new-window-open",
++						"host-message",
++					].includes(payload?.eventName)
++				) {
++					return;
++				}
++				webviewEventHandler(_id, payload.eventName, payload.detail);
+@@ -2603 +2614,12 @@
+-				webviewEventHandler(payload.id, payload.eventName, payload.detail);
++				if (
++					payload?.id !== _id ||
++					![
++						"dom-ready",
++						"did-navigate-in-page",
++						"new-window-open",
++						"host-message",
++					].includes(payload?.eventName)
++				) {
++					return;
++				}
++				webviewEventHandler(_id, payload.eventName, payload.detail);
+diff --git a/dist/api/shared/rpc.ts b/dist/api/shared/rpc.ts
+--- a/dist/api/shared/rpc.ts
++++ b/dist/api/shared/rpc.ts
+@@ -5,0 +6 @@ type _RPCRequestPacket = {
++	instanceId: string;
+@@ -11,2 +12,14 @@ type _RPCResponsePacket =
+-	| { type: "response"; id: number; success: true; payload: any }
+-	| { type: "response"; id: number; success: false; error?: string };
++	| {
++			type: "response";
++			id: number;
++			instanceId: string;
++			success: true;
++			payload: any;
++	  }
++	| {
++			type: "response";
++			id: number;
++			instanceId: string;
++			success: false;
++			error?: string;
++	  };
+@@ -178,0 +192,16 @@ const DEFAULT_MAX_REQUEST_TIME = 1000;
++const MAX_INSTANCE_ID_LENGTH = 128;
++
++function createRPCInstanceId(): string {
++	const cryptoApi = globalThis.crypto;
++	if (typeof cryptoApi?.randomUUID === "function") {
++		return cryptoApi.randomUUID();
++	}
++	if (typeof cryptoApi?.getRandomValues === "function") {
++		const entropy = new Uint32Array(4);
++		cryptoApi.getRandomValues(entropy);
++		return Array.from(entropy, (part) =>
++			part.toString(16).padStart(8, "0"),
++		).join("");
++	}
++	throw new Error("RPC instance isolation requires secure randomness.");
++}
+@@ -193,0 +223 @@ export function createRPC<
++	const rpcInstanceId = createRPCInstanceId();
+@@ -265,0 +296 @@ export function createRPC<
++				instanceId: rpcInstanceId,
+@@ -389 +420,8 @@ export function createRPC<
+-			const { id, method, params } = message;
++			const { id, instanceId, method, params } = message;
++			if (
++				typeof instanceId !== "string" ||
++				instanceId.length === 0 ||
++				instanceId.length > MAX_INSTANCE_ID_LENGTH
++			) {
++				return;
++			}
+@@ -394,0 +433 @@ export function createRPC<
++					instanceId,
+@@ -402,0 +442 @@ export function createRPC<
++					instanceId,
+@@ -412,0 +453 @@ export function createRPC<
++			if (message.instanceId !== rpcInstanceId) return;

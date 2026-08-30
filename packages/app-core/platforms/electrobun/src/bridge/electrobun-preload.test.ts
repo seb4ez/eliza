@@ -31,6 +31,7 @@ type ElectrobunHandlers = {
 type OutgoingPacket = {
   type?: unknown;
   id?: unknown;
+  instanceId?: unknown;
   method?: unknown;
   params?: unknown;
   success?: unknown;
@@ -89,12 +90,18 @@ function installPreloadHost(): PreloadWindow {
           return;
         }
         outgoing.push(parsed);
-        if (parsed.type === "request" && typeof parsed.id === "number") {
+        if (
+          parsed.type === "request" &&
+          typeof parsed.id === "number" &&
+          typeof parsed.instanceId === "string"
+        ) {
           const requestId = parsed.id;
+          const requestInstanceId = parsed.instanceId;
           queueMicrotask(() => {
             next.__electrobun?.receiveMessageFromBun({
               type: "response",
               id: requestId,
+              instanceId: requestInstanceId,
               success: true,
               payload: { echoedMethod: parsed.method },
             });
@@ -130,7 +137,11 @@ function dispatchIncoming(message: unknown): void {
   if (!bun) {
     throw new Error("preload did not install window.__electrobun");
   }
-  bun.receiveMessageFromBun(message);
+  bun.receiveMessageFromBun(
+    isPacket(message) && message.type === "request"
+      ? { ...message, instanceId: "test-host-rpc-instance" }
+      : message,
+  );
 }
 
 function makeTabsImpl(label: string): BrowserTabsRendererImpl {

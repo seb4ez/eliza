@@ -35,6 +35,7 @@ import {
 } from "./application-menu";
 import { setApplicationMenuActionHandler } from "./application-menu-action-registry";
 import { showBackgroundNoticeOnce } from "./background-notice";
+import { type BeforeQuitGate, createBeforeQuitGate } from "./before-quit-gate";
 import { getBrandConfig } from "./brand-config";
 import {
   resolveNamespaceFromEnv,
@@ -737,6 +738,11 @@ let rendererUrlPromise: Promise<string> | null = null;
 let backgroundWindowPromise: Promise<void> | null = null;
 let isQuitting = false;
 let quitRequestPromise: Promise<void> | null = null;
+let beforeQuitGate: BeforeQuitGate | null = null;
+
+function allowNextNativeQuit(): void {
+  beforeQuitGate?.allowNextQuit();
+}
 
 function requestAppQuit(): Promise<void> {
   if (quitRequestPromise) {
@@ -748,7 +754,10 @@ function requestAppQuit(): Promise<void> {
     try {
       await quitAfterDesktopCleanup(
         () => runShutdownCleanup("explicit-quit"),
-        () => Utils.quit(),
+        () => {
+          allowNextNativeQuit();
+          Utils.quit();
+        },
       );
     } catch (err) {
       logger.warn(
@@ -2488,14 +2497,20 @@ async function runShutdownCleanup(reason: string): Promise<void> {
 }
 
 function setupShutdown(): void {
-  Electrobun.events.on("before-quit", () => {
-    // error-policy:J5 the explicit-quit path observes and retries the same
-    // tracked cleanup; OS-initiated quit can only report its final failure.
-    void runShutdownCleanup("before-quit").catch((error) => {
+  if (beforeQuitGate) return;
+  const gate = createBeforeQuitGate({
+    cleanup: () => runShutdownCleanup("before-quit"),
+    onCleanupError: (error) => {
+      isQuitting = false;
       logger.warn(
         `[Main] Cleanup failed during before-quit: ${error instanceof Error ? error.message : String(error)}`,
       );
-    });
+    },
+    quit: () => Utils.quit(),
+  });
+  beforeQuitGate = gate;
+  Electrobun.events.on("before-quit", (event) => {
+    gate.handle(event);
   });
 }
 
@@ -2592,6 +2607,9 @@ function checkWebGpuBrowserSupport(rendererType: "native" | "cef"): void {
 }
 
 async function main(): Promise<void> {
+  // Install the synchronous OS/Cmd-Q denial before any await, renderer, or
+  // secure-store owner can exist during startup.
+  setupShutdown();
   recordStartupPhase("main_start", {
     pid: process.pid,
     exec_path: process.execPath,
@@ -2945,9 +2963,10 @@ async function main(): Promise<void> {
     void createSettingsWindow(tabHint);
   });
   getDesktopManager().setRestoreMainWindowCallback(() => restoreWindow());
-  getDesktopManager().setRequestQuitCallback((reason) =>
-    runShutdownCleanup(reason),
-  );
+  getDesktopManager().setRequestQuitCallback(async (reason) => {
+    await runShutdownCleanup(reason);
+    allowNextNativeQuit();
+  });
   getDesktopManager().setOpenSurfaceWindowCallback(
     (surface, browse, alwaysOnTop) => {
       if (!surfaceWindowManager) {
@@ -3044,8 +3063,6 @@ async function main(): Promise<void> {
         const base = await resolveRendererUrlForCurrentRuntime();
         const popoverUrl = new URL(base);
         popoverUrl.searchParams.set("shellMode", "tray-popover");
-        const { rpc, bindRendererLifecycle, releaseShellSync } =
-          createDesktopRpc("tray-popover");
         const buildInfo = await BuildConfig.get();
         const mainWindowPartition = resolveMainWindowPartition(process.env, {
           platform: process.platform,
@@ -3055,14 +3072,20 @@ async function main(): Promise<void> {
           url: popoverUrl.href,
           preload: readResolvedPreloadScript(import.meta.dir),
           partition: mainWindowPartition,
-          rpc,
-          bindRendererLifecycle,
-          wireRpc: () => wireSettingsRpcAfterCreate(rpc),
+          createRpcEndpoint: () => {
+            const { rpc, bindRendererLifecycle, releaseShellSync } =
+              createDesktopRpc("tray-popover");
+            return {
+              rpc,
+              bindRendererLifecycle,
+              wireRpc: () => wireSettingsRpcAfterCreate(rpc),
+              release: releaseShellSync,
+            };
+          },
           injectApiBase,
           onWindowFocused: (window) => {
             lastFocusedWindow = window;
           },
-          onWindowClosed: releaseShellSync,
         });
         logger.info("[Main] Tray popover enabled");
       } catch (err) {
@@ -3139,7 +3162,6 @@ async function main(): Promise<void> {
 
   void setupUpdater();
   cleanupFns.push(() => getAgentManager().stop());
-  setupShutdown();
 }
 
 function resolveStartupCrashReportPath(): string {
@@ -3354,7 +3376,10 @@ main().catch((err) => {
     // diagnostic write must not preempt the shutdown below, but log it.
     logger.warn("[Main] failed to persist fatal-startup diagnostics", writeErr);
   }
-  void runShutdownCleanup("fatal-startup").finally(shutdownAfterFatalError);
+  void runShutdownCleanup("fatal-startup").finally(() => {
+    allowNextNativeQuit();
+    shutdownAfterFatalError();
+  });
 });
 
 import { shutdownAfterFatalError } from "./fatal-shutdown";

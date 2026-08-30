@@ -2279,15 +2279,22 @@ export type ElizaDesktopRPCSchema = {
         response: { providers: DetectedProvider[] };
       };
       secureStoreGet: {
-        params: { kind: RendererSecureStoreKind };
+        params: {
+          documentCapability: string;
+          kind: RendererSecureStoreKind;
+        };
         response: RendererSecureStoreResult;
       };
       secureStoreRevision: {
-        params: { kind: RendererSecureStoreKind };
+        params: {
+          documentCapability: string;
+          kind: RendererSecureStoreKind;
+        };
         response: { ok: true; revision: number };
       };
       secureStoreSet: {
         params: {
+          documentCapability: string;
           kind: RendererSecureStoreKind;
           value: string;
           mutationId: string;
@@ -2296,6 +2303,7 @@ export type ElizaDesktopRPCSchema = {
       };
       secureStoreCommitReceipt: {
         params: {
+          documentCapability: string;
           kind: RendererSecureStoreKind;
           rollbackReceipt: string;
         };
@@ -2303,6 +2311,7 @@ export type ElizaDesktopRPCSchema = {
       };
       secureStoreCompensateCommittedReceipt: {
         params: {
+          documentCapability: string;
           kind: RendererSecureStoreKind;
           rollbackReceipt: string;
           expectedRevision: number;
@@ -2310,11 +2319,15 @@ export type ElizaDesktopRPCSchema = {
         response: RendererSecureStoreCompensateCommittedReceiptResult;
       };
       secureStoreDelete: {
-        params: { kind: RendererSecureStoreKind };
+        params: {
+          documentCapability: string;
+          kind: RendererSecureStoreKind;
+        };
         response: RendererSecureStoreResult;
       };
       secureStoreCompareAndDelete: {
         params: {
+          documentCapability: string;
           kind: RendererSecureStoreKind;
           expectedValue: string | null;
           expectedRevision: number;
@@ -2324,6 +2337,7 @@ export type ElizaDesktopRPCSchema = {
       };
       secureStoreCompareAndSet: {
         params: {
+          documentCapability: string;
           kind: RendererSecureStoreKind;
           expectedValue: string;
           value: string;
@@ -2334,6 +2348,7 @@ export type ElizaDesktopRPCSchema = {
       };
       secureStoreCompareAndRestore: {
         params: {
+          documentCapability: string;
           kind: RendererSecureStoreKind;
           rollbackReceipt: string;
         };
@@ -2709,10 +2724,10 @@ export type ElizaDesktopRPCSchema = {
         response: { ok: boolean };
       };
     };
-    // biome-ignore lint/complexity/noBannedTypes: empty message schema placeholder for future audio streaming
     messages: {
-      // Messages the webview sends TO bun (rare - most communication
-      // is request/response). Audio chunks for streaming could go here.
+      // Fire-and-forget hint only. The host never returns credentials on this
+      // transport; it injects the current capability into the native document.
+      secureStoreDocumentReady: Record<string, never>;
     };
   }>;
   webview: RPCSchema<{

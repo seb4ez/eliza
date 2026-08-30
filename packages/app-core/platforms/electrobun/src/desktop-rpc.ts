@@ -6,9 +6,14 @@
 
 import { BrowserView } from "electrobun/bun";
 import { logger } from "./logger";
+import {
+  createRendererSecureStoreOwner,
+  type RendererSecureStoreOwner,
+} from "./renderer-secure-store-authority";
 import { rendererSecureStoreRevisions } from "./renderer-secure-store-revisions";
 import {
   buildBunRpcHandlers,
+  type RendererSecureStoreDocumentAuthority,
   releaseRendererSecureStoreOwner,
 } from "./rpc-handlers";
 import type { ElizaDesktopRPCSchema } from "./rpc-schema";
@@ -20,17 +25,36 @@ export type ElizaDesktopRpc = ReturnType<
 >;
 
 interface PendingOwnerRelease {
+  activeOperations: number;
+  drainWaiters: Set<() => void>;
   label: string;
-  owner: symbol;
+  owner: RendererSecureStoreOwner;
   promise: Promise<void> | null;
+  releaseStarted: boolean;
 }
 
 interface RendererDocumentLifecycle {
-  on(name: "did-commit-navigation", handler: () => void): void;
+  executeJavascript(script: string): void;
+  on(
+    name: "will-navigate" | "did-commit-navigation" | "dom-ready",
+    handler: () => void,
+  ): void;
 }
 
-const pendingOwnerReleases = new Map<symbol, PendingOwnerRelease>();
+interface RendererDocumentOwner extends PendingOwnerRelease {
+  documentCapability: string;
+  generation: number;
+}
+
+const pendingOwnerReleases = new Map<
+  RendererSecureStoreOwner,
+  PendingOwnerRelease
+>();
 const MAX_RPC_REQUEST_TIME_MS = 600_000;
+
+function documentAuthorityError(message: string): Error {
+  return new Error(`Secure credential document authority denied: ${message}`);
+}
 
 function asRpcSend(
   send: unknown,
@@ -40,7 +64,14 @@ function asRpcSend(
 
 function startOwnerRelease(entry: PendingOwnerRelease): Promise<void> {
   if (entry.promise) return entry.promise;
-  const promise = releaseRendererSecureStoreOwner(entry.owner).then(
+  entry.releaseStarted = true;
+  const release = async (): Promise<void> => {
+    if (entry.activeOperations > 0) {
+      await new Promise<void>((resolve) => entry.drainWaiters.add(resolve));
+    }
+    await releaseRendererSecureStoreOwner(entry.owner);
+  };
+  const promise = release().then(
     () => {
       if (pendingOwnerReleases.get(entry.owner) === entry) {
         pendingOwnerReleases.delete(entry.owner);
@@ -106,47 +137,85 @@ export function createDesktopRpc(label: string): {
   let released = false;
   let lifecycleBound = false;
   let ownerGeneration = 0;
+  let documentGeneration = 0;
+  let publishableGeneration: number | null = null;
+  let initialPublicationAttempted = false;
 
-  const createOwnerRelease = (): PendingOwnerRelease => {
+  const createOwnerRelease = (generation: number): RendererDocumentOwner => {
     ownerGeneration += 1;
-    const entry: PendingOwnerRelease = {
+    const entry: RendererDocumentOwner = {
+      activeOperations: 0,
+      documentCapability: crypto.randomUUID(),
+      drainWaiters: new Set(),
+      generation,
       label: `${label}:document-${ownerGeneration}`,
-      owner: Symbol(
+      owner: createRendererSecureStoreOwner(
         `renderer-secure-store-owner:${label}:document-${ownerGeneration}`,
       ),
       promise: null,
+      releaseStarted: false,
     };
     pendingOwnerReleases.set(entry.owner, entry);
     return entry;
   };
 
-  let currentOwnerRelease = createOwnerRelease();
+  let currentDocument = createOwnerRelease(documentGeneration);
   let ownerReady: Promise<void> = Promise.resolve();
 
-  const prepareForRendererDocument = (): Promise<void> => {
-    if (released) return ownerReady;
+  const confirmRendererNavigation = (): void => {
+    if (released) return;
+    documentGeneration += 1;
+    const successorGeneration = documentGeneration;
+    publishableGeneration = null;
     ownerReady = ownerReady
       .catch(() => undefined)
       .then(async () => {
-        await startOwnerRelease(currentOwnerRelease);
-        if (!released) currentOwnerRelease = createOwnerRelease();
+        const predecessor = currentDocument;
+        await startOwnerRelease(predecessor);
+        if (!released && successorGeneration === documentGeneration) {
+          currentDocument = createOwnerRelease(successorGeneration);
+          publishableGeneration = successorGeneration;
+          requestCapabilityPublication();
+        }
       });
-    // error-policy:J5 resolver RPC calls and shutdown both observe this same
-    // rejection; this branch only prevents an unhandled navigation callback.
+    // error-policy:J5 secure RPC and shutdown observe the same tracked owner
+    // cleanup rejection; this prevents an unhandled lifecycle callback.
     void ownerReady.catch((error) => {
       logger.warn(
         `[secure-store:${label}] document rollover failed: ${error instanceof Error ? error.message : String(error)}`,
       );
     });
-    return ownerReady;
   };
 
-  const resolveSecureStoreOwner = async (): Promise<symbol> => {
-    while (true) {
+  const secureStoreDocuments: RendererSecureStoreDocumentAuthority = {
+    run: async (documentCapability, operation) => {
       const observedReady = ownerReady;
       await observedReady;
-      if (observedReady === ownerReady) return currentOwnerRelease.owner;
-    }
+      const current = currentDocument;
+      if (
+        released ||
+        current.documentCapability !== documentCapability ||
+        current.releaseStarted
+      ) {
+        throw documentAuthorityError("document is not active");
+      }
+      current.activeOperations += 1;
+      try {
+        return await operation(current.owner);
+      } finally {
+        // Electrobun routes responses through the socket currently attached to
+        // this webview id. Keep the document fenced for one host turn after the
+        // handler settles so its response packet is dispatched before a new
+        // document receives a capability and can reuse the same request id.
+        setTimeout(() => {
+          current.activeOperations = Math.max(0, current.activeOperations - 1);
+          if (current.activeOperations !== 0) return;
+          const waiters = Array.from(current.drainWaiters);
+          current.drainWaiters.clear();
+          for (const resolve of waiters) resolve();
+        }, 0);
+      }
+    },
   };
 
   const sendToWebview: SendToWebview = (message, payload) => {
@@ -169,11 +238,73 @@ export function createDesktopRpc(label: string): {
     }
   };
 
+  let rendererLifecycle: RendererDocumentLifecycle | null = null;
+  let capabilityPublication: Promise<void> | null = null;
+  let capabilityPublicationQueued = false;
+
+  const requestCapabilityPublication = (): void => {
+    if (capabilityPublication) {
+      capabilityPublicationQueued = true;
+      return;
+    }
+    if (
+      released ||
+      !rendererLifecycle ||
+      publishableGeneration !== documentGeneration
+    ) {
+      return;
+    }
+    const targetGeneration = documentGeneration;
+    const targetLifecycle = rendererLifecycle;
+    const publication = (async () => {
+      await ownerReady;
+      if (
+        released ||
+        publishableGeneration !== targetGeneration ||
+        currentDocument.generation !== targetGeneration ||
+        currentDocument.releaseStarted
+      ) {
+        return;
+      }
+      const payload = JSON.stringify({
+        documentCapability: currentDocument.documentCapability,
+        generation: targetGeneration,
+      });
+      targetLifecycle.executeJavascript(
+        `globalThis.__ELIZA_ACCEPT_SECURE_STORE_DOCUMENT_CAPABILITY__?.(${payload});`,
+      );
+      if (targetGeneration === 0) initialPublicationAttempted = true;
+    })();
+    capabilityPublication = publication;
+    // error-policy:J5 a later renderer-ready hint or dom-ready can retry the
+    // same host capability; never rotate authority on a delivery failure.
+    void publication
+      .catch((error) => {
+        logger.warn(
+          `[secure-store:${label}] capability publication failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      })
+      .finally(() => {
+        if (capabilityPublication === publication) {
+          capabilityPublication = null;
+        }
+        if (capabilityPublicationQueued) {
+          capabilityPublicationQueued = false;
+          requestCapabilityPublication();
+        }
+      });
+  };
+
   type BunRpcRequestsHandlers = NonNullable<
     Parameters<
       typeof BrowserView.defineRPC<ElizaDesktopRPCSchema>
     >[0]["handlers"]
   >["requests"];
+  type BunRpcMessagesHandlers = NonNullable<
+    Parameters<
+      typeof BrowserView.defineRPC<ElizaDesktopRPCSchema>
+    >[0]["handlers"]
+  >["messages"];
 
   const shellSyncEndpoint = registerShellSyncEndpoint(label, sendToWebview);
   const releaseSecureStoreRevisions =
@@ -182,9 +313,14 @@ export function createDesktopRpc(label: string): {
   rpc = BrowserView.defineRPC<ElizaDesktopRPCSchema>({
     maxRequestTime: MAX_RPC_REQUEST_TIME_MS,
     handlers: {
+      messages: {
+        secureStoreDocumentReady: () => {
+          requestCapabilityPublication();
+        },
+      } as BunRpcMessagesHandlers,
       requests: buildBunRpcHandlers({
         sendToWebview,
-        secureStoreOwner: resolveSecureStoreOwner,
+        secureStoreDocuments,
         shellControllerEndpoint: shellSyncEndpoint,
       }) as BunRpcRequestsHandlers,
     },
@@ -196,27 +332,33 @@ export function createDesktopRpc(label: string): {
     bindRendererLifecycle: (lifecycle) => {
       if (lifecycleBound) return;
       lifecycleBound = true;
-      // A committed top-level document boundary covers reload, allowed
-      // navigation, and renderer crash recovery. Rotate before its preload can
-      // hydrate: every secure-store RPC awaits ownerReady, so the old
-      // document's pending receipts are reconciled before the new owner exists.
+      rendererLifecycle = lifecycle;
+      lifecycle.on("will-navigate", () => {
+        // A pre-commit navigation may still be cancelled by another listener.
+        // Disable resends, but keep A fully active until an authenticated
+        // native did-commit event schedules its rollback.
+        publishableGeneration = null;
+      });
       lifecycle.on("did-commit-navigation", () => {
-        void prepareForRendererDocument();
+        confirmRendererNavigation();
+      });
+      lifecycle.on("dom-ready", () => {
+        // Electrobun implements dom-ready in renderer JavaScript. It is safe
+        // only for bootstrapping generation zero, never as rollover authority.
+        if (documentGeneration === 0 && !initialPublicationAttempted) {
+          publishableGeneration = 0;
+          requestCapabilityPublication();
+        }
       });
     },
     releaseShellSync: () => {
       if (released) return;
       released = true;
+      rendererLifecycle = null;
+      publishableGeneration = null;
       releaseSecureStoreRevisions();
       shellSyncEndpoint.release();
-      ownerReady = ownerReady
-        .catch(() => undefined)
-        .then(() => startOwnerRelease(currentOwnerRelease));
-      void ownerReady.catch((error) => {
-        logger.warn(
-          `[secure-store:${label}] endpoint cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      });
+      if (currentDocument) void startOwnerRelease(currentDocument);
     },
   };
 }

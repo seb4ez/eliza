@@ -11,7 +11,11 @@ import type {
   SecureStoreSecretKind,
   SecureStoreSetResult,
 } from "../../../src/security/platform-secure-store";
-import { RendererSecureStoreAuthority } from "./renderer-secure-store-authority";
+import {
+  createRendererSecureStoreOwner,
+  RendererSecureStoreAuthority,
+  type RendererSecureStoreOwner,
+} from "./renderer-secure-store-authority";
 
 const VAULT_ID = "renderer-authority-test-vault";
 const TOKEN_KIND = "session.steward_token" as const;
@@ -136,7 +140,7 @@ describe("RendererSecureStoreAuthority", () => {
   it("replays the same mutation id without a duplicate backend write", async () => {
     const store = new MemorySecureStore();
     const authority = createAuthority(store);
-    const owner = Symbol("renderer-a");
+    const owner = createRendererSecureStoreOwner("renderer-a");
 
     const first = await authority.set(
       VAULT_ID,
@@ -171,7 +175,7 @@ describe("RendererSecureStoreAuthority", () => {
       () => `bounded-receipt-${++receiptSequence}`,
       { journalCapacity: 2, journalTtlMs: 1 },
     );
-    const owner = Symbol("renderer-a");
+    const owner = createRendererSecureStoreOwner("renderer-a");
     const first = await authority.set(
       VAULT_ID,
       TOKEN_KIND,
@@ -206,7 +210,7 @@ describe("RendererSecureStoreAuthority", () => {
   it("rolls every non-finalized receipt owned by a closing endpoint back", async () => {
     const store = new MemorySecureStore();
     const authority = createAuthority(store);
-    const owner = Symbol("closing-renderer");
+    const owner = createRendererSecureStoreOwner("closing-renderer");
     const write = await authority.set(
       VAULT_ID,
       TOKEN_KIND,
@@ -221,18 +225,19 @@ describe("RendererSecureStoreAuthority", () => {
     expect(store.value).toBe("prior-token");
     expect(pendingReceiptCount(authority)).toBe(0);
     const ownerState = authority as unknown as {
-      ownerIds: Map<symbol, number>;
-      releasedOwners: Set<symbol>;
+      ownerIds: Map<RendererSecureStoreOwner, number>;
+      releasedOwners: WeakSet<RendererSecureStoreOwner>;
     };
     expect(ownerState.ownerIds.has(owner)).toBe(false);
+    expect(ownerState.releasedOwners).toBeInstanceOf(WeakSet);
     expect(ownerState.releasedOwners.has(owner)).toBe(true);
   });
 
-  it("drops a released ancestor journal identity but retains its deny tombstone", async () => {
+  it("drops a released ancestor journal identity but retains its weak deny tombstone", async () => {
     const store = new MemorySecureStore();
     const authority = createAuthority(store);
-    const releasedOwner = Symbol("released-renderer");
-    const activeOwner = Symbol("active-renderer");
+    const releasedOwner = createRendererSecureStoreOwner("released-renderer");
+    const activeOwner = createRendererSecureStoreOwner("active-renderer");
     const ancestor = await authority.set(
       VAULT_ID,
       TOKEN_KIND,
@@ -252,8 +257,8 @@ describe("RendererSecureStoreAuthority", () => {
 
     await authority.releaseOwner(releasedOwner);
     const ownerState = authority as unknown as {
-      ownerIds: Map<symbol, number>;
-      releasedOwners: Set<symbol>;
+      ownerIds: Map<RendererSecureStoreOwner, number>;
+      releasedOwners: WeakSet<RendererSecureStoreOwner>;
     };
     expect(ownerState.releasedOwners.has(releasedOwner)).toBe(true);
 
@@ -272,7 +277,7 @@ describe("RendererSecureStoreAuthority", () => {
   it("keeps a released-owner deny tombstone after cleanup drains", async () => {
     const store = new MemorySecureStore();
     const authority = createAuthority(store);
-    const owner = Symbol("released-renderer");
+    const owner = createRendererSecureStoreOwner("released-renderer");
     const write = await authority.set(
       VAULT_ID,
       TOKEN_KIND,
@@ -502,7 +507,7 @@ describe("RendererSecureStoreAuthority", () => {
   it("compensates a committed receipt at its exact SET revision and replays response loss", async () => {
     const store = new MemorySecureStore();
     const authority = createAuthority(store);
-    const owner = Symbol("renderer-a");
+    const owner = createRendererSecureStoreOwner("renderer-a");
     const write = await authority.set(
       VAULT_ID,
       TOKEN_KIND,
@@ -555,8 +560,8 @@ describe("RendererSecureStoreAuthority", () => {
   it("compensates a committed descendant past every cancelled ancestor", async () => {
     const store = new MemorySecureStore("pre-chain-token");
     const authority = createAuthority(store);
-    const ownerA = Symbol("renderer-a");
-    const ownerB = Symbol("renderer-b");
+    const ownerA = createRendererSecureStoreOwner("renderer-a");
+    const ownerB = createRendererSecureStoreOwner("renderer-b");
     const a = await authority.set(
       VAULT_ID,
       TOKEN_KIND,
@@ -601,7 +606,7 @@ describe("RendererSecureStoreAuthority", () => {
   it("does not compensate an old receipt after same-value ABA advances the host revision", async () => {
     const store = new MemorySecureStore();
     const authority = createAuthority(store);
-    const owner = Symbol("renderer-a");
+    const owner = createRendererSecureStoreOwner("renderer-a");
     const firstA = await authority.set(
       VAULT_ID,
       TOKEN_KIND,
@@ -660,8 +665,8 @@ describe("RendererSecureStoreAuthority", () => {
   it("lets durable B win but restores A before a marker-only B writes", async () => {
     const durableStore = new MemorySecureStore();
     const durableAuthority = createAuthority(durableStore);
-    const ownerA = Symbol("renderer-a");
-    const ownerB = Symbol("renderer-b");
+    const ownerA = createRendererSecureStoreOwner("renderer-a");
+    const ownerB = createRendererSecureStoreOwner("renderer-b");
     const durableA = await durableAuthority.set(
       VAULT_ID,
       TOKEN_KIND,
@@ -758,7 +763,7 @@ describe("RendererSecureStoreAuthority", () => {
       () => `suspended-receipt-${++receiptSequence}`,
       { journalCapacity: 2, now: () => now },
     );
-    const owner = Symbol("suspended-renderer");
+    const owner = createRendererSecureStoreOwner("suspended-renderer");
     const write = await authority.set(
       VAULT_ID,
       TOKEN_KIND,
@@ -805,7 +810,7 @@ describe("RendererSecureStoreAuthority", () => {
   it("does not replay a committed receipt journal entry for another slot", async () => {
     const store = new MemorySecureStore();
     const authority = createAuthority(store);
-    const owner = Symbol("renderer-a");
+    const owner = createRendererSecureStoreOwner("renderer-a");
     const write = await authority.set(
       VAULT_ID,
       TOKEN_KIND,
@@ -1116,7 +1121,7 @@ describe("RendererSecureStoreAuthority", () => {
   it("replays an exact CAS deletion after its first response is lost", async () => {
     const store = new MemorySecureStore("renderer-a-token");
     const authority = createAuthority(store);
-    const owner = Symbol("renderer-a");
+    const owner = createRendererSecureStoreOwner("renderer-a");
 
     await expect(
       authority.compareAndDelete(
@@ -1161,7 +1166,7 @@ describe("RendererSecureStoreAuthority", () => {
       "shared-token",
       20,
       20,
-      Symbol("renderer-b"),
+      createRendererSecureStoreOwner("renderer-b"),
       "terminal-delete-b",
     );
 
@@ -1172,7 +1177,7 @@ describe("RendererSecureStoreAuthority", () => {
         "shared-token",
         20,
         21,
-        Symbol("renderer-a"),
+        createRendererSecureStoreOwner("renderer-a"),
         "terminal-delete-a",
       ),
     ).resolves.toEqual({
@@ -1187,7 +1192,7 @@ describe("RendererSecureStoreAuthority", () => {
   it("applies one exact terminal transform and replays it without rewriting", async () => {
     const store = new MemorySecureStore("profile-a-with-token");
     const authority = createAuthority(store);
-    const owner = Symbol("terminal-renderer-a");
+    const owner = createRendererSecureStoreOwner("terminal-renderer-a");
 
     const first = await authority.compareAndSet(
       VAULT_ID,
@@ -1236,7 +1241,7 @@ describe("RendererSecureStoreAuthority", () => {
         "profile-a-scrubbed",
         4,
         5,
-        Symbol("renderer-a"),
+        createRendererSecureStoreOwner("renderer-a"),
         "stale-terminal-a",
       ),
     ).resolves.toEqual({
@@ -1264,7 +1269,7 @@ describe("RendererSecureStoreAuthority", () => {
         "active-a-scrubbed",
         2,
         2,
-        Symbol("renderer-a"),
+        createRendererSecureStoreOwner("renderer-a"),
         "mutate-error-terminal-a",
       ),
     ).resolves.toEqual({
@@ -1279,7 +1284,7 @@ describe("RendererSecureStoreAuthority", () => {
   it("retains a live predecessor rollback chain when terminal SET does not mutate", async () => {
     const store = new MemorySecureStore();
     const authority = createAuthority(store);
-    const owner = Symbol("terminal-renderer-a");
+    const owner = createRendererSecureStoreOwner("terminal-renderer-a");
     const write = await authority.set(
       VAULT_ID,
       TOKEN_KIND,
