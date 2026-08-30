@@ -49,6 +49,7 @@ const clientMock = vi.hoisted(() => ({
   submitFirstRun: vi.fn(async () => {}),
   setBaseUrl: vi.fn(),
   setToken: vi.fn(),
+  stageSessionTarget: vi.fn(),
   getBaseUrl: vi.fn(() => ""),
   createCloudCompatAgent: vi.fn(),
   startCloudAgentHandoff: vi.fn(),
@@ -102,6 +103,16 @@ vi.mock("../state", () => ({
   addAgentProfile: vi.fn(() => ({ id: "profile-1" })),
   createPersistedActiveServer: vi.fn((v) => ({ label: "Eliza Cloud", ...v })),
   loadPersistedActiveServer: loadPersistedActiveServerMock,
+  persistAgentProfileConnectionDurably: vi.fn(
+    async (profile, _server, options) => {
+      if ((await options?.finalize?.()) === false) return null;
+      return {
+        id: "profile-1",
+        createdAt: "2026-08-30T00:00:00.000Z",
+        ...profile,
+      };
+    },
+  ),
   removeAgentProfile: removeAgentProfileMock,
   savePersistedActiveServer: vi.fn(),
   savePersistedFirstRunComplete: savePersistedFirstRunCompleteMock,
@@ -160,6 +171,15 @@ function seedMarker(sharedAgentId: string): void {
 beforeEach(() => {
   vi.clearAllMocks();
   window.localStorage.clear();
+  clientMock.stageSessionTarget.mockImplementation(({ baseUrl, token }) => ({
+    publish: () => {
+      clientMock.setBaseUrl(baseUrl);
+      clientMock.setToken(token);
+      return true;
+    },
+    restoreIfCurrent: () => true,
+    clearIfCurrent: () => true,
+  }));
   clientMock.getCloudStatus.mockResolvedValue(null);
   clientMock.getRestAuthToken.mockReturnValue(null);
   clientMock.getPersonalSharedEliza.mockResolvedValue({

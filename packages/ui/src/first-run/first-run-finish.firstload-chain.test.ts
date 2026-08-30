@@ -19,6 +19,7 @@ const clientStub = vi.hoisted(() => ({
   submitFirstRun: vi.fn(async () => {}),
   setBaseUrl: vi.fn(),
   setToken: vi.fn(),
+  stageSessionTarget: vi.fn(),
   getBaseUrl: vi.fn(() => ""),
   createCloudCompatAgent: vi.fn(),
   startCloudAgentHandoff: vi.fn(),
@@ -39,6 +40,7 @@ const removeAgentProfileStub = vi.hoisted(() => vi.fn());
 const addAgentProfileStub = vi.hoisted(() =>
   vi.fn(() => ({ id: "profile-1" })),
 );
+const persistAgentProfileConnectionDurablyStub = vi.hoisted(() => vi.fn());
 const loadPersistedActiveServerStub = vi.hoisted(() =>
   vi.fn<() => { kind: string; id?: string } | null>(() => null),
 );
@@ -72,6 +74,8 @@ vi.mock("../state", () => ({
   addAgentProfile: addAgentProfileStub,
   createPersistedActiveServer: vi.fn((v) => ({ label: "Eliza Cloud", ...v })),
   loadPersistedActiveServer: loadPersistedActiveServerStub,
+  persistAgentProfileConnectionDurably:
+    persistAgentProfileConnectionDurablyStub,
   removeAgentProfile: removeAgentProfileStub,
   savePersistedActiveServer: vi.fn(),
   savePersistedFirstRunComplete: savePersistedFirstRunCompleteStub,
@@ -130,6 +134,26 @@ function stubSelection(): void {
 beforeEach(() => {
   vi.clearAllMocks();
   window.localStorage.clear();
+  persistAgentProfileConnectionDurablyStub.mockImplementation(
+    async (profile, _server, options) => {
+      if ((await options?.finalize?.()) === false) return null;
+      addAgentProfileStub(profile);
+      return {
+        id: "profile-1",
+        createdAt: "2026-08-30T00:00:00.000Z",
+        ...profile,
+      };
+    },
+  );
+  clientStub.stageSessionTarget.mockImplementation(({ baseUrl, token }) => ({
+    publish: () => {
+      clientStub.setBaseUrl(baseUrl);
+      clientStub.setToken(token);
+      return true;
+    },
+    restoreIfCurrent: () => true,
+    clearIfCurrent: () => true,
+  }));
   clientStub.listConversations = vi.fn(async () => ({ conversations: [] }));
   clientStub.getCloudStatus.mockResolvedValue({ connected: false });
   clientStub.getPersonalSharedEliza.mockResolvedValue({
@@ -245,5 +269,40 @@ describe("bindCloudAgent — agent-base warm-up", () => {
       ports().ports,
     );
     expect(outcome.kind).toBe("done");
+  });
+
+  it("compensates the exact live target when the attempt is aborted after durable finalization", async () => {
+    const abortController = new AbortController();
+    const restoreIfCurrent = vi.fn(() => true);
+    clientStub.stageSessionTarget.mockReturnValueOnce({
+      publish: () => true,
+      restoreIfCurrent,
+      clearIfCurrent: () => true,
+    });
+    persistAgentProfileConnectionDurablyStub.mockImplementationOnce(
+      async (profile, _server, options) => {
+        if ((await options?.finalize?.()) === false) return null;
+        options?.captureCompensation?.(async () => {
+          await options.compensateFinalization?.();
+        });
+        abortController.abort();
+        return {
+          id: "profile-1",
+          createdAt: "2026-08-30T00:00:00.000Z",
+          ...profile,
+        };
+      },
+    );
+
+    await expect(
+      bindCloudAgent(
+        draft(),
+        "steward-token",
+        {},
+        ports({ signal: abortController.signal }).ports,
+      ),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(restoreIfCurrent).toHaveBeenCalledTimes(1);
+    expect(clientStub.listConversations).not.toHaveBeenCalled();
   });
 });

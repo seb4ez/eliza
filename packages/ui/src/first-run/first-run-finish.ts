@@ -44,6 +44,7 @@ import {
   addAgentProfile,
   createPersistedActiveServer,
   loadPersistedActiveServer,
+  persistAgentProfileConnectionDurably,
   removeAgentProfile,
   savePersistedActiveServer,
   savePersistedFirstRunComplete,
@@ -582,8 +583,64 @@ export async function bindCloudAgent(
       };
     }
   }
-  client.setBaseUrl(cloudAgentApiBase);
-  client.setToken(authToken);
+  ports.signal?.throwIfAborted();
+  const activeServer = createPersistedActiveServer({
+    kind: "cloud",
+    id: `cloud:${selectedAgent.agentId}`,
+    apiBase: cloudAgentApiBase,
+    accessToken: authToken,
+  });
+  ports.onStatus?.("Saving first-run profile", "persist");
+  let liveTargetAuthority: ReturnType<typeof client.stageSessionTarget> = null;
+  let compensateConnection: (() => Promise<void>) | null = null;
+  const attemptIsLive = () => !ports.signal?.aborted;
+  const sharedAgentProfile = await persistAgentProfileConnectionDurably(
+    {
+      kind: "cloud",
+      label: activeServer.label,
+      cloudAgentId: selectedAgent.agentId,
+      ...(activeServer.apiBase ? { apiBase: activeServer.apiBase } : {}),
+      ...(activeServer.accessToken
+        ? { accessToken: activeServer.accessToken }
+        : {}),
+    },
+    activeServer,
+    {
+      validate: attemptIsLive,
+      finalize: async () => {
+        ports.signal?.throwIfAborted();
+        liveTargetAuthority = client.stageSessionTarget({
+          baseUrl: cloudAgentApiBase,
+          token: authToken,
+        });
+        if (!liveTargetAuthority) return false;
+        if (liveTargetAuthority.publish()) return true;
+        liveTargetAuthority.restoreIfCurrent();
+        return false;
+      },
+      compensateFinalization: async () => {
+        liveTargetAuthority?.restoreIfCurrent();
+      },
+      captureCompensation: (compensate) => {
+        compensateConnection = compensate;
+      },
+    },
+  );
+  if (!sharedAgentProfile || !liveTargetAuthority) {
+    return {
+      kind: "error",
+      message: "Couldn't durably save the selected cloud agent.",
+    };
+  }
+  if (!attemptIsLive()) {
+    const compensate = compensateConnection as (() => Promise<void>) | null;
+    if (compensate) await compensate();
+    ports.signal?.throwIfAborted();
+    return {
+      kind: "error",
+      message: "Cloud agent setup was cancelled.",
+    };
+  }
   // Warm the agent base NOW, overlapping everything between here and the
   // hydrate phase's real conversation fetch (persist, coordinator phase
   // transitions, the auth gate's /api/auth/me — measured 2.3s cold on
@@ -600,25 +657,7 @@ export async function bindCloudAgent(
   void Promise.resolve()
     .then(() => client.listConversations?.())
     .catch(() => undefined);
-  ports.signal?.throwIfAborted();
-  const activeServer = createPersistedActiveServer({
-    kind: "cloud",
-    id: `cloud:${selectedAgent.agentId}`,
-    apiBase: cloudAgentApiBase,
-    accessToken: authToken,
-  });
-  savePersistedActiveServer(activeServer);
-  const sharedAgentProfile = addAgentProfile({
-    kind: "cloud",
-    label: activeServer.label,
-    cloudAgentId: selectedAgent.agentId,
-    ...(activeServer.apiBase ? { apiBase: activeServer.apiBase } : {}),
-    ...(activeServer.accessToken
-      ? { accessToken: activeServer.accessToken }
-      : {}),
-  });
   persistMobileRuntimeModeForServerTarget("elizacloud");
-  ports.onStatus?.("Saving first-run profile", "persist");
   // Direct Cloud agent bases are chat runtimes, not full app-shell setup
   // servers — they do not own /api/first-run. Only persist when the bound base
   // owns the app-shell routes.

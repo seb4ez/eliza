@@ -1377,13 +1377,13 @@ export class ElizaClient {
   stageSessionTarget(
     target: {
       baseUrl: string;
-      token: string;
+      token: string | null;
     },
     options: { persist?: boolean } = {},
   ): SessionTargetAuthority | null {
     const normalizedBase = normalizeBaseUrl(target.baseUrl);
-    const normalizedToken = target.token.trim();
-    if (!normalizedBase || !normalizedToken) return null;
+    const normalizedToken = target.token?.trim() || null;
+    if (!normalizedBase) return null;
 
     const previousBase = this.getBaseUrl();
     const previousToken = this.getRestAuthToken();
@@ -1487,7 +1487,7 @@ export class ElizaClient {
    * receipt: stage, run a synchronous finalizer, then publish the pair.
    */
   installSessionTarget(
-    target: { baseUrl: string; token: string },
+    target: { baseUrl: string; token: string | null },
     options: {
       persist?: boolean;
       finalizeBeforePublish?: () => void;

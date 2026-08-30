@@ -23,14 +23,17 @@ const mocks = vi.hoisted(() => ({
   getBootConfig: vi.fn(() => ({ cloudApiBase: "https://api.elizacloud.ai" })),
   savePersistedActiveServer: vi.fn(),
   upsertAndActivateAgentProfile: vi.fn(),
+  persistAgentProfileConnectionDurably: vi.fn(),
   setBaseUrl: vi.fn(),
   setToken: vi.fn(),
+  stageSessionTarget: vi.fn(),
 }));
 
 vi.mock("../api", () => ({
   client: {
     setBaseUrl: mocks.setBaseUrl,
     setToken: mocks.setToken,
+    stageSessionTarget: mocks.stageSessionTarget,
   },
 }));
 
@@ -44,7 +47,8 @@ vi.mock("../state/persistence", () => ({
 }));
 
 vi.mock("../state/agent-profiles", () => ({
-  upsertAndActivateAgentProfile: mocks.upsertAndActivateAgentProfile,
+  persistAgentProfileConnectionDurably:
+    mocks.persistAgentProfileConnectionDurably,
 }));
 
 describe("browser launch connection handling", () => {
@@ -61,6 +65,24 @@ describe("browser launch connection handling", () => {
     mocks.getBootConfig.mockReturnValue({
       cloudApiBase: "https://api.elizacloud.ai",
     });
+    mocks.persistAgentProfileConnectionDurably.mockImplementation(
+      async (profile, server, options) => {
+        mocks.savePersistedActiveServer(server);
+        mocks.upsertAndActivateAgentProfile(profile);
+        if ((await options?.finalize?.()) === false) return null;
+        return { id: "test-profile", createdAt: "2026-08-30", ...profile };
+      },
+    );
+    mocks.stageSessionTarget.mockImplementation(({ baseUrl, token }) => ({
+      publish: () => {
+        mocks.setToken(null);
+        mocks.setBaseUrl(baseUrl);
+        if (token) mocks.setToken(token);
+        return true;
+      },
+      restoreIfCurrent: () => true,
+      clearIfCurrent: () => true,
+    }));
     window.history.replaceState(null, "", "http://localhost/");
   });
 
@@ -150,28 +172,28 @@ describe("browser launch connection handling", () => {
     expect(mocks.savePersistedActiveServer).not.toHaveBeenCalled();
   });
 
-  it("rejects Settings-style remote connect calls to arbitrary public HTTPS", () => {
-    expect(() =>
+  it("rejects Settings-style remote connect calls to arbitrary public HTTPS", async () => {
+    await expect(
       applyLaunchConnection({
         kind: "remote",
         apiBase: "https://agent.attacker.example/",
         token: "secret-token",
       }),
-    ).toThrow("Rejected invalid launch apiBase");
+    ).rejects.toThrow("Rejected invalid launch apiBase");
 
     expect(mocks.setBaseUrl).not.toHaveBeenCalled();
     expect(mocks.setToken).not.toHaveBeenCalled();
     expect(mocks.savePersistedActiveServer).not.toHaveBeenCalled();
   });
 
-  it("allows Settings-style remote connect calls to trusted private URLs", () => {
-    expect(
+  it("allows Settings-style remote connect calls to trusted private URLs", async () => {
+    await expect(
       applyLaunchConnection({
         kind: "remote",
         apiBase: "https://my-box.local:31337/",
         token: " secret-token ",
       }),
-    ).toEqual({
+    ).resolves.toEqual({
       apiBase: "https://my-box.local:31337",
       token: "secret-token",
     });
@@ -192,6 +214,21 @@ describe("browser launch connection handling", () => {
         kind: "remote",
       }),
     );
+  });
+
+  it("fails closed when the durable target cannot be installed in the live client", async () => {
+    mocks.stageSessionTarget.mockReturnValueOnce(null);
+
+    await expect(
+      applyLaunchConnection({
+        kind: "remote",
+        apiBase: "https://my-box.local:31337/",
+        token: "secret-token",
+      }),
+    ).rejects.toThrow("could not be saved");
+
+    expect(mocks.setBaseUrl).not.toHaveBeenCalled();
+    expect(mocks.setToken).not.toHaveBeenCalled();
   });
 
   it("rejects configured cloud API hosts over plaintext HTTP", async () => {

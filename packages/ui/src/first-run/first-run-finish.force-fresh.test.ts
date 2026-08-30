@@ -51,6 +51,7 @@ const clientMock = vi.hoisted(() => ({
   submitFirstRun: vi.fn(async () => {}),
   setBaseUrl: vi.fn(),
   setToken: vi.fn(),
+  stageSessionTarget: vi.fn(),
   getBaseUrl: vi.fn(() => ""),
 }));
 
@@ -64,6 +65,16 @@ vi.mock("../state", () => ({
   addAgentProfile: vi.fn(() => ({ id: "profile-1" })),
   createPersistedActiveServer: vi.fn((v) => ({ label: "Eliza Cloud", ...v })),
   loadPersistedActiveServer: vi.fn(() => null),
+  persistAgentProfileConnectionDurably: vi.fn(
+    async (profile, _server, options) => {
+      if ((await options?.finalize?.()) === false) return null;
+      return {
+        id: "profile-1",
+        createdAt: "2026-08-30T00:00:00.000Z",
+        ...profile,
+      };
+    },
+  ),
   removeAgentProfile: vi.fn(),
   savePersistedActiveServer: vi.fn(),
   savePersistedFirstRunComplete: vi.fn(),
@@ -99,6 +110,15 @@ function ports(): FirstRunFinishPorts {
 beforeEach(() => {
   vi.clearAllMocks();
   window.localStorage.clear();
+  clientMock.stageSessionTarget.mockImplementation(({ baseUrl, token }) => ({
+    publish: () => {
+      clientMock.setBaseUrl(baseUrl);
+      clientMock.setToken(token);
+      return true;
+    },
+    restoreIfCurrent: () => true,
+    clearIfCurrent: () => true,
+  }));
   clientMock.selectOrProvisionCloudAgent.mockResolvedValue({
     agentId: "cad3c071",
     apiBase: SHARED_AGENT_BASE,

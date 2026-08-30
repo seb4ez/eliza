@@ -175,6 +175,24 @@ describe("getCloudAuthToken (Cloud = Steward everywhere)", () => {
     offAuthority();
   });
 
+  it("stages a tokenless target as one coherent authority pair", () => {
+    const client = new ElizaClient("https://api.eliza.app", "old-token");
+    const authority = client.installSessionTarget(
+      {
+        baseUrl: "https://self-hosted.local:31337",
+        token: null,
+      },
+      { persist: false },
+    );
+
+    expect(authority).not.toBeNull();
+    expect(client.getBaseUrl()).toBe("https://self-hosted.local:31337");
+    expect(client.getRestAuthToken()).toBeNull();
+    expect(authority?.restoreIfCurrent()).toBe(true);
+    expect(client.getBaseUrl()).toBe("https://api.eliza.app");
+    expect(client.getRestAuthToken()).toBe("old-token");
+  });
+
   it("restores the predecessor before exposing a failed target finalizer", () => {
     const client = new ElizaClient("https://api.eliza.app", "old-token");
     const observed = vi.fn();

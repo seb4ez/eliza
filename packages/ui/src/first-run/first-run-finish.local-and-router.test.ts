@@ -23,6 +23,7 @@ const clientMock = vi.hoisted(() => ({
   submitFirstRun: vi.fn(async () => {}),
   setBaseUrl: vi.fn(),
   setToken: vi.fn(),
+  stageSessionTarget: vi.fn(),
   getBaseUrl: vi.fn(() => ""),
   getAuthStatus: vi.fn(async () => ({ ok: true })),
 }));
@@ -52,6 +53,16 @@ vi.mock("../state", () => ({
   addAgentProfile: addAgentProfileMock,
   createPersistedActiveServer: vi.fn((v) => v),
   loadPersistedActiveServer: vi.fn(() => null),
+  persistAgentProfileConnectionDurably: vi.fn(
+    async (profile, _server, options) => {
+      if ((await options?.finalize?.()) === false) return null;
+      return {
+        id: "profile-1",
+        createdAt: "2026-08-30T00:00:00.000Z",
+        ...profile,
+      };
+    },
+  ),
   removeAgentProfile: vi.fn(),
   savePersistedActiveServer: savePersistedActiveServerMock,
   savePersistedFirstRunComplete: vi.fn(),
@@ -91,6 +102,15 @@ beforeEach(() => {
   vi.clearAllMocks();
   clientMock.getBaseUrl.mockReturnValue("");
   window.localStorage.clear();
+  clientMock.stageSessionTarget.mockImplementation(({ baseUrl, token }) => ({
+    publish: () => {
+      clientMock.setBaseUrl(baseUrl);
+      clientMock.setToken(token);
+      return true;
+    },
+    restoreIfCurrent: () => true,
+    clearIfCurrent: () => true,
+  }));
 });
 
 afterEach(() => {

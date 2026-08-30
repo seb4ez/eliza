@@ -10,11 +10,8 @@ import {
 } from "@elizaos/shared/elizacloud";
 import { client } from "../api";
 import { getBootConfig } from "../config/boot-config-store";
-import { upsertAndActivateAgentProfile } from "../state/agent-profiles";
-import {
-  createPersistedActiveServer,
-  savePersistedActiveServer,
-} from "../state/persistence";
+import { persistAgentProfileConnectionDurably } from "../state/agent-profiles";
+import { createPersistedActiveServer } from "../state/persistence";
 import {
   isTrustedCloudApiBaseUrl,
   isTrustedRestoreApiBaseUrl,
@@ -188,12 +185,12 @@ async function exchangeCloudLaunchSession(
   throw lastError ?? new Error("Launch session exchange failed");
 }
 
-export function applyLaunchConnection(args: {
+export async function applyLaunchConnection(args: {
   apiBase: string;
   token?: string | null;
   kind?: "cloud" | "remote";
   cloudAgentId?: string | null;
-}): { apiBase: string; token: string | null } {
+}): Promise<{ apiBase: string; token: string | null }> {
   const kind = args.kind ?? "remote";
   const normalizedApiBase = normalizeLaunchApiBase(args.apiBase, {
     kind,
@@ -209,27 +206,47 @@ export function applyLaunchConnection(args: {
     throw new Error("Cloud launch owner does not match its API base");
   }
 
-  client.setToken(null);
-  client.setBaseUrl(normalizedApiBase);
-  if (token) client.setToken(token);
   const persisted = createPersistedActiveServer({
     kind,
     ...(cloudAgentId ? { id: `cloud:${cloudAgentId}` } : {}),
     apiBase: normalizedApiBase,
     ...(token ? { accessToken: token } : {}),
   });
-  savePersistedActiveServer(persisted);
   // Keep the agent-profile registry (the "My Runtimes" source of truth) in sync
   // with the active server — otherwise a connection made here is invisible to
   // the runtime switcher and leaves its Active badge stale. Idempotent: a
   // repeat connect to the same host re-activates rather than duplicating.
-  upsertAndActivateAgentProfile({
-    kind,
-    label: persisted.label,
-    ...(cloudAgentId ? { cloudAgentId } : {}),
-    ...(persisted.apiBase !== undefined ? { apiBase: persisted.apiBase } : {}),
-    ...(token ? { accessToken: token } : {}),
-  });
+  let liveTargetAuthority: ReturnType<typeof client.stageSessionTarget> = null;
+  const profile = await persistAgentProfileConnectionDurably(
+    {
+      kind,
+      label: persisted.label,
+      ...(cloudAgentId ? { cloudAgentId } : {}),
+      ...(persisted.apiBase !== undefined
+        ? { apiBase: persisted.apiBase }
+        : {}),
+      ...(token ? { accessToken: token } : {}),
+    },
+    persisted,
+    {
+      finalize: async () => {
+        liveTargetAuthority = client.stageSessionTarget({
+          baseUrl: normalizedApiBase,
+          token,
+        });
+        if (!liveTargetAuthority) return false;
+        if (liveTargetAuthority.publish()) return true;
+        liveTargetAuthority.restoreIfCurrent();
+        return false;
+      },
+      compensateFinalization: async () => {
+        liveTargetAuthority?.restoreIfCurrent();
+      },
+    },
+  );
+  if (!profile || !liveTargetAuthority) {
+    throw new Error("The launch connection could not be saved.");
+  }
 
   return { apiBase: normalizedApiBase, token };
 }
@@ -246,7 +263,7 @@ export async function applyLaunchConnectionFromUrl(): Promise<boolean> {
       normalizeLaunchBaseUrl(launchBase),
       launchSession,
     );
-    applyLaunchConnection({
+    await applyLaunchConnection({
       kind: "cloud",
       cloudAgentId: connection.agentId,
       apiBase: connection.apiBase,
@@ -282,7 +299,7 @@ export async function applyLaunchConnectionFromUrl(): Promise<boolean> {
     // error-policy:J3 normalization below owns the structured invalid result.
   }
 
-  applyLaunchConnection({
+  await applyLaunchConnection({
     kind: "remote",
     apiBase,
     token: null,

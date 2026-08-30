@@ -2638,7 +2638,7 @@ function AppContent() {
       }
 
       try {
-        const connection = applyLaunchConnection({
+        const connection = await applyLaunchConnection({
           kind: "remote",
           apiBase: payload.gatewayUrl,
           token: typeof payload.token === "string" ? payload.token : null,
