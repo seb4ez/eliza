@@ -45,9 +45,15 @@ describe("useCloudState — Electrobun Steward refresh endpoint", () => {
       cloudApiBase: "https://www.elizacloud.ai",
     });
     clientCloudMocks.refreshCloudStewardSession.mockReset();
-    clientCloudMocks.refreshCloudStewardSession.mockResolvedValue({
-      token: "fresh",
-    });
+    clientCloudMocks.refreshCloudStewardSession.mockImplementation(
+      async (options) => {
+        const session = { token: "fresh" };
+        await options?.commitRefreshedSession?.(session, {
+          validate: () => true,
+        });
+        return session;
+      },
+    );
   });
 
   afterEach(() => {
@@ -63,6 +69,7 @@ describe("useCloudState — Electrobun Steward refresh endpoint", () => {
     await waitFor(() =>
       expect(clientCloudMocks.refreshCloudStewardSession).toHaveBeenCalledWith({
         endpoint: "https://api.eliza.app/api/auth/steward-refresh",
+        commitRefreshedSession: expect.any(Function),
       }),
     );
   });

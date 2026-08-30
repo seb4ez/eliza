@@ -38,7 +38,7 @@ const silentlyRepointToDedicatedStub = vi.hoisted(() => vi.fn());
 const runAgentSessionRecoveryStub = vi.hoisted(() => vi.fn());
 const removeAgentProfileStub = vi.hoisted(() => vi.fn());
 const addAgentProfileStub = vi.hoisted(() =>
-  vi.fn(() => ({ id: "profile-1" })),
+  vi.fn((_profile: unknown) => ({ id: "profile-1" })),
 );
 const persistAgentProfileConnectionDurablyStub = vi.hoisted(() => vi.fn());
 const loadPersistedActiveServerStub = vi.hoisted(() =>

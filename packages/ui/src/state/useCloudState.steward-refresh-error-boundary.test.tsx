@@ -62,9 +62,15 @@ describe("useCloudState — Steward refresh endpoint error boundary", () => {
       cloudApiBase: "https://api.example.com",
     });
     clientCloudMocks.refreshCloudStewardSession.mockReset();
-    clientCloudMocks.refreshCloudStewardSession.mockResolvedValue({
-      token: "fresh",
-    });
+    clientCloudMocks.refreshCloudStewardSession.mockImplementation(
+      async (options) => {
+        const session = { token: "fresh" };
+        await options?.commitRefreshedSession?.(session, {
+          validate: () => true,
+        });
+        return session;
+      },
+    );
     clientCloudMocks.replaceStoredStewardTokenIfCurrent.mockReset();
     clientCloudMocks.replaceStoredStewardTokenIfCurrent.mockImplementation(
       async (expectedToken: string, replacementToken: string) => {
@@ -92,6 +98,7 @@ describe("useCloudState — Steward refresh endpoint error boundary", () => {
     await waitFor(() =>
       expect(clientCloudMocks.refreshCloudStewardSession).toHaveBeenCalledWith({
         endpoint: "https://api.example.com/api/auth/steward-refresh",
+        commitRefreshedSession: expect.any(Function),
       }),
     );
   });
@@ -104,6 +111,7 @@ describe("useCloudState — Steward refresh endpoint error boundary", () => {
     await waitFor(() =>
       expect(clientCloudMocks.refreshCloudStewardSession).toHaveBeenCalledWith({
         endpoint: undefined,
+        commitRefreshedSession: expect.any(Function),
       }),
     );
   });
@@ -149,11 +157,18 @@ describe("useCloudState — Steward refresh endpoint error boundary", () => {
   });
 
   it("does not restore a refreshed token after logout wins the race", async () => {
-    let releaseRefresh: (value: { token: string }) => void = () => {};
-    clientCloudMocks.refreshCloudStewardSession.mockReturnValueOnce(
-      new Promise((resolve) => {
-        releaseRefresh = resolve;
-      }),
+    let releaseRefresh: () => void = () => {};
+    clientCloudMocks.refreshCloudStewardSession.mockImplementationOnce(
+      async (options) => {
+        await new Promise<void>((resolve) => {
+          releaseRefresh = resolve;
+        });
+        const session = { token: "stale-refreshed-token" };
+        await options?.commitRefreshedSession?.(session, {
+          validate: () => true,
+        });
+        return session;
+      },
     );
 
     armStewardRefresh();
@@ -161,7 +176,7 @@ describe("useCloudState — Steward refresh endpoint error boundary", () => {
       expect(clientCloudMocks.refreshCloudStewardSession).toHaveBeenCalled(),
     );
     localStorage.removeItem(STEWARD_TOKEN_KEY);
-    releaseRefresh({ token: "stale-refreshed-token" });
+    releaseRefresh();
 
     await waitFor(() =>
       expect(
@@ -169,6 +184,7 @@ describe("useCloudState — Steward refresh endpoint error boundary", () => {
       ).toHaveBeenCalledWith(
         "near-expiry-steward-jwt",
         "stale-refreshed-token",
+        { validate: expect.any(Function) },
       ),
     );
     expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();

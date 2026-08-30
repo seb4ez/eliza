@@ -8,6 +8,7 @@
 
 import { STEWARD_TOKEN_KEY } from "@elizaos/shared/steward-session-client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { enqueueStewardSessionMutation } from "../cloud/lib/steward-session-mutation-queue";
 
 const capacitorMocks = vi.hoisted(() => ({
   request: vi.fn(),
@@ -16,6 +17,7 @@ const capacitorMocks = vi.hoisted(() => ({
 vi.mock("@capacitor/core", () => ({
   Capacitor: {
     isNativePlatform: () => true,
+    registerPlugin: () => ({}),
   },
   CapacitorHttp: {
     request: capacitorMocks.request,
@@ -27,6 +29,14 @@ vi.mock("../bridge/electrobun-runtime", () => ({
 }));
 
 import { refreshCloudStewardSession } from "./client-cloud";
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
 
 describe("refreshCloudStewardSession native bearer refresh", () => {
   const realFetch = globalThis.fetch;
@@ -103,5 +113,70 @@ describe("refreshCloudStewardSession native bearer refresh", () => {
 
     expect(capacitorMocks.request).not.toHaveBeenCalled();
     expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it("retires the exact native bearer after an explicit session_ended verdict", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, "revoked-bridged-token");
+    capacitorMocks.request.mockResolvedValue({
+      status: 401,
+      data: { code: "session_ended" },
+    });
+
+    await expect(
+      refreshCloudStewardSession({
+        endpoint: "https://api.elizacloud.ai/api/auth/steward-refresh",
+      }),
+    ).resolves.toBeNull();
+
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+  });
+
+  it("preserves the native bearer on a non-authoritative invalid_token 401", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, "still-valid-token");
+    capacitorMocks.request.mockResolvedValue({
+      status: 401,
+      data: { code: "invalid_token" },
+    });
+
+    await expect(
+      refreshCloudStewardSession({
+        endpoint: "https://api.elizacloud.ai/api/auth/steward-refresh",
+      }),
+    ).resolves.toBeNull();
+
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("still-valid-token");
+  });
+
+  it("serializes native refresh publication before a newer login transaction", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, "account-a");
+    capacitorMocks.request.mockResolvedValue({
+      status: 200,
+      data: { token: "account-a-refreshed" },
+    });
+    const publication = deferred<void>();
+    const order: string[] = [];
+
+    const refreshA = refreshCloudStewardSession({
+      endpoint: "https://api.elizacloud.ai/api/auth/steward-refresh",
+      commitRefreshedSession: async () => {
+        order.push("refresh-a-publish-start");
+        await publication.promise;
+        order.push("refresh-a-publish-end");
+      },
+    });
+    await vi.waitFor(() => expect(order).toEqual(["refresh-a-publish-start"]));
+    const loginB = enqueueStewardSessionMutation(async () => {
+      order.push("login-b");
+    });
+
+    await Promise.resolve();
+    expect(order).toEqual(["refresh-a-publish-start"]);
+    publication.resolve();
+    await Promise.all([refreshA, loginB]);
+    expect(order).toEqual([
+      "refresh-a-publish-start",
+      "refresh-a-publish-end",
+      "login-b",
+    ]);
   });
 });
