@@ -22,6 +22,7 @@ import { MOBILE_RUNTIME_MODE_STORAGE_KEY } from "../first-run/mobile-runtime-mod
 import { runAsPrivilegedShell } from "../surface-realm-channel";
 import {
   type DesktopSecureStoreKind,
+  desktopSecureStoreCompareAndRestore,
   desktopSecureStoreDelete,
   desktopSecureStoreGet,
   desktopSecureStoreSet,
@@ -122,6 +123,16 @@ const protectedStorageCache = new Map<string, string>();
 const protectedStorageMutationVersion = new Map<string, number>();
 const protectedStorageMutationTail = new Map<string, Promise<void>>();
 
+interface ProtectedStoreSetResult {
+  rollbackReceipt: string | null;
+  stored: boolean;
+}
+
+let stewardTokenRollbackAuthority: {
+  expectedToken: string;
+  receipt: string;
+} | null = null;
+
 function markProtectedStorageMutation(key: string): number {
   const version = (protectedStorageMutationVersion.get(key) ?? 0) + 1;
   protectedStorageMutationVersion.set(key, version);
@@ -152,10 +163,13 @@ function serializeProtectedStorageMutation<T>(
 function serializedProtectedStoreSet(
   key: string,
   value: string,
-): Promise<boolean> {
+): Promise<ProtectedStoreSetResult> {
   return serializeProtectedStorageMutation(key, async () => {
-    if (!(await protectedStoreSet(key, value))) return false;
-    return (await protectedStoreGet(key)) === value;
+    const result = await protectedStoreSet(key, value);
+    if (!result.stored) return result;
+    return (await protectedStoreGet(key)) === value
+      ? result
+      : { stored: false, rollbackReceipt: null };
   });
 }
 
@@ -182,6 +196,7 @@ function compareAndRestoreStorageValue(
   key: string,
   expectedValue: string,
   restoreValue: string | null,
+  rollbackReceipt: string | null = null,
 ): Promise<boolean> {
   if (!isProtectedStorageHost() || !PROTECTED_STORAGE_KIND.has(key)) {
     if (window.localStorage.getItem(key) !== expectedValue) {
@@ -199,6 +214,27 @@ function compareAndRestoreStorageValue(
 
   markProtectedStorageMutation(key);
   return serializeProtectedStorageMutation(key, async () => {
+    if (!isNativePlatform() && isElectrobunRuntime()) {
+      const kind = PROTECTED_STORAGE_KIND.get(key);
+      if (!kind) {
+        throw new Error("Protected storage kind is not registered");
+      }
+      if (!rollbackReceipt) {
+        throw new Error(
+          "Desktop protected storage rollback receipt is missing",
+        );
+      }
+      const result = await desktopSecureStoreCompareAndRestore(
+        kind,
+        rollbackReceipt,
+      );
+      if (!result?.ok) {
+        throw new Error("Desktop protected storage rejected rollback");
+      }
+      compareAndRestoreProtectedStorageCache(key, expectedValue, result.value);
+      return result.restored;
+    }
+
     const currentValue = await protectedStoreGet(key);
     if (currentValue !== expectedValue) {
       compareAndRestoreProtectedStorageCache(key, expectedValue, currentValue);
@@ -212,7 +248,7 @@ function compareAndRestoreStorageValue(
       }
     } else {
       const restored = await protectedStoreSet(key, restoreValue);
-      if (!restored || (await protectedStoreGet(key)) !== restoreValue) {
+      if (!restored.stored || (await protectedStoreGet(key)) !== restoreValue) {
         throw new Error(`Protected storage rejected rollback for ${key}`);
       }
     }
@@ -249,17 +285,26 @@ async function protectedStoreGet(key: string): Promise<string | null> {
   return null;
 }
 
-async function protectedStoreSet(key: string, value: string): Promise<boolean> {
+async function protectedStoreSet(
+  key: string,
+  value: string,
+): Promise<ProtectedStoreSetResult> {
   const kind = PROTECTED_STORAGE_KIND.get(key);
-  if (!kind) return false;
+  if (!kind) return { stored: false, rollbackReceipt: null };
   if (isNativePlatform()) {
     const { ElizaSecureStore } = await loadNativeSecureStore();
-    return (await ElizaSecureStore.set({ key: kind, value })).ok;
+    return {
+      stored: (await ElizaSecureStore.set({ key: kind, value })).ok,
+      rollbackReceipt: null,
+    };
   }
   if (isElectrobunRuntime()) {
-    return (await desktopSecureStoreSet(kind, value))?.ok === true;
+    const result = await desktopSecureStoreSet(kind, value);
+    return result?.ok
+      ? { stored: true, rollbackReceipt: result.rollbackReceipt }
+      : { stored: false, rollbackReceipt: null };
   }
-  return false;
+  return { stored: false, rollbackReceipt: null };
 }
 
 async function protectedStoreDelete(key: string): Promise<void> {
@@ -492,7 +537,7 @@ export async function initializeStorageBridge(): Promise<void> {
 
         protectedStorageCache.set(key, legacyValue);
         const stored = await protectedStoreSet(key, legacyValue);
-        const verified = stored ? await protectedStoreGet(key) : null;
+        const verified = stored.stored ? await protectedStoreGet(key) : null;
         if (verified !== legacyValue) {
           protectedStoreResponded = false;
           logger.error(
@@ -570,7 +615,7 @@ function setupStorageProxy(): void {
       setTimeout(() => {
         serializedProtectedStoreSet(key, value)
           .then((stored) => {
-            if (!stored) {
+            if (!stored.stored) {
               logger.error(
                 { key },
                 "[StorageBridge] secure-store rejected protected write",
@@ -744,22 +789,21 @@ export async function getStorageValue(key: string): Promise<string | null> {
   return window.localStorage.getItem(key);
 }
 
-/**
- * Set a value in storage (works on both native and web)
- */
-export async function setStorageValue(
+/** Persists a value and returns an Electrobun rollback receipt when present. */
+async function persistStorageValue(
   key: string,
   value: string,
-): Promise<void> {
+): Promise<string | null> {
   if (isProtectedStorageHost() && PROTECTED_STORAGE_KIND.has(key)) {
     const mutationVersion = markProtectedStorageMutation(key);
-    if (!(await serializedProtectedStoreSet(key, value))) {
+    const result = await serializedProtectedStoreSet(key, value);
+    if (!result.stored) {
       throw new Error(`Protected storage rejected write for ${key}`);
     }
     if (protectedStorageMutationVersion.get(key) === mutationVersion) {
       protectedStorageCache.set(key, value);
     }
-    return;
+    return result.rollbackReceipt;
   }
   // Privileged: this is the shell-side persistence helper (session/auth/
   // first-run keys); the view-facing path is the scoped override in
@@ -770,6 +814,17 @@ export async function setStorageValue(
     const { Preferences } = await loadPreferences();
     await Preferences.set({ key, value });
   }
+  return null;
+}
+
+/**
+ * Set a value in storage (works on both native and web)
+ */
+export async function setStorageValue(
+  key: string,
+  value: string,
+): Promise<void> {
+  await persistStorageValue(key, value);
 }
 
 /**
@@ -806,10 +861,31 @@ export function isStorageBridgeInitialized(): boolean {
   return initialized;
 }
 
-registerStewardTokenRemoval(() => removeStorageValue(STEWARD_TOKEN_KEY));
-registerStewardTokenPersistence((token) =>
-  setStorageValue(STEWARD_TOKEN_KEY, token),
-);
-registerStewardTokenCompareAndRestore((expectedToken, restoreToken) =>
-  compareAndRestoreStorageValue(STEWARD_TOKEN_KEY, expectedToken, restoreToken),
-);
+registerStewardTokenRemoval(async () => {
+  await removeStorageValue(STEWARD_TOKEN_KEY);
+  stewardTokenRollbackAuthority = null;
+});
+registerStewardTokenPersistence(async (token) => {
+  stewardTokenRollbackAuthority = null;
+  const receipt = await persistStorageValue(STEWARD_TOKEN_KEY, token);
+  stewardTokenRollbackAuthority = receipt
+    ? { expectedToken: token, receipt }
+    : null;
+});
+registerStewardTokenCompareAndRestore(async (expectedToken, restoreToken) => {
+  const rollbackAuthority = stewardTokenRollbackAuthority;
+  try {
+    return await compareAndRestoreStorageValue(
+      STEWARD_TOKEN_KEY,
+      expectedToken,
+      restoreToken,
+      rollbackAuthority?.expectedToken === expectedToken
+        ? rollbackAuthority.receipt
+        : null,
+    );
+  } finally {
+    if (stewardTokenRollbackAuthority === rollbackAuthority) {
+      stewardTokenRollbackAuthority = null;
+    }
+  }
+});

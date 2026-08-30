@@ -127,6 +127,26 @@ export type DesktopSecureStoreResult =
       message?: string;
     };
 
+export type DesktopSecureStoreSetResult =
+  | { ok: true; rollbackReceipt: string }
+  | {
+      ok: false;
+      reason: "not_found" | "denied" | "unavailable" | "error";
+      message?: string;
+    };
+
+export type DesktopSecureStoreCompareAndRestoreResult =
+  | {
+      ok: true;
+      restored: boolean;
+      value: string | null;
+    }
+  | {
+      ok: false;
+      reason: "not_found" | "denied" | "unavailable" | "error";
+      message?: string;
+    };
+
 export async function desktopSecureStoreGet(
   kind: DesktopSecureStoreKind,
 ): Promise<DesktopSecureStoreResult | null> {
@@ -140,8 +160,8 @@ export async function desktopSecureStoreGet(
 export async function desktopSecureStoreSet(
   kind: DesktopSecureStoreKind,
   value: string,
-): Promise<DesktopSecureStoreResult | null> {
-  return invokeDesktopBridgeRequest<DesktopSecureStoreResult>({
+): Promise<DesktopSecureStoreSetResult | null> {
+  return invokeDesktopBridgeRequest<DesktopSecureStoreSetResult>({
     rpcMethod: "secureStoreSet",
     ipcChannel: "secureStore:set",
     params: { kind, value },
@@ -155,6 +175,17 @@ export async function desktopSecureStoreDelete(
     rpcMethod: "secureStoreDelete",
     ipcChannel: "secureStore:delete",
     params: { kind },
+  });
+}
+
+export async function desktopSecureStoreCompareAndRestore(
+  kind: DesktopSecureStoreKind,
+  rollbackReceipt: string,
+): Promise<DesktopSecureStoreCompareAndRestoreResult | null> {
+  return invokeDesktopBridgeRequest<DesktopSecureStoreCompareAndRestoreResult>({
+    rpcMethod: "secureStoreCompareAndRestore",
+    ipcChannel: "secureStore:compareAndRestore",
+    params: { kind, rollbackReceipt },
   });
 }
 

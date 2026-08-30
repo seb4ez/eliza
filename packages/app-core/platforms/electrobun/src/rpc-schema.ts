@@ -513,6 +513,26 @@ export type RendererSecureStoreResult =
       message?: string;
     };
 
+export type RendererSecureStoreSetResult =
+  | { ok: true; rollbackReceipt: string }
+  | {
+      ok: false;
+      reason: "not_found" | "denied" | "unavailable" | "error";
+      message?: string;
+    };
+
+export type RendererSecureStoreCompareAndRestoreResult =
+  | {
+      ok: true;
+      restored: boolean;
+      value: string | null;
+    }
+  | {
+      ok: false;
+      reason: "not_found" | "denied" | "unavailable" | "error";
+      message?: string;
+    };
+
 export interface RendererSecureStoreStatus {
   backend:
     | "macos_keychain"
@@ -2181,11 +2201,18 @@ export type ElizaDesktopRPCSchema = {
       };
       secureStoreSet: {
         params: { kind: RendererSecureStoreKind; value: string };
-        response: RendererSecureStoreResult;
+        response: RendererSecureStoreSetResult;
       };
       secureStoreDelete: {
         params: { kind: RendererSecureStoreKind };
         response: RendererSecureStoreResult;
+      };
+      secureStoreCompareAndRestore: {
+        params: {
+          kind: RendererSecureStoreKind;
+          rollbackReceipt: string;
+        };
+        response: RendererSecureStoreCompareAndRestoreResult;
       };
       secureStoreStatus: {
         params: undefined;
@@ -3031,6 +3058,7 @@ export const CHANNEL_TO_RPC_METHOD: Record<string, string> = {
   "secureStore:get": "secureStoreGet",
   "secureStore:set": "secureStoreSet",
   "secureStore:delete": "secureStoreDelete",
+  "secureStore:compareAndRestore": "secureStoreCompareAndRestore",
   "secureStore:status": "secureStoreStatus",
   "runtimeCredential:store": "runtimeCredentialStore",
   "runtimeCredential:delete": "runtimeCredentialDelete",

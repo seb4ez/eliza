@@ -120,6 +120,7 @@ vi.mock("./electrobun-runtime", () => ({
 }));
 
 vi.mock("./electrobun-rpc", () => ({
+  desktopSecureStoreCompareAndRestore: vi.fn(),
   desktopSecureStoreDelete: vi.fn(),
   desktopSecureStoreGet: vi.fn(),
   desktopSecureStoreSet: vi.fn(),

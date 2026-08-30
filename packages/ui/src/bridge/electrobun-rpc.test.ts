@@ -11,6 +11,7 @@ import {
   DESKTOP_LAUNCHER_WINDOW_PATH,
   type DynamicViewManifest,
   desktopOpenPath,
+  desktopSecureStoreCompareAndRestore,
   desktopSecureStoreDelete,
   desktopSecureStoreGet,
   desktopSecureStoreSet,
@@ -294,11 +295,14 @@ describe("desktopSecureStore helpers", () => {
   it("routes set to secureStoreSet with kind and value", async () => {
     const harness = createBridgeHarness();
     installOnWindow(harness.rpc);
-    harness.handle("secureStoreSet", () => ({ ok: true }));
+    harness.handle("secureStoreSet", () => ({
+      ok: true,
+      rollbackReceipt: "opaque-receipt",
+    }));
 
     await expect(
       desktopSecureStoreSet("session.steward_token", "tok"),
-    ).resolves.toEqual({ ok: true });
+    ).resolves.toEqual({ ok: true, rollbackReceipt: "opaque-receipt" });
     expect(harness.calls).toEqual([
       {
         method: "secureStoreSet",
@@ -323,7 +327,37 @@ describe("desktopSecureStore helpers", () => {
     ]);
   });
 
-  it("return null for all three when the bridge is missing", async () => {
+  it("routes compare-and-restore as one host request", async () => {
+    const harness = createBridgeHarness();
+    installOnWindow(harness.rpc);
+    harness.handle("secureStoreCompareAndRestore", () => ({
+      ok: true,
+      restored: true,
+      value: "prior-token",
+    }));
+
+    await expect(
+      desktopSecureStoreCompareAndRestore(
+        "session.steward_token",
+        "opaque-receipt",
+      ),
+    ).resolves.toEqual({
+      ok: true,
+      restored: true,
+      value: "prior-token",
+    });
+    expect(harness.calls).toEqual([
+      {
+        method: "secureStoreCompareAndRestore",
+        params: {
+          kind: "session.steward_token",
+          rollbackReceipt: "opaque-receipt",
+        },
+      },
+    ]);
+  });
+
+  it("returns null for secure-store helpers when the bridge is missing", async () => {
     await expect(
       desktopSecureStoreGet("session.device_auth"),
     ).resolves.toBeNull();
@@ -332,6 +366,12 @@ describe("desktopSecureStore helpers", () => {
     ).resolves.toBeNull();
     await expect(
       desktopSecureStoreDelete("session.device_auth"),
+    ).resolves.toBeNull();
+    await expect(
+      desktopSecureStoreCompareAndRestore(
+        "session.steward_token",
+        "opaque-receipt",
+      ),
     ).resolves.toBeNull();
   });
 });

@@ -124,10 +124,10 @@ describe("desktop platform secure-store boundary", () => {
       'e.code === 1 || stderr.includes("not found")',
     );
     expect(rendererBridgeSource).toContain(
-      "secureStoreDelete: async (params) =>\n      rendererSecureStore.delete(",
+      "secureStoreDelete: async (params) =>\n      rendererSecureStoreAuthority.delete(",
     );
-    expect(rendererBridgeSource).not.toContain(
-      "await rendererSecureStore.delete(",
+    expect(rendererBridgeSource).toContain(
+      "rendererSecureStoreAuthority.compareAndRestore(",
     );
   });
 

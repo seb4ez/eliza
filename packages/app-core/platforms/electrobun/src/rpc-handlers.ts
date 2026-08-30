@@ -147,6 +147,7 @@ import {
   desktopRemoteTargetStatus,
   desktopRemoteTargetStop,
 } from "./remote-target-rpc";
+import { RendererSecureStoreAuthority } from "./renderer-secure-store-authority";
 import {
   buildDynamicViewRpcHandlers,
   buildNotificationRpcHandlers,
@@ -323,6 +324,9 @@ type BunRpcHandlers = {
 let rpcVoiceService: VoiceService | null = null;
 let rpcLaunchOrchestrator: LaunchOrchestrator | null = null;
 const rendererSecureStore = createNodePlatformSecureStore();
+const rendererSecureStoreAuthority = new RendererSecureStoreAuthority(
+  rendererSecureStore,
+);
 const rendererSecureStoreKinds = new Set<SecureStoreSecretKind>([
   "session.device_auth",
   "session.steward_token",
@@ -330,6 +334,7 @@ const rendererSecureStoreKinds = new Set<SecureStoreSecretKind>([
   "runtime.agent_profiles",
 ]);
 const RENDERER_SECURE_STORE_MAX_VALUE_BYTES = 256 * 1024;
+const RENDERER_SECURE_STORE_MAX_RECEIPT_BYTES = 512;
 
 function requireRendererSecureStoreKind(value: unknown): SecureStoreSecretKind {
   if (
@@ -348,6 +353,17 @@ function requireRendererSecureStoreValue(value: unknown): string {
     Buffer.byteLength(value, "utf8") > RENDERER_SECURE_STORE_MAX_VALUE_BYTES
   ) {
     throw new Error("secure-store value is missing or too large");
+  }
+  return value;
+}
+
+function requireRendererSecureStoreRollbackReceipt(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    Buffer.byteLength(value, "utf8") > RENDERER_SECURE_STORE_MAX_RECEIPT_BYTES
+  ) {
+    throw new Error("secure-store rollback receipt is missing or too large");
   }
   return value;
 }
@@ -1397,22 +1413,27 @@ export function buildBunRpcHandlers({
       return { providers: await scanAndValidateProviderCredentials() };
     },
     secureStoreGet: async (params) =>
-      rendererSecureStore.get(
+      rendererSecureStoreAuthority.get(
         deriveAgentVaultId(),
         requireRendererSecureStoreKind(params?.kind),
       ),
     secureStoreSet: async (params) => {
-      const result = await rendererSecureStore.set(
+      return rendererSecureStoreAuthority.set(
         deriveAgentVaultId(),
         requireRendererSecureStoreKind(params?.kind),
         requireRendererSecureStoreValue(params?.value),
       );
-      return result.ok ? { ok: true } : result;
     },
     secureStoreDelete: async (params) =>
-      rendererSecureStore.delete(
+      rendererSecureStoreAuthority.delete(
         deriveAgentVaultId(),
         requireRendererSecureStoreKind(params?.kind),
+      ),
+    secureStoreCompareAndRestore: async (params) =>
+      rendererSecureStoreAuthority.compareAndRestore(
+        deriveAgentVaultId(),
+        requireRendererSecureStoreKind(params?.kind),
+        requireRendererSecureStoreRollbackReceipt(params?.rollbackReceipt),
       ),
     secureStoreStatus: async () =>
       describeNodePlatformSecureStore(rendererSecureStore),

@@ -8,7 +8,10 @@
  * Harness is deterministic: the real bridge module runs against in-memory
  * stand-ins for the native-only Capacitor/desktop boundaries.
  */
-import { STEWARD_TOKEN_KEY } from "@elizaos/shared/steward-session-client";
+import {
+  STEWARD_TOKEN_KEY,
+  writeStoredStewardToken,
+} from "@elizaos/shared/steward-session-client";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Captured before any test can install the storage-bridge proxy so
@@ -29,8 +32,23 @@ const mockPreferences = new Map<string, string>();
 const mockDesktopStore = new Map<string, string>();
 const mockDesktopSecure = {
   available: true,
+  abortOnSet: null as AbortController | null,
+  compareAndRestoreCalls: [] as Array<{
+    kind: string;
+    rollbackReceipt: string;
+  }>,
+  receiptSequence: 0,
   rejectSets: false,
   failRemovals: false,
+  revisions: new Map<string, number>(),
+  rollbacks: new Map<
+    string,
+    {
+      predecessor: string | null;
+      receipt: string;
+      revision: number;
+    }
+  >(),
 };
 
 vi.mock("@capacitor/core", () => ({
@@ -79,15 +97,61 @@ vi.mock("./electrobun-rpc", () => ({
     if (mockDesktopSecure.rejectSets) {
       return { ok: false as const, reason: "denied" as const };
     }
+    const predecessor = mockDesktopStore.get(kind) ?? null;
     mockDesktopStore.set(kind, value);
-    return { ok: true as const };
+    const revision = (mockDesktopSecure.revisions.get(kind) ?? 0) + 1;
+    mockDesktopSecure.revisions.set(kind, revision);
+    mockDesktopSecure.receiptSequence += 1;
+    const rollbackReceipt = `mock-receipt-${mockDesktopSecure.receiptSequence}`;
+    mockDesktopSecure.rollbacks.set(kind, {
+      predecessor,
+      receipt: rollbackReceipt,
+      revision,
+    });
+    mockDesktopSecure.abortOnSet?.abort();
+    return { ok: true as const, rollbackReceipt };
   },
   desktopSecureStoreDelete: async (kind: string) => {
     if (mockDesktopSecure.failRemovals) {
       return { ok: false as const, reason: "denied" as const };
     }
     mockDesktopStore.delete(kind);
+    mockDesktopSecure.revisions.set(
+      kind,
+      (mockDesktopSecure.revisions.get(kind) ?? 0) + 1,
+    );
+    mockDesktopSecure.rollbacks.delete(kind);
     return { ok: true as const };
+  },
+  desktopSecureStoreCompareAndRestore: async (
+    kind: string,
+    rollbackReceipt: string,
+  ) => {
+    mockDesktopSecure.compareAndRestoreCalls.push({
+      kind,
+      rollbackReceipt,
+    });
+    const rollback = mockDesktopSecure.rollbacks.get(kind);
+    const currentValue = mockDesktopStore.get(kind) ?? null;
+    if (
+      !rollback ||
+      rollback.receipt !== rollbackReceipt ||
+      rollback.revision !== mockDesktopSecure.revisions.get(kind)
+    ) {
+      return { ok: true as const, restored: false, value: currentValue };
+    }
+    if (rollback.predecessor === null) {
+      mockDesktopStore.delete(kind);
+    } else {
+      mockDesktopStore.set(kind, rollback.predecessor);
+    }
+    mockDesktopSecure.revisions.set(kind, rollback.revision + 1);
+    mockDesktopSecure.rollbacks.delete(kind);
+    return {
+      ok: true as const,
+      restored: true,
+      value: rollback.predecessor,
+    };
   },
 }));
 
@@ -111,8 +175,13 @@ beforeEach(() => {
   mockPreferences.clear();
   mockDesktopStore.clear();
   mockDesktopSecure.available = true;
+  mockDesktopSecure.abortOnSet = null;
+  mockDesktopSecure.compareAndRestoreCalls.length = 0;
+  mockDesktopSecure.receiptSequence = 0;
   mockDesktopSecure.rejectSets = false;
   mockDesktopSecure.failRemovals = false;
+  mockDesktopSecure.revisions.clear();
+  mockDesktopSecure.rollbacks.clear();
   window.localStorage.clear();
   window.sessionStorage.clear();
 });
@@ -200,6 +269,25 @@ describe("storage bridge on the electrobun desktop runtime", () => {
     await expect(
       bridge.removeStorageValue("eliza.device.auth"),
     ).resolves.toBeUndefined();
+  });
+
+  it("rolls an aborted Steward write back through one host CAS request", async () => {
+    await bridge.setStorageValue(STEWARD_TOKEN_KEY, "prior-token");
+    const controller = new AbortController();
+    mockDesktopSecure.abortOnSet = controller;
+
+    await expect(
+      writeStoredStewardToken("aborted-token", { signal: controller.signal }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+
+    expect(mockDesktopSecure.compareAndRestoreCalls).toEqual([
+      {
+        kind: "session.steward_token",
+        rollbackReceipt: "mock-receipt-2",
+      },
+    ]);
+    expect(mockDesktopStore.get("session.steward_token")).toBe("prior-token");
+    expect(window.localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("prior-token");
   });
 
   it("fails closed when the desktop secure store is unavailable", async () => {
