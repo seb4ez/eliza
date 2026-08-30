@@ -346,6 +346,64 @@ describe("StewardLoginSection email magic-link companion code", () => {
     expect(screen.queryByText("Signed in")).toBeNull();
   });
 
+  it("keeps the server-selected account authoritative when BFCache aborts a dispatched session commit", async () => {
+    let finishSessionSync: (() => void) | undefined;
+    sessionSpies.sync.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          finishSessionSync = resolve;
+        }),
+    );
+    sessionSpies.recover.mockResolvedValue({
+      ok: true,
+      token: "server-selected-account-token",
+    });
+    renderSection();
+    await startEmailLogin();
+
+    // This is the account that was authoritative before the user selected a
+    // new identity. Email, SMS, passkey, Telegram, and both wallet chains all
+    // enter the same handleSuccess commit path exercised below.
+    window.localStorage.setItem(
+      "steward_session_token",
+      "previous-account-token",
+    );
+    fireEvent.change(screen.getByLabelText("Six-digit code"), {
+      target: { value: "123456" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Verify code/i }));
+    await waitFor(() => expect(sessionSpies.sync).toHaveBeenCalledOnce());
+    const commitSignal = sessionSpies.sync.mock.calls[0]?.[2]
+      ?.signal as AbortSignal;
+
+    const historyRestore = new Event("pageshow");
+    Object.defineProperty(historyRestore, "persisted", { value: true });
+    fireEvent(window, historyRestore);
+
+    expect(commitSignal.aborted).toBe(true);
+    await waitFor(() => expect(sessionSpies.recover).toHaveBeenCalledOnce());
+    expect(
+      sessionSpies.sync.mock.calls.some(
+        ([token]) => token === "previous-account-token",
+      ),
+    ).toBe(false);
+    await waitFor(() =>
+      expect(window.localStorage.getItem("steward_session_token")).toBe(
+        "server-selected-account-token",
+      ),
+    );
+
+    await act(async () => {
+      finishSessionSync?.();
+      await Promise.resolve();
+    });
+    expect(
+      sessionSpies.sync.mock.calls.some(
+        ([token]) => token === "previous-account-token",
+      ),
+    ).toBe(false);
+  });
+
   it("revokes a pending session publication on actual unmount", async () => {
     let finishSessionSync: (() => void) | undefined;
     sessionSpies.sync.mockImplementation(

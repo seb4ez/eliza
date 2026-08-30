@@ -516,13 +516,25 @@ async function clearRejectedCookieSession(signal?: AbortSignal): Promise<void> {
   // either boundary so recovery can never reuse pre-clear cookie authority.
   signal?.throwIfAborted();
   invalidateStewardServerCookieSyncMarker();
-  const response = await postAuthJson(
-    STEWARD_SESSION_ENDPOINT,
-    undefined,
-    "DELETE",
-    signal,
-  );
-  signal?.throwIfAborted();
+  let response: Response;
+  try {
+    response = await postAuthJson(
+      STEWARD_SESSION_ENDPOINT,
+      undefined,
+      "DELETE",
+      signal,
+    );
+  } catch (error) {
+    // Once fetch has been invoked, an AbortError is an ambiguous commit: the
+    // server may already have deleted its cookies even though lifecycle
+    // cancellation hid the response. Finish the unabortable durable removal so
+    // a later mount cannot replay the token for the retired server session.
+    if (signal?.aborted || isAbortError(error)) {
+      await clearStoredStewardToken();
+      return;
+    }
+    throw error;
+  }
   if (!response.ok) {
     const body = await readSessionError(response);
     throw new StewardSessionError(
@@ -531,7 +543,9 @@ async function clearRejectedCookieSession(signal?: AbortSignal): Promise<void> {
       body.code ?? null,
     );
   }
-  signal?.throwIfAborted();
+  // Do not consult the lifecycle signal after dispatch. A successful DELETE
+  // makes local removal mandatory even if navigation/BFCache aborted while the
+  // response was settling.
   await clearStoredStewardToken();
 }
 

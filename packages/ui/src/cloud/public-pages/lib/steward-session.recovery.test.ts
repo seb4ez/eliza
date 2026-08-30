@@ -3,7 +3,12 @@
  * one rejected refresh may lose a rotation race, while two rejected refreshes
  * clear the stale server session before the user starts a new login.
  */
+// @vitest-environment jsdom
 
+import {
+  registerStewardTokenRemoval,
+  STEWARD_TOKEN_KEY,
+} from "@elizaos/shared/steward-session-client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   recoverStewardEmailSessionViaCookie,
@@ -31,6 +36,7 @@ function tokenForEmail(email: string): string {
 describe("recoverStewardEmailSessionViaCookie", () => {
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    window.localStorage.clear();
     vi.useRealTimers();
   });
 
@@ -215,6 +221,7 @@ describe("recoverStewardEmailSessionViaCookie", () => {
 describe("recoverStewardSessionViaCookie", () => {
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    window.localStorage.clear();
     vi.useRealTimers();
   });
 
@@ -306,6 +313,79 @@ describe("recoverStewardSessionViaCookie", () => {
       credentials: "include",
       headers: expect.objectContaining({ "X-Eliza-CSRF": "1" }),
     });
+  });
+
+  it("finishes durable token removal when lifecycle aborts after DELETE dispatch", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const rejected = () =>
+      jsonResponse(
+        { error: "Refresh token rejected", code: "invalid_token" },
+        401,
+      );
+    const fetchMock = vi
+      .fn(async (_input: RequestInfo | URL, _init?: RequestInit) => rejected())
+      .mockResolvedValueOnce(rejected())
+      .mockResolvedValueOnce(rejected())
+      .mockImplementationOnce(
+        (_input: RequestInfo | URL, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener(
+              "abort",
+              () =>
+                reject(
+                  new DOMException("The operation was aborted.", "AbortError"),
+                ),
+              { once: true },
+            );
+          }),
+      );
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    window.localStorage.setItem(STEWARD_TOKEN_KEY, "retired-session-token");
+
+    let finishRemoval: (() => void) | undefined;
+    const removalStarted = vi.fn();
+    const unregisterRemoval = registerStewardTokenRemoval(
+      () =>
+        new Promise<void>((resolve) => {
+          removalStarted();
+          finishRemoval = () => {
+            window.localStorage.removeItem(STEWARD_TOKEN_KEY);
+            resolve();
+          };
+        }),
+    );
+    const controller = new AbortController();
+
+    try {
+      const recovery = recoverStewardSessionViaCookie({
+        signal: controller.signal,
+      });
+      await vi.advanceTimersByTimeAsync(100);
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+      expect(fetchMock.mock.calls[2]?.[1]).toMatchObject({
+        method: "DELETE",
+        signal: controller.signal,
+      });
+
+      controller.abort();
+      await vi.waitFor(() => expect(removalStarted).toHaveBeenCalledOnce());
+      let recoverySettled = false;
+      void recovery.then(() => {
+        recoverySettled = true;
+      });
+      await Promise.resolve();
+      expect(recoverySettled).toBe(false);
+      expect(window.localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(
+        "retired-session-token",
+      );
+
+      finishRemoval?.();
+      await expect(recovery).resolves.toBeNull();
+      expect(recoverySettled).toBe(true);
+      expect(window.localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    } finally {
+      unregisterRemoval();
+    }
   });
 
   it("preserves non-auth refresh failures for the login boundary", async () => {

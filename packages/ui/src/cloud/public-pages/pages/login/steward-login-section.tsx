@@ -754,6 +754,12 @@ export default function StewardLoginSection() {
   // restoration so a server-committed HttpOnly session can be rehydrated.
   const callbackRecoveryBlockedRef = useRef(false);
   const callbackExchangeStartedRef = useRef(false);
+  // A lifecycle abort cannot prove whether a dispatched cookie-session
+  // mutation reached the server. Once either the OAuth exchange or the shared
+  // handleSuccess POST is in that ambiguous window, recovery must consult the
+  // server cookie before any durable browser token. This covers email, SMS,
+  // passkey, Telegram, EVM, and Solana through their common handleSuccess path.
+  const serverSessionRecoveryRequiredRef = useRef(false);
   const recoverPendingOAuthReturnToRef = useRef(false);
   const [providersLoaded, setProvidersLoaded] = useState(
     () =>
@@ -939,9 +945,13 @@ export default function StewardLoginSection() {
       // A BFCache document can outlive the server capability snapshot that
       // authorized it. Rotate the intent generation synchronously so stale SDK
       // completions cannot publish while React is still committing this reset.
+      const callbackExchangeStarted = callbackExchangeStartedRef.current;
       recoverPendingOAuthReturnToRef.current =
-        recoverPendingOAuthReturnToRef.current ||
-        callbackExchangeStartedRef.current;
+        recoverPendingOAuthReturnToRef.current || callbackExchangeStarted;
+      serverSessionRecoveryRequiredRef.current =
+        serverSessionRecoveryRequiredRef.current ||
+        callbackExchangeStarted ||
+        sessionCommitGenerationRef.current !== null;
       callbackExchangeStartedRef.current = false;
       callbackRecoveryBlockedRef.current = false;
       rotateProviderIntent();
@@ -1240,7 +1250,7 @@ export default function StewardLoginSection() {
     let cancelled = false;
     const recoveryGeneration = providerIntentGenerationRef.current;
     const recoverySignal = providerIntentAbortRef.current.signal;
-    const recoveringOAuthCallback = recoverPendingOAuthReturnToRef.current;
+    const recoveringServerSession = serverSessionRecoveryRequiredRef.current;
     const recoveryIsCurrent = () =>
       !cancelled && isProviderGenerationCurrent(recoveryGeneration);
     const resolveRecoveredReturnTo = () => {
@@ -1253,11 +1263,12 @@ export default function StewardLoginSection() {
 
     const tryRecoverSession = async () => {
       try {
-        // A nonce exchange may already have committed a different account to
-        // the HttpOnly cookie before BFCache revoked its client continuation.
-        // In that case the server cookie wins; replaying a stale local token
-        // first could overwrite the newly selected account.
-        const storedToken = recoveringOAuthCallback
+        // A dispatched OAuth exchange or provider session POST may already
+        // have committed a different account to the HttpOnly cookie before
+        // BFCache revoked its client continuation. In that case the server
+        // cookie wins; replaying a stale local token first could overwrite the
+        // newly selected account.
+        const storedToken = recoveringServerSession
           ? null
           : readStoredStewardToken();
         if (storedToken) {
@@ -1280,7 +1291,7 @@ export default function StewardLoginSection() {
           }
         }
 
-        if (hasStewardAuthedCookie()) {
+        if (recoveringServerSession || hasStewardAuthedCookie()) {
           const refreshed = await recoverStewardSessionViaCookie({
             signal: recoverySignal,
           });
@@ -1290,6 +1301,7 @@ export default function StewardLoginSection() {
               signal: recoverySignal,
             });
             if (!recoveryIsCurrent()) return;
+            serverSessionRecoveryRequiredRef.current = false;
             window.dispatchEvent(new CustomEvent("steward-token-sync"));
             setRedirectTo(resolveRecoveredReturnTo());
           }
