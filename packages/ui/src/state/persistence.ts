@@ -520,8 +520,9 @@ function firstRunCompleteStorageKey(cloudOnly?: boolean): string {
     : FIRST_RUN_COMPLETE_STORAGE_KEY;
 }
 
-const FIRST_RUN_ACCOUNT_RESET_KEY =
-  "eliza:first-run-account-reset-authority:v1";
+function firstRunAccountResetStorageKey(cloudOnly?: boolean): string {
+  return `${firstRunCompleteStorageKey(cloudOnly)}:account-reset-authority:v1`;
+}
 
 export interface FirstRunAccountResetAuthority {
   completeRaw: string | null;
@@ -530,9 +531,10 @@ export interface FirstRunAccountResetAuthority {
 
 /** Snapshot the exact onboarding bytes owned by an account logout. */
 export function captureFirstRunAccountResetAuthority(): FirstRunAccountResetAuthority {
+  const resetKey = firstRunAccountResetStorageKey();
   return {
     completeRaw: localStorage.getItem(firstRunCompleteStorageKey()),
-    resetRaw: localStorage.getItem(FIRST_RUN_ACCOUNT_RESET_KEY),
+    resetRaw: localStorage.getItem(resetKey),
   };
 }
 
@@ -547,17 +549,18 @@ export function markFirstRunIncompleteForAccountIfCurrent(
   validate: () => boolean,
 ): boolean {
   if (!marker || !validate()) return false;
+  const resetKey = firstRunAccountResetStorageKey();
   if (
     localStorage.getItem(firstRunCompleteStorageKey()) !==
       authority.completeRaw ||
-    localStorage.getItem(FIRST_RUN_ACCOUNT_RESET_KEY) !== authority.resetRaw
+    localStorage.getItem(resetKey) !== authority.resetRaw
   ) {
     return false;
   }
-  shellLocalStorage.setItem(FIRST_RUN_ACCOUNT_RESET_KEY, marker);
+  shellLocalStorage.setItem(resetKey, marker);
   if (validate()) return true;
-  if (localStorage.getItem(FIRST_RUN_ACCOUNT_RESET_KEY) === marker) {
-    shellLocalStorage.removeItem(FIRST_RUN_ACCOUNT_RESET_KEY);
+  if (localStorage.getItem(resetKey) === marker) {
+    shellLocalStorage.removeItem(resetKey);
   }
   return false;
 }
@@ -568,7 +571,9 @@ export function loadPersistedFirstRunComplete(cloudOnly?: boolean): boolean {
   }
 
   try {
-    if (localStorage.getItem(FIRST_RUN_ACCOUNT_RESET_KEY) !== null) {
+    if (
+      localStorage.getItem(firstRunAccountResetStorageKey(cloudOnly)) !== null
+    ) {
       return false;
     }
     return localStorage.getItem(firstRunCompleteStorageKey(cloudOnly)) === "1";
@@ -615,6 +620,7 @@ async function persistNativeFirstRunComplete(complete: boolean): Promise<void> {
 
 export function savePersistedFirstRunComplete(complete: boolean): void {
   const storageKey = firstRunCompleteStorageKey();
+  const resetKey = firstRunAccountResetStorageKey();
   void persistNativeFirstRunComplete(complete);
 
   if (typeof localStorage === "undefined") {
@@ -622,7 +628,7 @@ export function savePersistedFirstRunComplete(complete: boolean): void {
   }
 
   try {
-    shellLocalStorage.removeItem(FIRST_RUN_ACCOUNT_RESET_KEY);
+    shellLocalStorage.removeItem(resetKey);
     if (complete) {
       shellLocalStorage.setItem(storageKey, "1");
     } else {

@@ -17,9 +17,11 @@ import {
 import { client } from "../api";
 import { signOutFromSsoBridgedHost } from "../cloud/sso-bridge/sso-bridge";
 import {
+  captureFirstRunAccountResetAuthority,
   clearPersistedActiveServer,
   loadPersistedActiveServer,
   loadPersistedFirstRunComplete,
+  markFirstRunIncompleteForAccountIfCurrent,
   savePersistedActiveServer,
   savePersistedFirstRunComplete,
 } from "./persistence";
@@ -127,10 +129,12 @@ describe("useCloudState — Cloud account sign-out", () => {
       sessionGeneration: null,
     });
     clearManagedCloudAccountBindingMock.mockImplementation(async () => {
+      const firstRunAuthority = captureFirstRunAccountResetAuthority();
       clearPersistedActiveServer();
-      localStorage.setItem(
-        "eliza:first-run-account-reset-authority:v1",
+      markFirstRunIncompleteForAccountIfCurrent(
+        firstRunAuthority,
         "test-generation",
+        () => true,
       );
     });
     nativePlatformState.enabled = false;

@@ -5,8 +5,10 @@ import { renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_BOOT_CONFIG, setBootConfig } from "../config/boot-config";
 import {
+  captureFirstRunAccountResetAuthority,
   hydratePersistedFirstRunCompleteFromNativeStore,
   loadPersistedFirstRunComplete,
+  markFirstRunIncompleteForAccountIfCurrent,
   savePersistedFirstRunComplete,
 } from "./persistence";
 import { useFirstRunState } from "./useFirstRunState";
@@ -96,6 +98,40 @@ describe("first-run completion durable flag survives a process restart", () => {
     expect(
       window.localStorage.getItem(FIRST_RUN_COMPLETE_STORAGE_KEY),
     ).toBeNull();
+  });
+
+  it("keeps a Cloud-only logout reset isolated across a local runtime visit", () => {
+    setBootConfig({
+      ...DEFAULT_BOOT_CONFIG,
+      branding: {
+        ...DEFAULT_BOOT_CONFIG.branding,
+        cloudOnly: true,
+      },
+    });
+    savePersistedFirstRunComplete(true);
+    const cloudAuthority = captureFirstRunAccountResetAuthority();
+
+    expect(
+      markFirstRunIncompleteForAccountIfCurrent(
+        cloudAuthority,
+        "cloud-account-logout",
+        () => true,
+      ),
+    ).toBe(true);
+    expect(loadPersistedFirstRunComplete()).toBe(false);
+
+    setBootConfig(DEFAULT_BOOT_CONFIG);
+    savePersistedFirstRunComplete(true);
+    expect(loadPersistedFirstRunComplete()).toBe(true);
+
+    setBootConfig({
+      ...DEFAULT_BOOT_CONFIG,
+      branding: {
+        ...DEFAULT_BOOT_CONFIG.branding,
+        cloudOnly: true,
+      },
+    });
+    expect(loadPersistedFirstRunComplete()).toBe(false);
   });
 });
 
