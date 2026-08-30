@@ -683,11 +683,19 @@ export function useCloudState({
     error: elizaCloudLoginError,
     userId: elizaCloudUserId,
   });
-  cloudLoginUiStateRef.current = {
-    connected: elizaCloudConnected,
-    error: elizaCloudLoginError,
-    userId: elizaCloudUserId,
-  };
+  // Preserve identity while React catches up to an explicitly published login
+  // snapshot. Rollback uses that identity as its exact UI ownership receipt.
+  if (
+    cloudLoginUiStateRef.current.connected !== elizaCloudConnected ||
+    cloudLoginUiStateRef.current.error !== elizaCloudLoginError ||
+    cloudLoginUiStateRef.current.userId !== elizaCloudUserId
+  ) {
+    cloudLoginUiStateRef.current = {
+      connected: elizaCloudConnected,
+      error: elizaCloudLoginError,
+      userId: elizaCloudUserId,
+    };
+  }
   /**
    * Verification URL returned by `POST /api/cloud/login`, shown to the user
    * as a manual fallback while the device-code flow is awaiting completion.
@@ -1651,6 +1659,7 @@ export function useCloudState({
                   > | null = null;
                   let uiPublished = false;
                   const previousUiState = cloudLoginUiStateRef.current;
+                  let publishedUiState: typeof previousUiState | null = null;
                   const rollbackStagedPublication = (
                     durableRestored: boolean,
                   ) => {
@@ -1667,21 +1676,30 @@ export function useCloudState({
                       setBootConfig(previousBootConfig);
                     }
                   };
-                  const rollback = () => {
-                    if (uiPublished) {
-                      cloudLoginUiStateRef.current = previousUiState;
-                      setElizaCloudConnected(previousUiState.connected);
-                      setElizaCloudLoginError(previousUiState.error);
-                      setElizaCloudUserId(previousUiState.userId);
+                  const rollback = async () => {
+                    try {
+                      // Canonical and subordinate authorities settle before
+                      // React can expose their predecessor.
+                      await rollbackCloudLoginPublication({
+                        bindingAuthority,
+                        tokenAuthority,
+                        clientTargetAuthority,
+                        previousBootConfig,
+                        publishedBootConfig,
+                      });
+                    } finally {
+                      if (
+                        uiPublished &&
+                        publishedUiState !== null &&
+                        cloudLoginUiStateRef.current === publishedUiState
+                      ) {
+                        cloudLoginUiStateRef.current = previousUiState;
+                        setElizaCloudConnected(previousUiState.connected);
+                        setElizaCloudLoginError(previousUiState.error);
+                        setElizaCloudUserId(previousUiState.userId);
+                      }
                       uiPublished = false;
                     }
-                    return rollbackCloudLoginPublication({
-                      bindingAuthority,
-                      tokenAuthority,
-                      clientTargetAuthority,
-                      previousBootConfig,
-                      publishedBootConfig,
-                    });
                   };
                   try {
                     if (
@@ -1769,11 +1787,12 @@ export function useCloudState({
                       return false;
                     }
                     uiPublished = true;
-                    cloudLoginUiStateRef.current = {
+                    publishedUiState = {
                       connected: true,
                       error: null,
                       userId: poll.userId ?? previousUiState.userId,
                     };
+                    cloudLoginUiStateRef.current = publishedUiState;
                     setElizaCloudConnected(true);
                     setElizaCloudLoginError(null);
                     if (poll.userId) setElizaCloudUserId(poll.userId);
@@ -1937,6 +1956,7 @@ export function useCloudState({
                 > | null = null;
                 let uiPublished = false;
                 const previousUiState = cloudLoginUiStateRef.current;
+                let publishedUiState: typeof previousUiState | null = null;
                 const rollbackStagedPublication = (
                   durableRestored: boolean,
                 ) => {
@@ -1953,21 +1973,30 @@ export function useCloudState({
                     setBootConfig(previousBootConfig);
                   }
                 };
-                const rollback = () => {
-                  if (uiPublished) {
-                    cloudLoginUiStateRef.current = previousUiState;
-                    setElizaCloudConnected(previousUiState.connected);
-                    setElizaCloudLoginError(previousUiState.error);
-                    setElizaCloudUserId(previousUiState.userId);
+                const rollback = async () => {
+                  try {
+                    // Canonical and subordinate authorities settle before
+                    // React can expose their predecessor.
+                    await rollbackCloudLoginPublication({
+                      bindingAuthority: null,
+                      tokenAuthority,
+                      clientTargetAuthority,
+                      previousBootConfig,
+                      publishedBootConfig,
+                    });
+                  } finally {
+                    if (
+                      uiPublished &&
+                      publishedUiState !== null &&
+                      cloudLoginUiStateRef.current === publishedUiState
+                    ) {
+                      cloudLoginUiStateRef.current = previousUiState;
+                      setElizaCloudConnected(previousUiState.connected);
+                      setElizaCloudLoginError(previousUiState.error);
+                      setElizaCloudUserId(previousUiState.userId);
+                    }
                     uiPublished = false;
                   }
-                  return rollbackCloudLoginPublication({
-                    bindingAuthority: null,
-                    tokenAuthority,
-                    clientTargetAuthority,
-                    previousBootConfig,
-                    publishedBootConfig,
-                  });
                 };
                 try {
                   tokenAuthority = await writeStoredStewardToken(sessionToken, {
@@ -2010,11 +2039,12 @@ export function useCloudState({
                     return false;
                   }
                   uiPublished = true;
-                  cloudLoginUiStateRef.current = {
+                  publishedUiState = {
                     connected: true,
                     error: null,
                     userId: poll.userId ?? previousUiState.userId,
                   };
+                  cloudLoginUiStateRef.current = publishedUiState;
                   setElizaCloudConnected(true);
                   setElizaCloudLoginError(null);
                   if (poll.userId) setElizaCloudUserId(poll.userId);

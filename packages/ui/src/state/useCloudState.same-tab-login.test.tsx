@@ -138,6 +138,14 @@ function completeNewerLogin(token: string): void {
   completeStewardSessionRecovery(recovery);
 }
 
+function completeNewerRecovery(): void {
+  const recovery = beginStewardSessionRecovery(
+    configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID),
+    "provider",
+  );
+  completeStewardSessionRecovery(recovery);
+}
+
 function restorePinnedRemote(): void {
   if (originalPinnedRemote === undefined) {
     delete runtimeWithPinnedRemote.__ELIZA_BUILD_CONFIGURED_REMOTE_API_BASE__;
@@ -775,6 +783,89 @@ describe("useCloudState — handleCloudLogin same-tab fallback on hosted web", (
     expect(result.current.elizaCloudConnected).toBe(false);
   });
 
+  it("keeps the same-tab A UI published until durable rollback completes", async () => {
+    const search =
+      "?elizaCloudLogin=complete&elizaCloudLoginSession=sess-rollback-order-a";
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: {
+        ...window.location,
+        href: `https://cloud.eliza.app/chat${search}`,
+        pathname: "/chat",
+        search,
+        assign: assignSpy,
+      },
+    });
+    const previousBootConfig = {
+      branding: {},
+      cloudApiBase: "https://eliza.app",
+    };
+    setBootConfig(previousBootConfig);
+    localStorage.setItem("steward_session_token", "predecessor-token");
+    let queuedNewerRecovery = false;
+    cloudLoginPollDirectSpy.mockResolvedValue({
+      status: "authenticated",
+      token: "account-a-token",
+      get userId() {
+        if (!queuedNewerRecovery) {
+          queuedNewerRecovery = true;
+          queueMicrotask(completeNewerRecovery);
+        }
+        return "account-a-user";
+      },
+    });
+    const durableRollbackGate = deferred<void>();
+    let durableRollbackStarted = false;
+    const unregisterPersistence = registerStewardTokenPersistence(
+      async (token) => {
+        const predecessor = localStorage.getItem("steward_session_token");
+        localStorage.setItem("steward_session_token", token);
+        return {
+          commit: async () => undefined,
+          restorePredecessor: async () => {
+            durableRollbackStarted = true;
+            await durableRollbackGate.promise;
+            if (localStorage.getItem("steward_session_token") !== token) {
+              return false;
+            }
+            if (predecessor === null) {
+              localStorage.removeItem("steward_session_token");
+            } else {
+              localStorage.setItem("steward_session_token", predecessor);
+            }
+            return true;
+          },
+        };
+      },
+    );
+
+    try {
+      const { result } = renderHook(() => useCloudState(makeParams()));
+      await waitFor(() => {
+        expect(durableRollbackStarted).toBe(true);
+      });
+
+      expect(result.current.elizaCloudConnected).toBe(true);
+      expect(result.current.elizaCloudUserId).toBe("account-a-user");
+      expect(getBootConfig().cloudApiBase).toBe("https://api.eliza.app");
+
+      durableRollbackGate.resolve();
+      await waitFor(() => {
+        expect(result.current.elizaCloudLoginBusy).toBe(false);
+      });
+
+      expect(localStorage.getItem("steward_session_token")).toBe(
+        "predecessor-token",
+      );
+      expect(getBootConfig()).toBe(previousBootConfig);
+      expect(result.current.elizaCloudConnected).toBe(false);
+      expect(result.current.elizaCloudUserId).toBeNull();
+    } finally {
+      durableRollbackGate.resolve();
+      unregisterPersistence();
+    }
+  });
+
   it("claims a hosted staging return without replacing the localhost backend", async () => {
     const search =
       "?elizaCloudLogin=complete&elizaCloudLoginSession=staging-return";
@@ -1162,6 +1253,129 @@ describe("useCloudState — handleCloudLogin same-tab fallback on hosted web", (
       unmount();
       vi.clearAllTimers();
     } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps newer UI B when it lands during device-code binding rollback", async () => {
+    vi.useFakeTimers();
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: {
+        ...window.location,
+        href: "http://127.0.0.1:5174/?shellMode=chat-overlay",
+        origin: "http://127.0.0.1:5174",
+        protocol: "http:",
+        hostname: "127.0.0.1",
+        port: "5174",
+        pathname: "/",
+        search: "?shellMode=chat-overlay",
+        assign: assignSpy,
+      },
+    });
+    const previousBootConfig = {
+      branding: {},
+      cloudApiBase: "https://eliza.app",
+    };
+    setBootConfig(previousBootConfig);
+    windowWithElectrobun.__electrobunWindowId = 1;
+    windowWithElectrobun.__ELIZA_DESKTOP_RUNTIME_MODE__ = "cloud";
+    windowWithElectrobun.__ELIZA_ELECTROBUN_RPC__ = {
+      request: {
+        openExternal: vi.fn(async () => ({ opened: true })),
+      },
+      onMessage: vi.fn(),
+      offMessage: vi.fn(),
+    };
+    const getCloudStatusSpy = vi
+      .spyOn(client, "getCloudStatus")
+      .mockResolvedValue({ connected: false, enabled: true });
+    vi.spyOn(client, "getCloudCredits").mockResolvedValue({
+      balance: 42,
+      connected: true,
+      low: false,
+      critical: false,
+    });
+    cloudLoginDirectSpy.mockResolvedValue({
+      ok: true,
+      apiBase: "https://api.eliza.app",
+      browserUrl: "https://eliza.app/auth/cli-login?session=electrobun-ui-a",
+      sessionId: "electrobun-ui-a",
+    });
+    let queuedNewerLogin = false;
+    cloudLoginPollDirectSpy.mockResolvedValue({
+      status: "authenticated",
+      token: "account-a-token",
+      get userId() {
+        if (!queuedNewerLogin) {
+          queuedNewerLogin = true;
+          queueMicrotask(() => completeNewerLogin("account-b-token"));
+        }
+        return "account-a-user";
+      },
+    });
+    const bindingRollbackStarted = deferred<void>();
+    const bindingRollbackGate = deferred<void>();
+    let bindingRollbackFinished = false;
+    directBindBoundary.override = async (options) => {
+      localStorage.setItem("steward_session_token", "account-a-token");
+      const restoreBoot = options.finalize?.();
+      expect(options.commitBeforePublish?.()).toBe(true);
+      return {
+        restoreIfCurrent: async () => {
+          bindingRollbackStarted.resolve();
+          await bindingRollbackGate.promise;
+          restoreBoot?.();
+          bindingRollbackFinished = true;
+        },
+      };
+    };
+
+    try {
+      const { result, unmount } = renderHook(() => useCloudState(makeParams()));
+      let login: Promise<void> = Promise.resolve();
+      await act(async () => {
+        login = result.current.handleCloudLogin(null);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      await act(async () => {
+        vi.advanceTimersByTime(1_000);
+        await bindingRollbackStarted.promise;
+      });
+
+      expect(bindingRollbackFinished).toBe(false);
+      expect(result.current.elizaCloudConnected).toBe(true);
+      expect(result.current.elizaCloudUserId).toBe("account-a-user");
+
+      getCloudStatusSpy.mockResolvedValue({
+        connected: true,
+        enabled: true,
+        userId: "account-b-user",
+      });
+      await act(async () => {
+        await result.current.pollCloudCredits();
+      });
+      expect(result.current.elizaCloudConnected).toBe(true);
+      expect(result.current.elizaCloudUserId).toBe("account-b-user");
+
+      bindingRollbackGate.resolve();
+      await act(async () => {
+        await login;
+      });
+
+      expect(bindingRollbackFinished).toBe(true);
+      expect(localStorage.getItem("steward_session_token")).toBe(
+        "account-b-token",
+      );
+      expect(getBootConfig()).toBe(previousBootConfig);
+      expect(result.current.elizaCloudConnected).toBe(true);
+      expect(result.current.elizaCloudUserId).toBe("account-b-user");
+      expect(recoverySnapshot().receipts).toEqual([]);
+      unmount();
+      vi.clearAllTimers();
+    } finally {
+      bindingRollbackGate.resolve();
       vi.useRealTimers();
     }
   });
