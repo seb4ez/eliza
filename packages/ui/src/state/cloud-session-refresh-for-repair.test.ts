@@ -91,7 +91,9 @@ describe("ensureCloudSessionForRepair", () => {
       window.removeEventListener("steward-token-sync", syncListener);
     }
 
-    expect(writeToken).toHaveBeenCalledWith("fresh.jwt", { validate });
+    expect(writeToken).toHaveBeenCalledWith("fresh.jwt", {
+      validate: expect.any(Function),
+    });
     expect(syncListener).toHaveBeenCalledTimes(1);
   });
 
@@ -119,7 +121,9 @@ describe("ensureCloudSessionForRepair", () => {
     }
 
     expect(writeToken).toHaveBeenCalledTimes(1);
-    expect(writeToken).toHaveBeenCalledWith("superseded.jwt", { validate });
+    expect(writeToken).toHaveBeenCalledWith("superseded.jwt", {
+      validate: expect.any(Function),
+    });
     expect(syncListener).not.toHaveBeenCalled();
   });
 
@@ -161,6 +165,44 @@ describe("ensureCloudSessionForRepair", () => {
     const token = await ensureCloudSessionForRepair(deps);
     expect(token).toBeNull();
     expect(deps.writeToken).not.toHaveBeenCalled();
+  });
+
+  it("does not persist a token when a timed-out refresh invokes its commit callback late", async () => {
+    let commitRefreshedSession:
+      | NonNullable<
+          Parameters<
+            NonNullable<EnsureCloudSessionForRepairDeps["refreshFn"]>
+          >[0]
+        >["commitRefreshedSession"]
+      | undefined;
+    let resolveRefresh!: (value: RefreshResult) => void;
+    const refreshFn: NonNullable<EnsureCloudSessionForRepairDeps["refreshFn"]> =
+      vi.fn(
+        (options) =>
+          new Promise<RefreshResult>((resolve) => {
+            commitRefreshedSession = options?.commitRefreshedSession;
+            resolveRefresh = resolve;
+          }),
+      );
+    const writeToken = vi.fn();
+    const deps = makeDeps({
+      refreshFn,
+      writeToken,
+      raceTimeout: (() => Promise.resolve(null)) as <T>(
+        p: Promise<T>,
+        ms: number,
+      ) => Promise<T | null>,
+    });
+
+    await expect(ensureCloudSessionForRepair(deps)).resolves.toBeNull();
+    await commitRefreshedSession?.(
+      { token: "too-late.jwt" },
+      { validate: () => true },
+    );
+    resolveRefresh({ token: "too-late.jwt" });
+    await Promise.resolve();
+
+    expect(writeToken).not.toHaveBeenCalled();
   });
 
   it("trims whitespace on both the existing token and the recovered token", async () => {

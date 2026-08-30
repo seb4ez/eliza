@@ -122,6 +122,31 @@ type RestoredStewardToken =
   | null
   | typeof STEWARD_REFRESH_AUTHORITY_SUPERSEDED;
 
+/**
+ * `runStartupProbeWithTimeout` deliberately does not abort an ambiguous
+ * cookie mutation. Fence its publication instead: once startup stops waiting,
+ * a late refresh may finish server-side but cannot reinstall its bearer into
+ * browser/native storage or emit a session event.
+ */
+function createStewardRestoreRefreshFence() {
+  let publicationOpen = true;
+  let upstreamAuthority: { validate: () => boolean } | null = null;
+  const validate = () =>
+    publicationOpen && upstreamAuthority?.validate() === true;
+  return {
+    capture(authority: { validate: () => boolean }) {
+      upstreamAuthority = authority;
+    },
+    validate,
+    close() {
+      publicationOpen = false;
+    },
+    wasSuperseded() {
+      return upstreamAuthority?.validate() === false;
+    },
+  };
+}
+
 function recoverCloudAgentId(active: PersistedActiveServer): string | null {
   const runtimeId = active.cloudRuntimeAgentId?.trim() ?? "";
   if (isCloudPairAgentId(runtimeId) || isPersonalSharedElizaId(runtimeId)) {
@@ -449,20 +474,18 @@ async function resolveRestoredStewardToken(): Promise<RestoredStewardToken> {
     // the /login page) instead of forcing a redundant re-sign-in; on success
     // the top-level LoginView gate and the first-run conductor both skip.
     if (typeof window !== "undefined" && hasStewardAuthedCookie()) {
-      const refreshCommit = {
-        authority: null as { validate: () => boolean } | null,
-      };
+      const refreshCommit = createStewardRestoreRefreshFence();
       const refreshProbe = await runStartupProbeWithTimeout(
         () =>
           refreshCloudStewardSession({
             endpoint: resolveRestoreStewardRefreshEndpoint(),
             commitRefreshedSession: async (session, authority) => {
-              refreshCommit.authority = authority;
-              if (!session.token || !authority.validate()) return;
+              refreshCommit.capture(authority);
+              if (!session.token || !refreshCommit.validate()) return;
               await writeStoredStewardToken(session.token, {
-                validate: authority.validate,
+                validate: refreshCommit.validate,
               });
-              if (!authority.validate()) return;
+              if (!refreshCommit.validate()) return;
               try {
                 window.dispatchEvent(new CustomEvent("steward-token-sync"));
               } catch {
@@ -472,7 +495,9 @@ async function resolveRestoredStewardToken(): Promise<RestoredStewardToken> {
           }),
         STEWARD_RESTORE_REFRESH_TIMEOUT_MS,
       );
-      if (refreshCommit.authority?.validate() === false) {
+      const refreshWasSuperseded = refreshCommit.wasSuperseded();
+      refreshCommit.close();
+      if (refreshWasSuperseded) {
         return STEWARD_REFRESH_AUTHORITY_SUPERSEDED;
       }
       const recovered = refreshProbe.kind === "ok" ? refreshProbe.value : null;
@@ -494,20 +519,18 @@ async function resolveRestoredStewardToken(): Promise<RestoredStewardToken> {
   // Comfortably valid → restore instantly.
   if (secs >= STEWARD_RESTORE_REFRESH_AHEAD_SECS) return stored;
 
-  const refreshCommit = {
-    authority: null as { validate: () => boolean } | null,
-  };
+  const refreshCommit = createStewardRestoreRefreshFence();
   const refreshProbe = await runStartupProbeWithTimeout(
     () =>
       refreshCloudStewardSession({
         endpoint: resolveRestoreStewardRefreshEndpoint(),
         commitRefreshedSession: async (session, authority) => {
-          refreshCommit.authority = authority;
-          if (!session.token || !authority.validate()) return;
+          refreshCommit.capture(authority);
+          if (!session.token || !refreshCommit.validate()) return;
           await writeStoredStewardToken(session.token, {
-            validate: authority.validate,
+            validate: refreshCommit.validate,
           });
-          if (!authority.validate()) return;
+          if (!refreshCommit.validate()) return;
           try {
             if (typeof window !== "undefined") {
               window.dispatchEvent(new CustomEvent("steward-token-sync"));
@@ -519,7 +542,9 @@ async function resolveRestoredStewardToken(): Promise<RestoredStewardToken> {
       }),
     STEWARD_RESTORE_REFRESH_TIMEOUT_MS,
   );
-  if (refreshCommit.authority?.validate() === false) {
+  const refreshWasSuperseded = refreshCommit.wasSuperseded();
+  refreshCommit.close();
+  if (refreshWasSuperseded) {
     return STEWARD_REFRESH_AUTHORITY_SUPERSEDED;
   }
   const refreshed = refreshProbe.kind === "ok" ? refreshProbe.value : null;
@@ -569,7 +594,8 @@ async function dropShadowingStewardToken(
 
 export async function applyRestoredConnection(args: {
   restoredActiveServer: PersistedActiveServer;
-  clientRef: Pick<typeof client, "setBaseUrl" | "setToken">;
+  clientRef: Pick<typeof client, "setBaseUrl" | "setToken"> &
+    Partial<Pick<typeof client, "stageSessionTarget">>;
   startLocalRuntime?: () => Promise<void>;
 }) {
   const { restoredActiveServer, clientRef, startLocalRuntime } = args;
@@ -625,9 +651,25 @@ export async function applyRestoredConnection(args: {
       : isAgentlessControlPlane
         ? restoreProbeToken
         : resolved.accessToken || restoreProbeToken || null;
-    clientRef.setToken(null);
-    clientRef.setBaseUrl(resolved.apiBase ?? null);
-    clientRef.setToken(initialToken);
+    let provisionalTargetAuthority: ReturnType<
+      typeof client.stageSessionTarget
+    > = null;
+    if (initialToken && clientRef.stageSessionTarget && resolved.apiBase) {
+      provisionalTargetAuthority = clientRef.stageSessionTarget({
+        baseUrl: resolved.apiBase,
+        token: initialToken,
+      });
+      if (!provisionalTargetAuthority?.publish()) {
+        provisionalTargetAuthority?.restoreIfCurrent();
+        clientRef.setToken(null);
+        clientRef.setBaseUrl(null);
+        return;
+      }
+    } else {
+      clientRef.setToken(null);
+      clientRef.setBaseUrl(resolved.apiBase ?? null);
+      clientRef.setToken(initialToken);
+    }
     let stewardTokenPromise: Promise<RestoredStewardToken>;
     if (nativeOwnerApiKey && restoreProbeToken) {
       const secs = cloudTokenSecsRemaining(restoreProbeToken);
@@ -696,7 +738,10 @@ export async function applyRestoredConnection(args: {
     // refresh it BEFORE handing it to the client so a returning user never
     // boots into a permanently-401ing session (see resolveRestoredStewardToken).
     const stewardToken = await stewardTokenPromise;
-    if (stewardToken === STEWARD_REFRESH_AUTHORITY_SUPERSEDED) return;
+    if (stewardToken === STEWARD_REFRESH_AUTHORITY_SUPERSEDED) {
+      provisionalTargetAuthority?.clearIfCurrent();
+      return;
+    }
     if (isManagedSharedControlPlane && !stewardToken && !nativeOwnerApiKey) {
       // Terminal refresh failure or a missing account session makes the saved
       // shared target unsafe. Clear every account-scoped mirror before startup

@@ -485,6 +485,9 @@ describe("useAgentSessionRecovery", () => {
     mockEnsureCloudSession.mockImplementation(async () => {
       // Simulate the cookie refresh landing a fresh app-origin token.
       token = "steward.jwt.recovered";
+      // The canonical writer publishes synchronously before the ensure promise
+      // resolves. This event must not cancel the attempt that produced it.
+      window.dispatchEvent(new CustomEvent("steward-token-sync"));
       return token;
     });
     mockRunRecovery.mockReturnValue(new Promise(() => {})); // stays recovering

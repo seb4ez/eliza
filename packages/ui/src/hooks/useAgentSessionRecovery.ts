@@ -150,6 +150,13 @@ export function useAgentSessionRecovery(
 
     const rearmAfterCloudReauth = () => {
       const cloudToken = getCloudAuthToken();
+      // The cookie-recovery attempt writes its canonical token before its
+      // promise can hand that token to this effect. Do not let that same sync
+      // event tear down/abort the in-flight attempt; explicit reauth is armed
+      // through `awaitingCloudTokenRef` and still re-renders below.
+      if (attemptedRef.current && !awaitingCloudTokenRef.current) {
+        return;
+      }
       setCloudTokenSnapshot(cloudToken);
       if (!awaitingCloudTokenRef.current || !cloudToken?.trim()) {
         return;

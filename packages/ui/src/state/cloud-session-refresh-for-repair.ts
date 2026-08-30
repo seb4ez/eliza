@@ -110,11 +110,14 @@ export async function ensureCloudSessionForRepair(
   if (!hasCookie()) return null;
 
   let recovered: Awaited<ReturnType<typeof refreshCloudStewardSession>> = null;
+  let publicationOpen = true;
   const refreshCommit = {
     committed: false,
     finalizerInvoked: false,
     authority: null as { validate: () => boolean } | null,
   };
+  const validatePublication = () =>
+    publicationOpen && refreshCommit.authority?.validate() === true;
   try {
     // error-policy:J4 a failed/absent cookie refresh yields null → the caller
     // keeps the wall; it NEVER fabricates a session.
@@ -125,9 +128,9 @@ export async function ensureCloudSessionForRepair(
           refreshCommit.finalizerInvoked = true;
           refreshCommit.authority = authority;
           const token = session.token?.trim();
-          if (!token || !authority.validate()) return;
-          await writeToken(token, { validate: authority.validate });
-          if (!authority.validate()) return;
+          if (!token || !validatePublication()) return;
+          await writeToken(token, { validate: validatePublication });
+          if (!validatePublication()) return;
           refreshCommit.committed = true;
           if (typeof CustomEvent === "function") {
             window.dispatchEvent(new CustomEvent("steward-token-sync"));
@@ -137,12 +140,18 @@ export async function ensureCloudSessionForRepair(
       timeoutMs,
     );
   } catch {
+    publicationOpen = false;
     return null;
   }
 
+  const refreshWasSuperseded = refreshCommit.authority?.validate() === false;
+  // `raceTimeout` does not cancel an ambiguous cookie mutation. Retire its
+  // renderer publication as soon as this gate stops awaiting it so a late
+  // response cannot install a token after the reauth notice has won.
+  publicationOpen = false;
   const token = recovered?.token?.trim();
   if (!token) return null;
-  if (refreshCommit.authority?.validate() === false) return null;
+  if (refreshWasSuperseded) return null;
   if (refreshCommit.finalizerInvoked && !refreshCommit.committed) return null;
 
   // Injected test/alternate refresh functions may predate the transactional

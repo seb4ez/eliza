@@ -61,6 +61,44 @@ function fakeClient() {
   return { setBaseUrl: vi.fn(), setToken: vi.fn() };
 }
 
+function fakeClientWithStagedAuthority() {
+  const base = fakeClient();
+  let revision = 0;
+  const stageSessionTarget = vi.fn(
+    (target: { baseUrl: string; token: string }) => {
+      const installedRevision = ++revision;
+      let live = true;
+      base.setToken(null);
+      base.setBaseUrl(target.baseUrl);
+      base.setToken(target.token);
+      const consume = () => {
+        if (!live || revision !== installedRevision) return false;
+        live = false;
+        revision += 1;
+        return true;
+      };
+      return {
+        publish: vi.fn(() => live && revision === installedRevision),
+        restoreIfCurrent: vi.fn(() => consume()),
+        clearIfCurrent: vi.fn(() => {
+          if (!consume()) return false;
+          base.setToken(null);
+          return true;
+        }),
+      };
+    },
+  );
+  return {
+    ...base,
+    stageSessionTarget,
+    installNewerTarget(baseUrl: string, token: string) {
+      revision += 1;
+      base.setBaseUrl(baseUrl);
+      base.setToken(token);
+    },
+  };
+}
+
 describe("applyRestoredConnection — cloud Steward token refresh at restore", () => {
   let fetchMock: ReturnType<typeof vi.fn>;
   const realFetch = globalThis.fetch;
@@ -72,7 +110,10 @@ describe("applyRestoredConnection — cloud Steward token refresh at restore", (
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     globalThis.fetch = realFetch;
+    // biome-ignore lint/suspicious/noDocumentCookie: jsdom has no Cookie Store API.
+    document.cookie = "steward-authed=; Max-Age=0; path=/";
     localStorage.clear();
     vi.restoreAllMocks();
   });
@@ -121,6 +162,92 @@ describe("applyRestoredConnection — cloud Steward token refresh at restore", (
     expect(client.setToken).toHaveBeenCalledWith(fresh);
   });
 
+  it("does not reinstall an expired bearer when refresh succeeds after the startup timeout", async () => {
+    vi.useFakeTimers();
+    const expired = makeJwt(-60);
+    const fresh = makeJwt(3600);
+    localStorage.setItem(STEWARD_TOKEN_KEY, expired);
+    let resolveFetch!: (value: {
+      ok: boolean;
+      json: () => Promise<{ token: string }>;
+    }) => void;
+    let markJsonRead!: () => void;
+    const jsonRead = new Promise<void>((resolve) => {
+      markJsonRead = resolve;
+    });
+    fetchMock.mockReturnValue(
+      new Promise((resolve) => {
+        resolveFetch = resolve;
+      }),
+    );
+    const client = fakeClient();
+
+    const restore = applyRestoredConnection({
+      restoredActiveServer: cloudServer(),
+      clientRef: client,
+    });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(4_000);
+    await restore;
+
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(client.setToken).toHaveBeenLastCalledWith(null);
+    resolveFetch({
+      ok: true,
+      json: async () => {
+        markJsonRead();
+        return { token: fresh };
+      },
+    });
+    await jsonRead;
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
+
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(client.setToken).toHaveBeenLastCalledWith(null);
+  });
+
+  it("does not publish a cookie-recovered bearer after startup stopped waiting", async () => {
+    vi.useFakeTimers();
+    // biome-ignore lint/suspicious/noDocumentCookie: jsdom has no Cookie Store API.
+    document.cookie = "steward-authed=1; path=/";
+    const fresh = makeJwt(3600);
+    let resolveFetch!: (value: {
+      ok: boolean;
+      json: () => Promise<{ token: string }>;
+    }) => void;
+    let markJsonRead!: () => void;
+    const jsonRead = new Promise<void>((resolve) => {
+      markJsonRead = resolve;
+    });
+    fetchMock.mockReturnValue(
+      new Promise((resolve) => {
+        resolveFetch = resolve;
+      }),
+    );
+    const client = fakeClient();
+
+    const restore = applyRestoredConnection({
+      restoredActiveServer: cloudServer(),
+      clientRef: client,
+    });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(4_000);
+    await restore;
+
+    resolveFetch({
+      ok: true,
+      json: async () => {
+        markJsonRead();
+        return { token: fresh };
+      },
+    });
+    await jsonRead;
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
+
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(client.setToken).toHaveBeenLastCalledWith(null);
+  });
+
   it("stops publishing restored client state when refresh authority changes during the durable write", async () => {
     const expired = makeJwt(-60);
     localStorage.setItem(STEWARD_TOKEN_KEY, expired);
@@ -136,7 +263,7 @@ describe("applyRestoredConnection — cloud Steward token refresh at restore", (
         newerLogin = beginStewardSessionRecovery(STEWARD_TENANT_ID, "provider");
       },
     );
-    const client = fakeClient();
+    const client = fakeClientWithStagedAuthority();
 
     try {
       await applyRestoredConnection({
@@ -149,10 +276,45 @@ describe("applyRestoredConnection — cloud Steward token refresh at restore", (
     }
 
     // Base + provisional A were published before the refresh. Once the newer
-    // login marker invalidates the refresh, no terminal A/null client state is
-    // published and the fenced token write compensates back to its predecessor.
-    expect(client.setToken).toHaveBeenCalledTimes(2);
-    expect(client.setToken).toHaveBeenLastCalledWith(expired);
+    // login marker invalidates the refresh, its exact client authority clears A
+    // fail-closed while the fenced token write restores durable predecessor A.
+    expect(client.setToken).toHaveBeenCalledTimes(3);
+    expect(client.setToken).toHaveBeenLastCalledWith(null);
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(expired);
+  });
+
+  it("does not clear a newer same-tab client target when restore authority is superseded", async () => {
+    const expired = makeJwt(-60);
+    localStorage.setItem(STEWARD_TOKEN_KEY, expired);
+    const fresh = makeJwt(3600);
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ token: fresh }),
+    });
+    const client = fakeClientWithStagedAuthority();
+    let newerLogin: StewardSessionRecoveryReceipt | null = null;
+    const unregisterPersistence = registerStewardTokenPersistence(
+      async (token) => {
+        localStorage.setItem(STEWARD_TOKEN_KEY, token);
+        newerLogin = beginStewardSessionRecovery(STEWARD_TENANT_ID, "provider");
+        client.installNewerTarget(
+          "https://api.eliza.app/api/v1/eliza/agents/22222222-2222-4222-8222-222222222222",
+          "account-b",
+        );
+      },
+    );
+
+    try {
+      await applyRestoredConnection({
+        restoredActiveServer: cloudServer(),
+        clientRef: client,
+      });
+    } finally {
+      unregisterPersistence();
+      if (newerLogin) rejectStewardSessionRecovery(newerLogin);
+    }
+
+    expect(client.setToken).toHaveBeenLastCalledWith("account-b");
     expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(expired);
   });
 
