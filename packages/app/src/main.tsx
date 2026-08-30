@@ -130,10 +130,7 @@ import {
 import type { ShareTargetPayload } from "@elizaos/ui/platform";
 import { isStandalonePwa } from "@elizaos/ui/platform";
 import { isAndroidCloudBuild } from "@elizaos/ui/platform/android-runtime";
-import {
-  applyLaunchConnection,
-  applyLaunchConnectionFromUrl,
-} from "@elizaos/ui/platform/browser-launch";
+import { applyLaunchConnectionFromUrl } from "@elizaos/ui/platform/browser-launch";
 import { installLocalProviderCloudPreferencePatch } from "@elizaos/ui/platform/cloud-preference-patch";
 import { installDesktopPermissionsClientPatch } from "@elizaos/ui/platform/desktop-permissions-client";
 import {
@@ -2060,31 +2057,23 @@ function connectFirstRunRemoteDeepLink(
   return applyRemoteDeepLinkConnection(validatedUrl, true);
 }
 
-async function applyRemoteDeepLinkConnection(
+function applyRemoteDeepLinkConnection(
   validatedUrl: URL,
   completeFirstRun: boolean,
 ): Promise<boolean> {
-  // applyLaunchConnection owns the durable registry + active-server
-  // transaction and only publishes the live client target after both writes
-  // commit. Dispatching earlier lets consumers race ahead on a target that a
-  // reload cannot restore.
-  const connection = await applyLaunchConnection({
-    kind: "remote",
-    apiBase: validatedUrl.href,
-    token: null,
-  });
+  // The OS producer only validates. The claimed CONNECT_EVENT consumer owns
+  // confirmation and every durable/live mutation, and the dispatch promise
+  // resolves only after that consumer finishes. This keeps Android's buffered
+  // deep-link acknowledgement behind both consent and durable application.
   if (completeFirstRun) {
-    dispatchConnectRequest({
-      gatewayUrl: connection.apiBase,
+    return dispatchConnectRequest({
+      gatewayUrl: validatedUrl.href,
       completeFirstRun: true,
     });
-  } else {
-    dispatchConnectRequest({
-      gatewayUrl: connection.apiBase,
-      token: connection.token ?? undefined,
-    });
   }
-  return true;
+  return dispatchConnectRequest({
+    gatewayUrl: validatedUrl.href,
+  });
 }
 
 async function recordIosAuthCallbackSmoke(

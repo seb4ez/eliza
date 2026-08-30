@@ -123,7 +123,7 @@ export function useStartupShellController(): StartupShellController {
       token?: string;
       completeFirstRun?: boolean;
       skipConfirm?: boolean;
-    }): Promise<void> => {
+    }): Promise<boolean> => {
       // `completeFirstRun` marks the connected remote as this device's finished
       // first-run target (device/desktop remote-connect-at-URL onboarding), so
       // it lands on home instead of re-showing onboarding on the next launch.
@@ -151,7 +151,7 @@ export function useStartupShellController(): StartupShellController {
         });
         if (!approved) {
           setActionNotice("Connection request cancelled.", "info", 4200);
-          return;
+          return true;
         }
       }
 
@@ -184,6 +184,7 @@ export function useStartupShellController(): StartupShellController {
         }
         setActionNotice("Connected to remote backend.", "success", 4200);
         retryStartup();
+        return true;
       } catch (err) {
         setActionNotice(
           err instanceof Error
@@ -192,6 +193,7 @@ export function useStartupShellController(): StartupShellController {
           "error",
           8000,
         );
+        return false;
       }
     };
 

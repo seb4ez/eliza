@@ -17,7 +17,6 @@ import {
 } from "@elizaos/ui/events";
 import { routeFirstRunDeepLink } from "@elizaos/ui/first-run/deep-link-handler";
 import type { ShareTargetPayload } from "@elizaos/ui/platform";
-import { applyLaunchConnection } from "@elizaos/ui/platform/browser-launch";
 import {
   buildAssistantLaunchHashRoute,
   type DeepLinkNavigationIntent,
@@ -77,7 +76,7 @@ export function isTrustedAppLink(
 }
 
 export function createDeepLinkHandler(ctx: DeepLinkHandlerContext) {
-  function handle(url: string): void | Promise<void> {
+  function handle(url: string): undefined | Promise<boolean> {
     if (routeFirstRunDeepLink(url, ctx.urlScheme)) {
       return;
     }
@@ -162,7 +161,7 @@ export function createDeepLinkHandler(ctx: DeepLinkHandlerContext) {
     }
   }
 
-  function handleConnect(parsed: URL): void | Promise<void> {
+  function handleConnect(parsed: URL): undefined | Promise<boolean> {
     const gatewayUrl = parsed.searchParams.get("url");
     if (!gatewayUrl) return;
     let validatedUrl: URL;
@@ -197,21 +196,12 @@ export function createDeepLinkHandler(ctx: DeepLinkHandlerContext) {
     // way — remote auth goes through the cloudLaunchSession exchange
     // (applyLaunchConnectionFromUrl already refuses raw `token` params). The
     // host repoint is preserved for the legitimate local-agent connect feature.
-    return applyRemoteConnection(validatedUrl);
-  }
-
-  async function applyRemoteConnection(validatedUrl: URL): Promise<void> {
-    // Do not publish CONNECT_EVENT until the registry + active-server
-    // transaction has durably committed and the live client target has been
-    // fenced/published by applyLaunchConnection.
-    const connection = await applyLaunchConnection({
-      kind: "remote",
-      apiBase: validatedUrl.href,
-      token: null,
-    });
-    dispatchConnectRequest({
-      gatewayUrl: connection.apiBase,
-      token: connection.token ?? undefined,
+    // Validation belongs at the OS boundary; consent and every durable/live
+    // mutation belong to the claimed CONNECT_EVENT consumer. The returned
+    // promise settles only after that consumer has approved/cancelled or
+    // attempted the durable transaction.
+    return dispatchConnectRequest({
+      gatewayUrl: validatedUrl.href,
     });
   }
 

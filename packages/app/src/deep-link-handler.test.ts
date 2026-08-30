@@ -10,7 +10,7 @@
  * `location.hash`, and event listeners; dispatch seams are `vi.fn()` spies.
  */
 import {
-  CONNECT_EVENT,
+  listenForConnectRequests,
   listenForNavigateViewRequests,
 } from "@elizaos/ui/events";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -21,10 +21,16 @@ import {
 } from "./deep-link-handler";
 
 const mocks = vi.hoisted(() => ({
-  applyLaunchConnection: vi.fn(async () => ({
-    apiBase: "http://100.96.0.1:31337/v1",
-    token: null,
-  })),
+  applyLaunchConnection: vi.fn(
+    async (_connection?: {
+      kind: "remote";
+      apiBase: string;
+      token: string | null;
+    }) => ({
+      apiBase: "http://100.96.0.1:31337/v1",
+      token: null,
+    }),
+  ),
 }));
 
 vi.mock("@elizaos/ui/platform/browser-launch", () => ({
@@ -222,65 +228,76 @@ describe("createDeepLinkHandler — universal (https) app links", () => {
 });
 
 describe("createDeepLinkHandler — remote runtime connect links", () => {
-  it("waits for the durable launch transaction before dispatching a trusted connect", async () => {
+  it("never mutates before the claimed consumer approves the trusted connect", async () => {
     const { handle } = makeHandler();
-    const seen: unknown[] = [];
-    let resolveConnection!: (connection: {
-      apiBase: string;
-      token: null;
-    }) => void;
-    mocks.applyLaunchConnection.mockImplementationOnce(
-      () =>
-        new Promise((resolve) => {
-          resolveConnection = resolve;
-        }),
-    );
-    const onConnect = (event: Event) => {
-      seen.push((event as CustomEvent).detail);
-    };
-    document.addEventListener(CONNECT_EVENT, onConnect);
+    let approve!: () => void;
+    const approval = new Promise<void>((resolve) => {
+      approve = resolve;
+    });
+    const consumer = vi.fn(async (request: { gatewayUrl: string }) => {
+      await approval;
+      await mocks.applyLaunchConnection({
+        kind: "remote",
+        apiBase: request.gatewayUrl,
+        token: null,
+      });
+      return true;
+    });
+    const stop = listenForConnectRequests(consumer);
     try {
       const handled = handle(
         "elizaos://connect?url=http%3A%2F%2F100.96.0.1%3A31337%2Fv1%2F&token=attacker-token",
-      );
+      ) as Promise<boolean>;
+      let settled = false;
+      void handled.then(() => {
+        settled = true;
+      });
+
+      expect(consumer).toHaveBeenCalledWith({
+        gatewayUrl: "http://100.96.0.1:31337/v1/",
+      });
+      expect(mocks.applyLaunchConnection).not.toHaveBeenCalled();
+      await Promise.resolve();
+      expect(settled).toBe(false);
+
+      approve();
+      await expect(handled).resolves.toBe(true);
+      expect(mocks.applyLaunchConnection).toHaveBeenCalledOnce();
       expect(mocks.applyLaunchConnection).toHaveBeenCalledWith({
         kind: "remote",
         apiBase: "http://100.96.0.1:31337/v1/",
         token: null,
       });
-      expect(seen).toEqual([]);
-
-      resolveConnection({
-        apiBase: "http://100.96.0.1:31337/v1",
-        token: null,
-      });
-      await handled;
     } finally {
-      document.removeEventListener(CONNECT_EVENT, onConnect);
+      stop();
     }
-
-    expect(seen).toEqual([
-      {
-        gatewayUrl: "http://100.96.0.1:31337/v1",
-        token: undefined,
-      },
-    ]);
   });
 
-  it("does not dispatch when the durable launch transaction rejects", async () => {
+  it("reports durable consumer failure without acknowledging the request", async () => {
     const { handle } = makeHandler();
-    const onConnect = vi.fn();
     mocks.applyLaunchConnection.mockRejectedValueOnce(
       new Error("durable write failed"),
     );
-    document.addEventListener(CONNECT_EVENT, onConnect);
+    const consumer = vi.fn(async (request: { gatewayUrl: string }) => {
+      try {
+        await mocks.applyLaunchConnection({
+          kind: "remote",
+          apiBase: request.gatewayUrl,
+          token: null,
+        });
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    const stop = listenForConnectRequests(consumer);
     try {
       await expect(
         handle("elizaos://connect?url=http%3A%2F%2F100.96.0.1%3A31337%2Fv1%2F"),
-      ).rejects.toThrow("durable write failed");
-      expect(onConnect).not.toHaveBeenCalled();
+      ).resolves.toBe(false);
+      expect(consumer).toHaveBeenCalledOnce();
     } finally {
-      document.removeEventListener(CONNECT_EVENT, onConnect);
+      stop();
     }
   });
 
@@ -290,7 +307,7 @@ describe("createDeepLinkHandler — remote runtime connect links", () => {
       trustPolicy: { isTrustedDeepLinkApiBaseUrl: () => false } as never,
     });
     const onConnect = vi.fn();
-    document.addEventListener(CONNECT_EVENT, onConnect);
+    const stop = listenForConnectRequests(onConnect);
     try {
       handle("elizaos://connect?url=https%3A%2F%2Fagent.attacker.example");
       expect(mocks.applyLaunchConnection).not.toHaveBeenCalled();
@@ -300,7 +317,7 @@ describe("createDeepLinkHandler — remote runtime connect links", () => {
         "agent.attacker.example",
       );
     } finally {
-      document.removeEventListener(CONNECT_EVENT, onConnect);
+      stop();
       warn.mockRestore();
     }
   });

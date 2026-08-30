@@ -279,9 +279,14 @@ export interface ConnectRequestDetail {
 
 type ConnectRequestListener = (
   detail: ConnectRequestDetail,
-) => void | Promise<void>;
+) => boolean | void | Promise<boolean> | Promise<void>;
 
-const connectRequestClaims = new WeakMap<object, () => boolean>();
+interface ConnectRequestClaim {
+  claimed: boolean;
+  settle: (applied: boolean) => void;
+}
+
+const connectRequestClaims = new WeakMap<object, ConnectRequestClaim>();
 let pendingConnectRequest: ConnectRequestDetail | null = null;
 
 function emitConnectRequest(detail: ConnectRequestDetail): void {
@@ -292,23 +297,42 @@ function emitConnectRequest(detail: ConnectRequestDetail): void {
  * Dispatches a connection request without losing native deep links that arrive
  * while React is replacing the startup screen with the live shell. The latest
  * unclaimed request is replayed when a consumer mounts; a synchronous claim
- * guarantees that the startup and shell listeners cannot both adopt it.
+ * guarantees that the startup and shell listeners cannot both adopt it. The
+ * returned promise resolves only after that claimed listener finishes: `true`
+ * means the request was handled (including an explicit user cancellation),
+ * while `false` means it could not be durably applied.
  */
-export function dispatchConnectRequest(detail: ConnectRequestDetail): void {
-  let claimed = false;
+export function dispatchConnectRequest(
+  detail: ConnectRequestDetail,
+): Promise<boolean> {
+  if (typeof document === "undefined") return Promise.resolve(false);
+
+  if (pendingConnectRequest) {
+    connectRequestClaims.get(pendingConnectRequest)?.settle(false);
+  }
+
   const request: ConnectRequestDetail = {
     ...detail,
   };
-  connectRequestClaims.set(request, () => {
-    if (claimed) return false;
-    claimed = true;
-    if (pendingConnectRequest === request) {
-      pendingConnectRequest = null;
-    }
-    return true;
+  let settled = false;
+  let resolveApplied!: (applied: boolean) => void;
+  const applied = new Promise<boolean>((resolve) => {
+    resolveApplied = resolve;
   });
+  const claim: ConnectRequestClaim = {
+    claimed: false,
+    settle: (wasApplied) => {
+      if (settled) return;
+      settled = true;
+      if (pendingConnectRequest === request) pendingConnectRequest = null;
+      connectRequestClaims.delete(request);
+      resolveApplied(wasApplied);
+    },
+  };
+  connectRequestClaims.set(request, claim);
   pendingConnectRequest = request;
   emitConnectRequest(request);
+  return applied;
 }
 
 /**
@@ -332,8 +356,40 @@ export function listenForConnectRequests(
 
     const request = detail as ConnectRequestDetail;
     const claim = connectRequestClaims.get(request);
-    if (claim && !claim()) return;
-    void listener(request);
+    if (claim?.claimed) return;
+
+    if (claim) {
+      claim.claimed = true;
+      if (pendingConnectRequest === request) pendingConnectRequest = null;
+    }
+
+    let result: boolean | void | Promise<boolean> | Promise<void>;
+    try {
+      result = listener(request);
+    } catch (error) {
+      // error-policy:J4 a consumer failure must resolve the native delivery
+      // contract as not applied, never escape the CustomEvent boundary.
+      logger.warn(
+        { error },
+        "[connect-request] listener threw while applying a connection request",
+      );
+      claim?.settle(false);
+      return;
+    }
+
+    void Promise.resolve(result).then(
+      (wasApplied) => claim?.settle(wasApplied !== false),
+      (error) => {
+        // error-policy:J4 reject as not applied so Android retains its buffered
+        // deep link for a later renderer instead of producing an unhandled
+        // rejection or acknowledging a connection that never committed.
+        logger.warn(
+          { error },
+          "[connect-request] listener rejected while applying a connection request",
+        );
+        claim?.settle(false);
+      },
+    );
   };
 
   document.addEventListener(CONNECT_EVENT, handle);

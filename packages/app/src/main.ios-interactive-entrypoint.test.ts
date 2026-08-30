@@ -21,7 +21,11 @@ const iosBoot = vi.hoisted(() => ({
   createRoot: vi.fn(),
   runEmbedHandshake: vi.fn(async () => undefined),
   applyLaunchConnection: vi.fn(
-    async (connection: { apiBase: string; token?: string | null }) => ({
+    async (connection: {
+      kind?: "remote";
+      apiBase: string;
+      token?: string | null;
+    }) => ({
       apiBase: connection.apiBase.replace(/\/+$/, ""),
       token: connection.token?.trim() || null,
     }),
@@ -173,7 +177,16 @@ describe("renderer interactive iOS composition", () => {
 
     const handleDeepLink = iosBoot.lifecycleDependencies?.handleDeepLink;
     expect(handleDeepLink).toBeTypeOf("function");
-    const connectRequest = vi.fn();
+    const connectRequest = vi.fn(
+      async (request: { gatewayUrl: string; token?: string }) => {
+        await iosBoot.applyLaunchConnection({
+          kind: "remote",
+          apiBase: request.gatewayUrl,
+          token: request.token ?? null,
+        });
+        return true;
+      },
+    );
     const removeConnectListener = listenForConnectRequests(connectRequest);
     const notificationCenterRequest = vi.fn();
     window.addEventListener(
@@ -225,10 +238,13 @@ describe("renderer interactive iOS composition", () => {
     expect(window.location.hash).toContain("aec-loop");
     expect(connectRequest).toHaveBeenCalledWith(
       expect.objectContaining({
-        gatewayUrl: "http://127.0.0.1:31337",
+        gatewayUrl: "http://127.0.0.1:31337/",
         completeFirstRun: true,
       }),
     );
+    // Both remote URLs are durably applied by the claimed consumer, never by
+    // the OS deep-link producer before consent.
+    expect(iosBoot.applyLaunchConnection).toHaveBeenCalledTimes(2);
     removeConnectListener();
     window.removeEventListener(
       OPEN_NOTIFICATION_CENTER_EVENT,

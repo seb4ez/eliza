@@ -2618,7 +2618,7 @@ function AppContent() {
       token?: string;
       completeFirstRun?: boolean;
       skipConfirm?: boolean;
-    }): Promise<void> => {
+    }): Promise<boolean> => {
       const shouldCompleteFirstRun = payload.completeFirstRun === true;
       const skipConfirm = payload.skipConfirm === true;
       if (!skipConfirm && !isLoopbackGatewayHost(payload.gatewayUrl)) {
@@ -2633,7 +2633,7 @@ function AppContent() {
         });
         if (!approved) {
           setActionNotice("Connection request cancelled.", "info", 4200);
-          return;
+          return true;
         }
       }
 
@@ -2662,6 +2662,7 @@ function AppContent() {
         }
         setActionNotice("Connected to remote backend.", "success", 4200);
         retryStartup();
+        return true;
       } catch (err) {
         setActionNotice(
           err instanceof Error
@@ -2670,6 +2671,7 @@ function AppContent() {
           "error",
           8000,
         );
+        return false;
       }
     };
 
