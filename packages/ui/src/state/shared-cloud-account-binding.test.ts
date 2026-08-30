@@ -1,7 +1,7 @@
 /** Verifies complete browser teardown of an account-scoped shared Cloud binding under jsdom. */
 // @vitest-environment jsdom
 
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getBootConfig, setBootConfig } from "../config/boot-config";
 import {
   loadAgentProfileRegistry,
@@ -14,6 +14,7 @@ import {
 import {
   clearManagedCloudAccountBinding,
   clearSharedCloudAccountBinding,
+  clearSharedCloudAccountBindingDurably,
 } from "./shared-cloud-account-binding";
 
 const SHARED_BASE =
@@ -140,5 +141,102 @@ describe("clearSharedCloudAccountBinding", () => {
         }),
       ],
     });
+  });
+
+  it("does not resurrect terminal profile A or clear live mirrors after authority B appears", async () => {
+    savePersistedActiveServer({
+      id: "cloud:previous-account-agent",
+      kind: "cloud",
+      label: "Eliza Cloud",
+      apiBase: SHARED_BASE,
+    });
+    saveAgentProfileRegistry({
+      version: 1,
+      activeProfileId: "old-profile",
+      profiles: [
+        {
+          id: "old-profile",
+          kind: "cloud",
+          label: "Eliza Cloud",
+          apiBase: SHARED_BASE,
+          accessToken: "revoked-a",
+          createdAt: new Date().toISOString(),
+        },
+      ],
+    });
+    localStorage.setItem("elizaos_api_base", SHARED_BASE);
+    let authorityLive = true;
+    const originalSetItem = window.localStorage.setItem.bind(
+      window.localStorage,
+    );
+    const setItem = vi
+      .spyOn(window.localStorage, "setItem")
+      .mockImplementation((key, value) => {
+        originalSetItem(key, value);
+        if (key === "elizaos:agent-profiles") authorityLive = false;
+      });
+
+    try {
+      await expect(
+        clearSharedCloudAccountBindingDurably({
+          validate: () => authorityLive,
+        }),
+      ).resolves.toBe(false);
+    } finally {
+      setItem.mockRestore();
+    }
+
+    expect(loadAgentProfileRegistry().profiles).toEqual([]);
+    expect(loadPersistedActiveServer()?.apiBase).toBe(SHARED_BASE);
+    expect(localStorage.getItem("elizaos_api_base")).toBe(SHARED_BASE);
+    expect(getBootConfig().apiToken).toBe("previous-account-token");
+  });
+
+  it("keeps terminal profiles scrubbed on active-server failure without publishing logout", async () => {
+    savePersistedActiveServer({
+      id: "cloud:previous-account-agent",
+      kind: "cloud",
+      label: "Eliza Cloud",
+      apiBase: SHARED_BASE,
+    });
+    saveAgentProfileRegistry({
+      version: 1,
+      activeProfileId: "old-profile",
+      profiles: [
+        {
+          id: "old-profile",
+          kind: "cloud",
+          label: "Eliza Cloud",
+          apiBase: SHARED_BASE,
+          accessToken: "revoked-a",
+          createdAt: new Date().toISOString(),
+        },
+      ],
+    });
+    localStorage.setItem("elizaos_api_base", SHARED_BASE);
+    const originalRemoveItem = window.localStorage.removeItem.bind(
+      window.localStorage,
+    );
+    const removeItem = vi
+      .spyOn(window.localStorage, "removeItem")
+      .mockImplementation((key) => {
+        if (key === "elizaos:active-server") {
+          throw new DOMException("blocked", "SecurityError");
+        }
+        originalRemoveItem(key);
+      });
+
+    try {
+      await expect(
+        clearSharedCloudAccountBindingDurably({ validate: () => true }),
+      ).rejects.toThrow("blocked");
+    } finally {
+      removeItem.mockRestore();
+    }
+
+    expect(loadAgentProfileRegistry().profiles).toEqual([]);
+    expect(loadPersistedActiveServer()?.apiBase).toBe(SHARED_BASE);
+    expect(localStorage.getItem("elizaos_api_base")).toBe(SHARED_BASE);
+    expect(getBootConfig().apiToken).toBe("previous-account-token");
   });
 });

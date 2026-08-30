@@ -21,11 +21,18 @@ import {
 import { MOBILE_RUNTIME_MODE_STORAGE_KEY } from "../first-run/mobile-runtime-mode";
 import { runAsPrivilegedShell } from "../surface-realm-channel";
 import {
+  type DesktopSecureStoreChangedEvent,
   type DesktopSecureStoreKind,
+  desktopSecureStoreCommitReceipt,
+  desktopSecureStoreCompareAndDelete,
   desktopSecureStoreCompareAndRestore,
+  desktopSecureStoreCompareAndSet,
+  desktopSecureStoreCompensateCommittedReceipt,
   desktopSecureStoreDelete,
   desktopSecureStoreGet,
+  desktopSecureStoreRevision,
   desktopSecureStoreSet,
+  subscribeDesktopBridgeEvent,
 } from "./electrobun-rpc";
 import { isElectrobunRuntime } from "./electrobun-runtime";
 
@@ -118,25 +125,307 @@ const PROTECTED_STORAGE_KIND = new Map<string, DesktopSecureStoreKind>([
   ["elizaos:active-server", "runtime.active_server"],
   ["elizaos:agent-profiles", "runtime.agent_profiles"],
 ]);
+const PROTECTED_STORAGE_KEY = new Map<DesktopSecureStoreKind, string>(
+  Array.from(PROTECTED_STORAGE_KIND, ([key, kind]) => [kind, key]),
+);
 
 const protectedStorageCache = new Map<string, string>();
+const protectedStorageCacheValidatedAt = new Map<string, number>();
+const protectedStorageHostRevision = new Map<string, number>();
+const protectedStorageLeaseRefreshes = new Map<string, Promise<void>>();
+const protectedStorageLeaseTimers = new Map<
+  string,
+  ReturnType<typeof setTimeout>
+>();
 const protectedStorageMutationVersion = new Map<string, number>();
 const protectedStorageMutationTail = new Map<string, Promise<void>>();
 
 interface ProtectedStoreSetResult {
+  predecessor?: string | null;
   rollbackReceipt: string | null;
+  setRevision?: number;
   stored: boolean;
 }
 
-let stewardTokenRollbackAuthority: {
-  expectedToken: string;
+interface ProtectedStoreRollbackAuthority {
   receipt: string;
-} | null = null;
+  setRevision: number;
+}
+
+interface ProtectedStoreCompensationSnapshot {
+  restored: boolean;
+  revision?: number;
+  value: string | null;
+}
+
+interface PersistedStorageValue {
+  mutationVersion: number;
+  previousValue?: string | null;
+  rollbackAuthority: ProtectedStoreRollbackAuthority | null;
+}
+
+export interface StorageWriteCompensation {
+  compensate(): Promise<boolean>;
+}
+
+export interface StorageWriteValidationOptions {
+  /**
+   * Defaults to true for transactional writes. Terminal credential scrubs set
+   * this false: once A is removed, a newer marker must never resurrect A.
+   */
+  compensateOnValidationFailure?: boolean;
+  validate?: () => boolean;
+}
+
+export interface StorageRemovalValidationOptions {
+  validate?: () => boolean;
+}
+
+const DESKTOP_SECURE_STORE_RPC_ATTEMPTS = 3;
+export const PROTECTED_STORAGE_CACHE_LEASE_MS = 30_000;
+const PROTECTED_STORAGE_CACHE_RENEW_AFTER_MS =
+  PROTECTED_STORAGE_CACHE_LEASE_MS / 2;
+let protectedStorageMutationIdSequence = 0;
+
+class ProtectedStorageWriteSupersededError extends Error {
+  constructor(key: string) {
+    super(`Desktop protected storage write was superseded for ${key}`);
+    this.name = "ProtectedStorageWriteSupersededError";
+  }
+}
+
+function invalidateProtectedStorageCache(key: string): void {
+  protectedStorageCache.delete(key);
+  protectedStorageCacheValidatedAt.delete(key);
+  const timer = protectedStorageLeaseTimers.get(key);
+  if (timer !== undefined) {
+    clearTimeout(timer);
+    protectedStorageLeaseTimers.delete(key);
+  }
+}
+
+function cacheProtectedStorageValue(key: string, value: string): void {
+  protectedStorageCache.set(key, value);
+  if (isElectrobunRuntime() && !isNativePlatform()) {
+    protectedStorageCacheValidatedAt.set(key, Date.now());
+    scheduleProtectedStorageLeaseRenewal(key);
+  }
+}
+
+type ProtectedStorageLeaseRefreshResult =
+  | "renewed"
+  | "invalidated"
+  | "unavailable";
+
+function scheduleProtectedStorageLeaseExpiry(
+  key: string,
+  validatedAt: number,
+): void {
+  const currentTimer = protectedStorageLeaseTimers.get(key);
+  if (currentTimer !== undefined) clearTimeout(currentTimer);
+  const remaining = Math.max(
+    0,
+    validatedAt + PROTECTED_STORAGE_CACHE_LEASE_MS - Date.now(),
+  );
+  const timer = setTimeout(() => {
+    if (protectedStorageLeaseTimers.get(key) !== timer) return;
+    protectedStorageLeaseTimers.delete(key);
+    if (protectedStorageCacheValidatedAt.get(key) !== validatedAt) return;
+    if (Date.now() - validatedAt >= PROTECTED_STORAGE_CACHE_LEASE_MS) {
+      invalidateProtectedStorageCache(key);
+      return;
+    }
+    // A clock adjustment can make a timer run before the absolute lease bound.
+    // Re-arm only for the remaining part of the original lease; a failed poll
+    // never extends credential authority.
+    scheduleProtectedStorageLeaseExpiry(key, validatedAt);
+  }, remaining);
+  protectedStorageLeaseTimers.set(key, timer);
+}
+
+function scheduleProtectedStorageLeaseRenewal(key: string): void {
+  const validatedAt = protectedStorageCacheValidatedAt.get(key);
+  if (
+    validatedAt === undefined ||
+    !isElectrobunRuntime() ||
+    isNativePlatform()
+  ) {
+    return;
+  }
+  const currentTimer = protectedStorageLeaseTimers.get(key);
+  if (currentTimer !== undefined) clearTimeout(currentTimer);
+  const remaining = Math.max(
+    0,
+    validatedAt + PROTECTED_STORAGE_CACHE_RENEW_AFTER_MS - Date.now(),
+  );
+  const timer = setTimeout(() => {
+    if (protectedStorageLeaseTimers.get(key) !== timer) return;
+    protectedStorageLeaseTimers.delete(key);
+    startProtectedStorageLeaseRefresh(key);
+  }, remaining);
+  protectedStorageLeaseTimers.set(key, timer);
+}
+
+async function refreshProtectedStorageCacheLease(
+  key: string,
+): Promise<ProtectedStorageLeaseRefreshResult> {
+  const kind = PROTECTED_STORAGE_KIND.get(key);
+  const expectedValue = protectedStorageCache.get(key);
+  const expectedRevision = protectedStorageHostRevision.get(key) ?? 0;
+  const expectedValidatedAt = protectedStorageCacheValidatedAt.get(key);
+  if (
+    !kind ||
+    expectedValue === undefined ||
+    expectedValidatedAt === undefined
+  ) {
+    return "invalidated";
+  }
+  // Background timer throttling must not turn an already-expired cache entry
+  // back into an authorised credential when the renderer wakes up.
+  if (Date.now() - expectedValidatedAt >= PROTECTED_STORAGE_CACHE_LEASE_MS) {
+    invalidateProtectedStorageCache(key);
+    return "invalidated";
+  }
+  try {
+    const result = await desktopSecureStoreRevision(kind);
+    if (
+      !result?.ok ||
+      !Number.isSafeInteger(result.revision) ||
+      result.revision < 0
+    ) {
+      return "unavailable";
+    }
+    if (result.revision !== expectedRevision) {
+      if (result.revision > expectedRevision) {
+        protectedStorageHostRevision.set(key, result.revision);
+      }
+      invalidateProtectedStorageCache(key);
+      return "invalidated";
+    }
+    if (Date.now() - expectedValidatedAt >= PROTECTED_STORAGE_CACHE_LEASE_MS) {
+      invalidateProtectedStorageCache(key);
+      return "invalidated";
+    }
+    if (
+      protectedStorageCache.get(key) === expectedValue &&
+      (protectedStorageHostRevision.get(key) ?? 0) === expectedRevision &&
+      protectedStorageCacheValidatedAt.get(key) === expectedValidatedAt
+    ) {
+      protectedStorageCacheValidatedAt.set(key, Date.now());
+      return "renewed";
+    }
+    return "invalidated";
+  } catch {
+    // error-policy:J4 a failed secret-free lease check leaves the old
+    // validation timestamp untouched; the synchronous facade then expires to
+    // null at the fixed bound instead of serving stale credentials forever.
+    return "unavailable";
+  }
+}
+
+function startProtectedStorageLeaseRefresh(key: string): void {
+  if (protectedStorageLeaseRefreshes.has(key)) return;
+  const refresh = refreshProtectedStorageCacheLease(key)
+    .then((result) => {
+      if (result === "renewed") {
+        scheduleProtectedStorageLeaseRenewal(key);
+        return;
+      }
+      if (result === "unavailable") {
+        const validatedAt = protectedStorageCacheValidatedAt.get(key);
+        if (validatedAt !== undefined) {
+          scheduleProtectedStorageLeaseExpiry(key, validatedAt);
+        }
+      }
+    })
+    .finally(() => {
+      if (protectedStorageLeaseRefreshes.get(key) === refresh) {
+        protectedStorageLeaseRefreshes.delete(key);
+      }
+    });
+  protectedStorageLeaseRefreshes.set(key, refresh);
+}
+
+function readProtectedStorageCache(key: string): string | null {
+  const value = protectedStorageCache.get(key);
+  if (value === undefined) return null;
+  if (!isElectrobunRuntime() || isNativePlatform()) return value;
+
+  const validatedAt = protectedStorageCacheValidatedAt.get(key) ?? 0;
+  const age = Date.now() - validatedAt;
+  if (age >= PROTECTED_STORAGE_CACHE_LEASE_MS) {
+    invalidateProtectedStorageCache(key);
+    return null;
+  }
+  if (
+    age >= PROTECTED_STORAGE_CACHE_RENEW_AFTER_MS &&
+    !protectedStorageLeaseRefreshes.has(key)
+  ) {
+    startProtectedStorageLeaseRefresh(key);
+  }
+  return value;
+}
+
+function acceptProtectedStorageHostRevision(
+  key: string,
+  revision: number | undefined,
+): boolean {
+  // Backward-compatible while a renderer and host from adjacent desktop
+  // builds briefly overlap during an update. Current hosts always provide it.
+  if (revision === undefined) {
+    return (protectedStorageHostRevision.get(key) ?? 0) === 0;
+  }
+  if (!Number.isSafeInteger(revision) || revision < 0) return false;
+  const knownRevision = protectedStorageHostRevision.get(key) ?? 0;
+  if (revision < knownRevision) return false;
+  protectedStorageHostRevision.set(key, revision);
+  return true;
+}
+
+function handleProtectedStorageHostInvalidation(payload: unknown): void {
+  if (!payload || typeof payload !== "object") return;
+  const { kind, revision } = payload as Partial<DesktopSecureStoreChangedEvent>;
+  if (
+    typeof kind !== "string" ||
+    !Number.isSafeInteger(revision) ||
+    (revision ?? -1) < 0
+  ) {
+    return;
+  }
+  const key = PROTECTED_STORAGE_KEY.get(kind as DesktopSecureStoreKind);
+  if (!key) return;
+  const knownRevision = protectedStorageHostRevision.get(key) ?? 0;
+  if ((revision as number) <= knownRevision) return;
+  protectedStorageHostRevision.set(key, revision as number);
+  // Never broadcast credential values. A revision advance makes the sync
+  // localStorage facade fail closed until this renderer performs an awaited
+  // secureStoreGet and repopulates from the host-authoritative snapshot.
+  invalidateProtectedStorageCache(key);
+}
 
 function markProtectedStorageMutation(key: string): number {
   const version = (protectedStorageMutationVersion.get(key) ?? 0) + 1;
   protectedStorageMutationVersion.set(key, version);
   return version;
+}
+
+function createProtectedStorageMutationId(): string {
+  const cryptoApi = globalThis.crypto;
+  if (typeof cryptoApi?.randomUUID === "function") {
+    return cryptoApi.randomUUID();
+  }
+  if (typeof cryptoApi?.getRandomValues === "function") {
+    const entropy = new Uint32Array(4);
+    cryptoApi.getRandomValues(entropy);
+    return Array.from(entropy, (part) =>
+      part.toString(16).padStart(8, "0"),
+    ).join("");
+  }
+  // Mutation ids are scoped to one host-owned renderer endpoint. A monotonic
+  // per-renderer fallback remains collision-free inside that authority even on
+  // older WebViews without randomUUID/getRandomValues.
+  protectedStorageMutationIdSequence += 1;
+  return `renderer-mutation-${protectedStorageMutationIdSequence}`;
 }
 
 /** Orders native mutations for one logical credential without coupling keys. */
@@ -165,11 +454,33 @@ function serializedProtectedStoreSet(
   value: string,
 ): Promise<ProtectedStoreSetResult> {
   return serializeProtectedStorageMutation(key, async () => {
+    if (isNativePlatform()) {
+      return nativeProtectedStoreSetWithCompensation(key, value);
+    }
     const result = await protectedStoreSet(key, value);
-    if (!result.stored) return result;
-    return (await protectedStoreGet(key)) === value
-      ? result
-      : { stored: false, rollbackReceipt: null };
+    if (!result.stored) {
+      if (result.rollbackReceipt) {
+        await rollbackFailedDesktopProtectedStoreSet(key, result);
+      }
+      return { stored: false, rollbackReceipt: null };
+    }
+    try {
+      if ((await protectedStoreGet(key)) === value) return result;
+    } catch (readbackError) {
+      // Electrobun's set and get are separate renderer→host RPCs. A set may
+      // therefore commit successfully before the readback transport fails.
+      // Keep the opaque set receipt live long enough to undo that exact host
+      // mutation; otherwise the caller sees a rejected login while the token
+      // silently survives in the OS credential store and returns on restart.
+      await rollbackFailedDesktopProtectedStoreSet(key, result);
+      throw readbackError;
+    }
+
+    // A readable but mismatched value is also a failed publication. Roll the
+    // exact write back when it still owns the slot; the host CAS preserves a
+    // newer renderer mutation when this receipt has already gone stale.
+    await rollbackFailedDesktopProtectedStoreSet(key, result);
+    return { stored: false, rollbackReceipt: null };
   });
 }
 
@@ -186,9 +497,22 @@ function compareAndRestoreProtectedStorageCache(
 ): void {
   if (protectedStorageCache.get(key) !== expectedValue) return;
   if (restoreValue === null) {
-    protectedStorageCache.delete(key);
+    invalidateProtectedStorageCache(key);
   } else {
-    protectedStorageCache.set(key, restoreValue);
+    cacheProtectedStorageValue(key, restoreValue);
+  }
+}
+
+function applyProtectedStorageHostSnapshot(
+  key: string,
+  value: string | null,
+  revision: number | undefined,
+): void {
+  if (!acceptProtectedStorageHostRevision(key, revision)) return;
+  if (value === null) {
+    invalidateProtectedStorageCache(key);
+  } else {
+    cacheProtectedStorageValue(key, value);
   }
 }
 
@@ -231,7 +555,7 @@ function compareAndRestoreStorageValue(
       if (!result?.ok) {
         throw new Error("Desktop protected storage rejected rollback");
       }
-      compareAndRestoreProtectedStorageCache(key, expectedValue, result.value);
+      applyProtectedStorageHostSnapshot(key, result.value, result.revision);
       return result.restored;
     }
 
@@ -262,6 +586,11 @@ function isProtectedStorageHost(): boolean {
   return isNativePlatform() || isElectrobunRuntime();
 }
 
+/** Whether protected runtime/session records require an awaited host write. */
+export function isProtectedStorageHostRuntime(): boolean {
+  return isProtectedStorageHost();
+}
+
 async function protectedStoreGet(key: string): Promise<string | null> {
   const kind = PROTECTED_STORAGE_KIND.get(key);
   if (!kind) return null;
@@ -275,12 +604,22 @@ async function protectedStoreGet(key: string): Promise<string | null> {
     throw new Error("Native protected storage is unavailable");
   }
   if (isElectrobunRuntime()) {
-    const result = await desktopSecureStoreGet(kind);
-    if (result?.ok) {
-      return typeof result.value === "string" ? result.value : null;
+    // A mutation event can overtake an older in-flight get response on another
+    // renderer transport. Retry any snapshot whose host revision is older than
+    // the invalidation already observed here, so it can never refill the cache
+    // with the previous account's credential.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const result = await desktopSecureStoreGet(kind);
+      if (result && !acceptProtectedStorageHostRevision(key, result.revision)) {
+        if (attempt < 2) continue;
+        throw new Error("Desktop protected storage returned a stale snapshot");
+      }
+      if (result?.ok) {
+        return typeof result.value === "string" ? result.value : null;
+      }
+      if (result?.reason === "not_found") return null;
+      throw new Error("Desktop protected storage is unavailable");
     }
-    if (result?.reason === "not_found") return null;
-    throw new Error("Desktop protected storage is unavailable");
   }
   return null;
 }
@@ -299,12 +638,348 @@ async function protectedStoreSet(
     };
   }
   if (isElectrobunRuntime()) {
-    const result = await desktopSecureStoreSet(kind, value);
+    const mutationId = createProtectedStorageMutationId();
+    let result: Awaited<ReturnType<typeof desktopSecureStoreSet>> = null;
+    let lastError: unknown = new Error(
+      "Desktop protected storage request is unavailable",
+    );
+    for (
+      let attempt = 0;
+      attempt < DESKTOP_SECURE_STORE_RPC_ATTEMPTS;
+      attempt += 1
+    ) {
+      try {
+        result = await desktopSecureStoreSet(kind, value, mutationId);
+        if (result) break;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    if (!result) throw lastError;
+    if (result) {
+      acceptProtectedStorageHostRevision(key, result.revision);
+    }
     return result?.ok
-      ? { stored: true, rollbackReceipt: result.rollbackReceipt }
-      : { stored: false, rollbackReceipt: null };
+      ? {
+          stored: true,
+          rollbackReceipt: result.rollbackReceipt,
+          ...(Number.isSafeInteger(result.revision)
+            ? { setRevision: result.revision }
+            : {}),
+        }
+      : {
+          stored: false,
+          rollbackReceipt: result?.rollbackReceipt ?? null,
+          ...(Number.isSafeInteger(result?.revision)
+            ? { setRevision: result?.revision }
+            : {}),
+        };
   }
   return { stored: false, rollbackReceipt: null };
+}
+
+/**
+ * Capacitor currently exposes no compare-and-swap primitive. Mobile uses one
+ * renderer, and this bridge serializes the predecessor read, write, readback,
+ * and compensation for each key. That makes exact restoration safe inside the
+ * supported single-renderer boundary; a future multi-WebView host must add CAS
+ * at the native plugin before sharing this path.
+ */
+async function nativeProtectedStoreSetWithCompensation(
+  key: string,
+  value: string,
+): Promise<ProtectedStoreSetResult> {
+  const kind = PROTECTED_STORAGE_KIND.get(key);
+  if (!kind) return { stored: false, rollbackReceipt: null };
+  const predecessor = await protectedStoreGet(key);
+  // The native host snapshot is authoritative even before the successor SET
+  // can run. Reconcile a stale renderer cache here so a blocked write never
+  // exposes credentials that the OS store no longer contains.
+  if (predecessor === null) invalidateProtectedStorageCache(key);
+  else cacheProtectedStorageValue(key, predecessor);
+  const { ElizaSecureStore } = await loadNativeSecureStore();
+  let writeError: unknown = null;
+  try {
+    await ElizaSecureStore.set({ key: kind, value });
+  } catch (error) {
+    writeError = error;
+  }
+
+  let readback: string | null;
+  try {
+    readback = await protectedStoreGet(key);
+    if (readback === value) {
+      return { stored: true, rollbackReceipt: null, predecessor };
+    }
+  } catch (readbackError) {
+    await restoreNativeProtectedStorePredecessor(key, predecessor);
+    throw readbackError;
+  }
+
+  // A readable mismatch is just as authoritative as a failed GET: the write
+  // did not publish the requested value. Restore and verify the exact
+  // predecessor before exposing failure to the caller.
+  await restoreNativeProtectedStorePredecessor(key, predecessor);
+  if (writeError) throw writeError;
+  return { stored: false, rollbackReceipt: null, predecessor };
+}
+
+async function restoreNativeProtectedStorePredecessor(
+  key: string,
+  predecessor: string | null,
+): Promise<void> {
+  const kind = PROTECTED_STORAGE_KIND.get(key);
+  if (!kind) throw new Error("Protected storage kind is not registered");
+  const { ElizaSecureStore } = await loadNativeSecureStore();
+  try {
+    if (predecessor === null) {
+      await ElizaSecureStore.remove({ key: kind });
+    } else {
+      await ElizaSecureStore.set({ key: kind, value: predecessor });
+    }
+  } catch {
+    // A native adapter may mutate before throwing. Verification below, rather
+    // than the acknowledgement alone, decides whether compensation succeeded.
+  }
+  if ((await protectedStoreGet(key)) !== predecessor) {
+    throw new Error(
+      `Native protected storage could not restore predecessor for ${key}`,
+    );
+  }
+}
+
+async function rollbackFailedDesktopProtectedStoreSet(
+  key: string,
+  result: ProtectedStoreSetResult,
+): Promise<void> {
+  if (isNativePlatform() || !isElectrobunRuntime() || !result.rollbackReceipt) {
+    return;
+  }
+  const kind = PROTECTED_STORAGE_KIND.get(key);
+  if (!kind) {
+    throw new Error("Protected storage kind is not registered");
+  }
+  const rollback = await desktopSecureStoreCompareAndRestore(
+    kind,
+    result.rollbackReceipt,
+  );
+  if (!rollback?.ok) {
+    throw new Error(
+      `Desktop protected storage could not reconcile failed write for ${key}`,
+    );
+  }
+  applyProtectedStorageHostSnapshot(key, rollback.value, rollback.revision);
+}
+
+async function commitDesktopProtectedStoreReceipt(
+  key: string,
+  rollbackReceipt: string,
+  expectedValue: string,
+  setRevision: number | undefined,
+): Promise<void> {
+  if (isNativePlatform() || !isElectrobunRuntime()) return;
+  const kind = PROTECTED_STORAGE_KIND.get(key);
+  if (!kind) {
+    throw new Error("Protected storage kind is not registered");
+  }
+  let committed: Awaited<ReturnType<typeof desktopSecureStoreCommitReceipt>> =
+    null;
+  let lastError: unknown = new Error(
+    "Desktop protected storage commit request is unavailable",
+  );
+  for (
+    let attempt = 0;
+    attempt < DESKTOP_SECURE_STORE_RPC_ATTEMPTS;
+    attempt += 1
+  ) {
+    try {
+      committed = await desktopSecureStoreCommitReceipt(kind, rollbackReceipt);
+      if (committed) break;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  const throwAfterReconciliation = async (commitFailure: unknown) => {
+    try {
+      await reconcileAmbiguousDesktopProtectedStoreCommit(
+        key,
+        { receipt: rollbackReceipt, setRevision },
+        expectedValue,
+      );
+    } catch (reconciliationError) {
+      throw new AggregateError(
+        [commitFailure, reconciliationError],
+        `Desktop protected storage could not safely reconcile commit for ${key}`,
+      );
+    }
+    throw commitFailure;
+  };
+  if (!committed) {
+    return throwAfterReconciliation(lastError);
+  }
+  if (!committed.ok) {
+    return throwAfterReconciliation(
+      new Error(
+        `Desktop protected storage could not commit write receipt for ${key}`,
+      ),
+    );
+  }
+  acceptProtectedStorageHostRevision(key, committed.revision);
+  let authoritativeValue: string | null;
+  try {
+    authoritativeValue = await protectedStoreGet(key);
+  } catch (readbackError) {
+    if (committed.committed) {
+      try {
+        await reconcileAmbiguousDesktopProtectedStoreCommit(
+          key,
+          { receipt: rollbackReceipt, setRevision },
+          expectedValue,
+        );
+      } catch (reconciliationError) {
+        throw new AggregateError(
+          [readbackError, reconciliationError],
+          `Desktop protected storage could not safely reconcile commit readback for ${key}`,
+        );
+      }
+    }
+    throw readbackError;
+  }
+  if (!committed.committed || authoritativeValue !== expectedValue) {
+    throw new ProtectedStorageWriteSupersededError(key);
+  }
+}
+
+async function compensateCommittedDesktopProtectedStoreReceipt(
+  key: string,
+  authority: ProtectedStoreRollbackAuthority & { expectedToken: string },
+): Promise<ProtectedStoreCompensationSnapshot> {
+  if (isNativePlatform() || !isElectrobunRuntime()) {
+    return { restored: false, value: null };
+  }
+  const kind = PROTECTED_STORAGE_KIND.get(key);
+  if (!kind) {
+    throw new Error("Protected storage kind is not registered");
+  }
+  let compensation: Awaited<
+    ReturnType<typeof desktopSecureStoreCompensateCommittedReceipt>
+  > = null;
+  let lastError: unknown = new Error(
+    "Desktop protected storage compensation request is unavailable",
+  );
+  for (
+    let attempt = 0;
+    attempt < DESKTOP_SECURE_STORE_RPC_ATTEMPTS;
+    attempt += 1
+  ) {
+    try {
+      compensation = await desktopSecureStoreCompensateCommittedReceipt(
+        kind,
+        authority.receipt,
+        authority.setRevision,
+      );
+      if (compensation) break;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  if (!compensation) throw lastError;
+  if (!compensation.ok) {
+    throw new Error(
+      `Desktop protected storage could not compensate committed receipt for ${key}`,
+    );
+  }
+  applyProtectedStorageHostSnapshot(
+    key,
+    compensation.value,
+    compensation.revision,
+  );
+  // restored:false means a newer revision already owns the slot. That is the
+  // correct CAS outcome and must never be overwritten by this older writer.
+  return {
+    restored: compensation.restored,
+    revision: compensation.revision,
+    value: compensation.value,
+  };
+}
+
+/**
+ * Resolve an RPC outcome that cannot distinguish an uncommitted SET from a
+ * committed SET whose response was lost. First replay the committed tombstone;
+ * if no tombstone owns the exact SET revision, consume the still-live receipt.
+ * A newer host revision/value is authoritative and must never be overwritten.
+ */
+async function reconcileAmbiguousDesktopProtectedStoreCommit(
+  key: string,
+  authority: { receipt: string; setRevision: number | undefined },
+  expectedValue: string,
+): Promise<void> {
+  const kind = PROTECTED_STORAGE_KIND.get(key);
+  if (!kind) {
+    throw new Error("Protected storage kind is not registered");
+  }
+
+  let compensationError: unknown = null;
+  if (Number.isSafeInteger(authority.setRevision)) {
+    try {
+      const compensation =
+        await compensateCommittedDesktopProtectedStoreReceipt(key, {
+          expectedToken: expectedValue,
+          receipt: authority.receipt,
+          setRevision: authority.setRevision as number,
+        });
+      if (
+        compensation.restored ||
+        compensation.value !== expectedValue ||
+        (Number.isSafeInteger(compensation.revision) &&
+          compensation.revision !== authority.setRevision)
+      ) {
+        return;
+      }
+    } catch (error) {
+      compensationError = error;
+    }
+  }
+
+  let rollback: Awaited<
+    ReturnType<typeof desktopSecureStoreCompareAndRestore>
+  > = null;
+  let rollbackError: unknown = new Error(
+    "Desktop protected storage rollback request is unavailable",
+  );
+  for (
+    let attempt = 0;
+    attempt < DESKTOP_SECURE_STORE_RPC_ATTEMPTS;
+    attempt += 1
+  ) {
+    try {
+      rollback = await desktopSecureStoreCompareAndRestore(
+        kind,
+        authority.receipt,
+      );
+      if (rollback) break;
+    } catch (error) {
+      rollbackError = error;
+    }
+  }
+  if (rollback?.ok) {
+    applyProtectedStorageHostSnapshot(key, rollback.value, rollback.revision);
+    if (rollback.restored || rollback.value !== expectedValue) return;
+    rollbackError = new Error(
+      `Desktop protected storage still contains the ambiguous value for ${key}`,
+    );
+  } else if (rollback) {
+    rollbackError = new Error(
+      `Desktop protected storage rejected ambiguous rollback for ${key}`,
+    );
+  }
+
+  throw compensationError
+    ? new AggregateError(
+        [compensationError, rollbackError],
+        `Desktop protected storage ambiguity could not be reconciled for ${key}`,
+      )
+    : rollbackError;
 }
 
 async function protectedStoreDelete(key: string): Promise<void> {
@@ -314,8 +989,17 @@ async function protectedStoreDelete(key: string): Promise<void> {
   }
   if (isNativePlatform()) {
     const { ElizaSecureStore } = await loadNativeSecureStore();
-    const result = await ElizaSecureStore.remove({ key: kind });
-    if (result.ok || result.error === "not_found") return;
+    let removalError: unknown = null;
+    try {
+      await ElizaSecureStore.remove({ key: kind });
+    } catch (error) {
+      removalError = error;
+    }
+    // Native acknowledgements are not authoritative: adapters can return
+    // ok:true without deleting, or delete and then report an error. The host
+    // snapshot alone decides whether the requested absence is durable.
+    if ((await protectedStoreGet(key)) === null) return;
+    if (removalError) throw removalError;
     throw new Error("Native protected storage rejected deletion");
   }
   if (isElectrobunRuntime()) {
@@ -520,7 +1204,7 @@ export async function initializeStorageBridge(): Promise<void> {
       try {
         const protectedValue = await protectedStoreGet(key);
         if (protectedValue !== null) {
-          protectedStorageCache.set(key, protectedValue);
+          cacheProtectedStorageValue(key, protectedValue);
           originalRemoveItem(key);
           if (isNativePlatform()) {
             const { Preferences } = await loadPreferences();
@@ -535,16 +1219,27 @@ export async function initializeStorageBridge(): Promise<void> {
         const legacyValue = preferenceValue ?? originalGetItem(key);
         if (legacyValue === null) continue;
 
-        protectedStorageCache.set(key, legacyValue);
-        const stored = await protectedStoreSet(key, legacyValue);
-        const verified = stored.stored ? await protectedStoreGet(key) : null;
-        if (verified !== legacyValue) {
+        const migrationVersion = markProtectedStorageMutation(key);
+        cacheProtectedStorageValue(key, legacyValue);
+        const stored = await serializedProtectedStoreSet(key, legacyValue);
+        if (!stored.stored) {
           protectedStoreResponded = false;
           logger.error(
             { key },
             "[StorageBridge] protected-storage migration did not verify",
           );
           continue;
+        }
+        if (stored.rollbackReceipt) {
+          await commitDesktopProtectedStoreReceipt(
+            key,
+            stored.rollbackReceipt,
+            legacyValue,
+            stored.setRevision,
+          );
+        }
+        if (protectedStorageMutationVersion.get(key) === migrationVersion) {
+          cacheProtectedStorageValue(key, legacyValue);
         }
         originalRemoveItem(key);
         if (isNativePlatform()) {
@@ -584,6 +1279,14 @@ function setupStorageProxy(): void {
     return;
   }
 
+  if (isElectrobunRuntime()) {
+    subscribeDesktopBridgeEvent({
+      rpcMessage: "secureStoreChanged",
+      ipcChannel: "secureStore:changed",
+      listener: handleProtectedStorageHostInvalidation,
+    });
+  }
+
   const nativeStorage = getNativeLocalStorageMethods();
   const {
     setItem: originalSetItem,
@@ -609,17 +1312,29 @@ function setupStorageProxy(): void {
       // explicitly optimistic. Security-critical producers use the awaited
       // setStorageValue registration below and are published only after
       // protected-store write plus exact readback succeeds.
-      markProtectedStorageMutation(key);
-      protectedStorageCache.set(key, value);
+      const writeVersion = markProtectedStorageMutation(key);
+      cacheProtectedStorageValue(key, value);
       originalRemoveItem(key);
       setTimeout(() => {
         serializedProtectedStoreSet(key, value)
-          .then((stored) => {
+          .then(async (stored) => {
             if (!stored.stored) {
               logger.error(
                 { key },
                 "[StorageBridge] secure-store rejected protected write",
               );
+              return;
+            }
+            if (stored.rollbackReceipt) {
+              await commitDesktopProtectedStoreReceipt(
+                key,
+                stored.rollbackReceipt,
+                value,
+                stored.setRevision,
+              );
+            }
+            if (protectedStorageMutationVersion.get(key) === writeVersion) {
+              cacheProtectedStorageValue(key, value);
             }
           })
           .catch((err) => {
@@ -659,7 +1374,7 @@ function setupStorageProxy(): void {
   // Override getItem
   const secureGetItem = (key: string): string | null => {
     if (isProtectedStorageHost() && PROTECTED_STORAGE_KIND.has(key)) {
-      return protectedStorageCache.get(key) ?? null;
+      return readProtectedStorageCache(key);
     }
     // For synced keys, prefer the cache (which was loaded from Preferences)
     if (SYNCED_KEYS.has(key) && preferencesCache.has(key)) {
@@ -676,7 +1391,7 @@ function setupStorageProxy(): void {
         serializedProtectedStoreDelete(key)
           .then(() => {
             if (protectedStorageMutationVersion.get(key) === removalVersion) {
-              protectedStorageCache.delete(key);
+              invalidateProtectedStorageCache(key);
               originalRemoveItem(key);
             }
           })
@@ -778,8 +1493,15 @@ function setupStorageProxy(): void {
 export async function getStorageValue(key: string): Promise<string | null> {
   if (isProtectedStorageHost() && PROTECTED_STORAGE_KIND.has(key)) {
     const value = await protectedStoreGet(key);
-    if (value !== null) protectedStorageCache.set(key, value);
-    return value ?? protectedStorageCache.get(key) ?? null;
+    if (value === null) {
+      // The secure host is authoritative. Falling back to a renderer-local
+      // cache after `not_found` resurrects credentials removed by another
+      // window (logout/account switch) and can replay the previous JWT.
+      invalidateProtectedStorageCache(key);
+      return null;
+    }
+    cacheProtectedStorageValue(key, value);
+    return value;
   }
   if (isNativePlatform() && SYNCED_KEYS.has(key)) {
     const { Preferences } = await loadPreferences();
@@ -793,7 +1515,7 @@ export async function getStorageValue(key: string): Promise<string | null> {
 async function persistStorageValue(
   key: string,
   value: string,
-): Promise<string | null> {
+): Promise<PersistedStorageValue> {
   if (isProtectedStorageHost() && PROTECTED_STORAGE_KIND.has(key)) {
     const mutationVersion = markProtectedStorageMutation(key);
     const result = await serializedProtectedStoreSet(key, value);
@@ -801,20 +1523,41 @@ async function persistStorageValue(
       throw new Error(`Protected storage rejected write for ${key}`);
     }
     if (protectedStorageMutationVersion.get(key) === mutationVersion) {
-      protectedStorageCache.set(key, value);
+      cacheProtectedStorageValue(key, value);
     }
-    return result.rollbackReceipt;
+    if (!result.rollbackReceipt) {
+      return {
+        mutationVersion,
+        rollbackAuthority: null,
+        ...(Object.hasOwn(result, "predecessor")
+          ? { previousValue: result.predecessor }
+          : {}),
+      };
+    }
+    if (!Number.isSafeInteger(result.setRevision)) {
+      await rollbackFailedDesktopProtectedStoreSet(key, result);
+      throw new Error(`Protected storage did not return a revision for ${key}`);
+    }
+    return {
+      mutationVersion,
+      rollbackAuthority: {
+        receipt: result.rollbackReceipt,
+        setRevision: result.setRevision as number,
+      },
+    };
   }
   // Privileged: this is the shell-side persistence helper (session/auth/
   // first-run keys); the view-facing path is the scoped override in
   // DynamicViewLoader's bridge compat, not this function.
+  const previousValue = window.localStorage.getItem(key);
+  const mutationVersion = markProtectedStorageMutation(key);
   runAsPrivilegedShell(() => window.localStorage.setItem(key, value));
 
   if (isNativePlatform() && SYNCED_KEYS.has(key)) {
     const { Preferences } = await loadPreferences();
     await Preferences.set({ key, value });
   }
-  return null;
+  return { mutationVersion, previousValue, rollbackAuthority: null };
 }
 
 /**
@@ -824,7 +1567,219 @@ export async function setStorageValue(
   key: string,
   value: string,
 ): Promise<void> {
-  await persistStorageValue(key, value);
+  const { rollbackAuthority } = await persistStorageValue(key, value);
+  if (rollbackAuthority) {
+    await commitDesktopProtectedStoreReceipt(
+      key,
+      rollbackAuthority.receipt,
+      value,
+      rollbackAuthority.setRevision,
+    );
+  }
+}
+
+/**
+ * Persist a protected value and retain an exact compensation handle until the
+ * caller has durably committed all related records. Electrobun compensation is
+ * receipt + SET-revision fenced; native remains within the documented
+ * single-renderer serialized boundary.
+ */
+export async function setStorageValueWithCompensation(
+  key: string,
+  value: string,
+  options: StorageWriteValidationOptions = {},
+): Promise<StorageWriteCompensation | null> {
+  if (options.validate?.() === false) return null;
+  const compensateOnValidationFailure =
+    options.compensateOnValidationFailure !== false;
+  const persisted = await persistStorageValue(key, value);
+  const compensate = async (): Promise<boolean> => {
+    if (
+      protectedStorageMutationVersion.get(key) !== persisted.mutationVersion
+    ) {
+      return false;
+    }
+    if (persisted.rollbackAuthority) {
+      const compensation =
+        await compensateCommittedDesktopProtectedStoreReceipt(key, {
+          ...persisted.rollbackAuthority,
+          expectedToken: value,
+        });
+      return compensation.restored;
+    }
+    return compareAndRestoreStorageValue(
+      key,
+      value,
+      persisted.previousValue ?? null,
+    );
+  };
+
+  if (persisted.rollbackAuthority) {
+    if (options.validate?.() === false && compensateOnValidationFailure) {
+      await compareAndRestoreStorageValue(
+        key,
+        value,
+        null,
+        persisted.rollbackAuthority.receipt,
+      );
+      return null;
+    }
+    try {
+      await commitDesktopProtectedStoreReceipt(
+        key,
+        persisted.rollbackAuthority.receipt,
+        value,
+        persisted.rollbackAuthority.setRevision,
+      );
+    } catch (error) {
+      if (error instanceof ProtectedStorageWriteSupersededError) return null;
+      throw error;
+    }
+  }
+  if (options.validate?.() === false) {
+    if (compensateOnValidationFailure) await compensate();
+    return null;
+  }
+  return { compensate };
+}
+
+/**
+ * Apply a terminal credential transform only to the exact raw record observed
+ * by the caller. Electrobun binds bytes + host revision + owner mutation id;
+ * native relies on the documented single-renderer per-key serialization.
+ * Once applied, validator loss suppresses publication but never restores A.
+ */
+export async function setStorageValueIfCurrent(
+  key: string,
+  expectedValue: string,
+  value: string,
+  options: StorageWriteValidationOptions = {},
+): Promise<boolean> {
+  if (options.validate?.() === false) return false;
+  if (!isProtectedStorageHost() || !PROTECTED_STORAGE_KIND.has(key)) {
+    if (window.localStorage.getItem(key) !== expectedValue) return false;
+    if (options.validate?.() === false) return false;
+    await setStorageValue(key, value);
+    return options.validate?.() !== false;
+  }
+
+  const mutationVersion = markProtectedStorageMutation(key);
+  return serializeProtectedStorageMutation(key, async () => {
+    if (!isNativePlatform() && isElectrobunRuntime()) {
+      const kind = PROTECTED_STORAGE_KIND.get(key);
+      if (!kind) throw new Error("Protected storage kind is not registered");
+      const snapshot = await desktopSecureStoreGet(kind);
+      if (!snapshot) {
+        throw new Error("Desktop protected storage is unavailable");
+      }
+      const snapshotValue = snapshot.ok
+        ? typeof snapshot.value === "string"
+          ? snapshot.value
+          : null
+        : snapshot.reason === "not_found"
+          ? null
+          : undefined;
+      if (snapshotValue === undefined) {
+        throw new Error("Desktop protected storage is unavailable");
+      }
+      applyProtectedStorageHostSnapshot(key, snapshotValue, snapshot.revision);
+      if (
+        snapshotValue !== expectedValue ||
+        options.validate?.() === false ||
+        !Number.isSafeInteger(snapshot.revision)
+      ) {
+        return false;
+      }
+
+      const mutationId = createProtectedStorageMutationId();
+      let transformed: Awaited<
+        ReturnType<typeof desktopSecureStoreCompareAndSet>
+      > = null;
+      let transformError: unknown = new Error(
+        "Desktop protected storage CAS transform is unavailable",
+      );
+      for (
+        let attempt = 0;
+        attempt < DESKTOP_SECURE_STORE_RPC_ATTEMPTS;
+        attempt += 1
+      ) {
+        try {
+          transformed = await desktopSecureStoreCompareAndSet(
+            kind,
+            expectedValue,
+            value,
+            snapshot.revision as number,
+            mutationId,
+          );
+          if (transformed) break;
+        } catch (error) {
+          transformError = error;
+        }
+      }
+      if (!transformed) {
+        try {
+          transformed = await desktopSecureStoreCompareAndSet(
+            kind,
+            expectedValue,
+            value,
+            snapshot.revision as number,
+            mutationId,
+          );
+        } catch (error) {
+          transformError = error;
+        }
+      }
+      if (!transformed) throw transformError;
+      if (!transformed.ok) {
+        throw new Error("Desktop protected storage rejected CAS transform");
+      }
+      applyProtectedStorageHostSnapshot(
+        key,
+        transformed.value,
+        transformed.revision,
+      );
+      if (!transformed.applied) return false;
+      if (options.validate?.() === false) return false;
+      if (protectedStorageMutationVersion.get(key) === mutationVersion) {
+        cacheProtectedStorageValue(key, value);
+      }
+      return true;
+    }
+
+    const currentValue = await protectedStoreGet(key);
+    if (currentValue !== expectedValue || options.validate?.() === false) {
+      if (currentValue === null) invalidateProtectedStorageCache(key);
+      else cacheProtectedStorageValue(key, currentValue);
+      return false;
+    }
+    let writeError: unknown = null;
+    try {
+      await protectedStoreSet(key, value);
+    } catch (error) {
+      writeError = error;
+    }
+    let readback: string | null;
+    try {
+      readback = await protectedStoreGet(key);
+    } catch (error) {
+      throw writeError
+        ? new AggregateError(
+            [writeError, error],
+            `Native protected storage could not verify terminal transform for ${key}`,
+          )
+        : error;
+    }
+    if (readback !== value) {
+      if (readback === null) invalidateProtectedStorageCache(key);
+      else cacheProtectedStorageValue(key, readback);
+      if (writeError) throw writeError;
+      return false;
+    }
+    if (protectedStorageMutationVersion.get(key) === mutationVersion) {
+      cacheProtectedStorageValue(key, value);
+    }
+    return options.validate?.() !== false;
+  });
 }
 
 /**
@@ -835,7 +1790,7 @@ export async function removeStorageValue(key: string): Promise<void> {
     const removalVersion = markProtectedStorageMutation(key);
     await serializedProtectedStoreDelete(key);
     if (protectedStorageMutationVersion.get(key) === removalVersion) {
-      protectedStorageCache.delete(key);
+      invalidateProtectedStorageCache(key);
     }
     return;
   }
@@ -845,6 +1800,132 @@ export async function removeStorageValue(key: string): Promise<void> {
     const { Preferences } = await loadPreferences();
     await Preferences.remove({ key });
   }
+}
+
+/**
+ * Remove only the protected value observed by a terminal-session authority.
+ * Electrobun fences both bytes and host revision, so renderer A cannot delete
+ * renderer B's later login even when their local Web Locks are unrelated.
+ */
+export async function removeStorageValueIfCurrent(
+  key: string,
+  expectedValue: string | null,
+  options: StorageRemovalValidationOptions = {},
+): Promise<boolean> {
+  if (options.validate?.() === false) return false;
+  if (!isProtectedStorageHost() || !PROTECTED_STORAGE_KIND.has(key)) {
+    if (window.localStorage.getItem(key) !== expectedValue) return false;
+    if (options.validate?.() === false) return false;
+    if (expectedValue === null) return true;
+    await removeStorageValue(key);
+    // Once the exact terminal delete is acquired, the caller must finish its
+    // remaining teardown. It independently rechecks the validator to suppress
+    // only the observable event; terminal credentials are never resurrected.
+    return true;
+  }
+
+  const removalVersion = markProtectedStorageMutation(key);
+  return serializeProtectedStorageMutation(key, async () => {
+    if (isElectrobunRuntime() && !isNativePlatform()) {
+      const kind = PROTECTED_STORAGE_KIND.get(key);
+      if (!kind) throw new Error("Protected storage kind is not registered");
+      const snapshot = await desktopSecureStoreGet(kind);
+      if (!snapshot) {
+        throw new Error("Desktop protected storage is unavailable");
+      }
+      const snapshotValue = snapshot.ok
+        ? typeof snapshot.value === "string"
+          ? snapshot.value
+          : null
+        : snapshot.reason === "not_found"
+          ? null
+          : undefined;
+      if (snapshotValue === undefined) {
+        throw new Error("Desktop protected storage is unavailable");
+      }
+      applyProtectedStorageHostSnapshot(key, snapshotValue, snapshot.revision);
+      if (
+        snapshotValue !== expectedValue ||
+        options.validate?.() === false ||
+        !Number.isSafeInteger(snapshot.revision)
+      ) {
+        return false;
+      }
+
+      let deletion: Awaited<
+        ReturnType<typeof desktopSecureStoreCompareAndDelete>
+      > = null;
+      let deletionError: unknown = new Error(
+        "Desktop protected storage CAS deletion is unavailable",
+      );
+      const deletionMutationId = createProtectedStorageMutationId();
+      for (
+        let attempt = 0;
+        attempt < DESKTOP_SECURE_STORE_RPC_ATTEMPTS;
+        attempt += 1
+      ) {
+        try {
+          deletion = await desktopSecureStoreCompareAndDelete(
+            kind,
+            expectedValue,
+            snapshot.revision as number,
+            deletionMutationId,
+          );
+          if (deletion) break;
+        } catch (error) {
+          deletionError = error;
+        }
+      }
+      if (!deletion) {
+        try {
+          // The request journal is owner + mutation-id bound. Query it once
+          // after the transport retry budget so three post-host response
+          // losses still resolve to A's exact deletion rather than attributing
+          // an unrelated renderer B deletion by revision arithmetic.
+          deletion = await desktopSecureStoreCompareAndDelete(
+            kind,
+            expectedValue,
+            snapshot.revision as number,
+            deletionMutationId,
+          );
+        } catch (error) {
+          deletionError = error;
+        }
+      }
+      if (!deletion) throw deletionError;
+      if (!deletion.ok) {
+        throw new Error("Desktop protected storage rejected CAS deletion");
+      }
+      applyProtectedStorageHostSnapshot(key, deletion.value, deletion.revision);
+      if (!deletion.deleted) return false;
+
+      if (protectedStorageMutationVersion.get(key) === removalVersion) {
+        invalidateProtectedStorageCache(key);
+      }
+      return true;
+    }
+
+    const currentValue = await protectedStoreGet(key);
+    if (currentValue !== expectedValue || options.validate?.() === false) {
+      if (expectedValue === null) {
+        if (currentValue === null) invalidateProtectedStorageCache(key);
+        else cacheProtectedStorageValue(key, currentValue);
+      } else {
+        compareAndRestoreProtectedStorageCache(
+          key,
+          expectedValue,
+          currentValue,
+        );
+      }
+      return false;
+    }
+    if (expectedValue === null) return true;
+    await protectedStoreDelete(key);
+    if (protectedStorageMutationVersion.get(key) === removalVersion) {
+      invalidateProtectedStorageCache(key);
+    }
+    return true;
+  });
 }
 
 /**
@@ -861,31 +1942,108 @@ export function isStorageBridgeInitialized(): boolean {
   return initialized;
 }
 
-registerStewardTokenRemoval(async () => {
+registerStewardTokenRemoval(async (options) => {
+  if (options) {
+    return removeStorageValueIfCurrent(
+      STEWARD_TOKEN_KEY,
+      options.expectedToken,
+      { validate: options.validate },
+    );
+  }
   await removeStorageValue(STEWARD_TOKEN_KEY);
-  stewardTokenRollbackAuthority = null;
+  return true;
 });
 registerStewardTokenPersistence(async (token) => {
-  stewardTokenRollbackAuthority = null;
-  const receipt = await persistStorageValue(STEWARD_TOKEN_KEY, token);
-  stewardTokenRollbackAuthority = receipt
-    ? { expectedToken: token, receipt }
-    : null;
+  // The Shared writer validates its canonical localStorage facade after the
+  // awaited host commit. Install that facade synchronously even if an early
+  // native login races full bridge hydration; plaintext storage is never used.
+  setupStorageProxy();
+  const persisted = await persistStorageValue(STEWARD_TOKEN_KEY, token);
+  let committed = false;
+  let restoration: Promise<boolean> | null = null;
+
+  const restorePredecessor = (_validate?: () => boolean): Promise<boolean> => {
+    if (restoration) return restoration;
+    const operation = (async () => {
+      // Same-renderer native/browser ABA is fenced by the per-key generation.
+      // Electrobun additionally binds every rollback to its opaque host receipt
+      // and exact SET revision, so another renderer's same bytes cannot match.
+      // Once that exact CAS is acquired, the boolean remains true even if the
+      // caller's validator changes while the RPC is in flight; Shared uses it
+      // to restore subordinate state without guessing from same-value bytes.
+      if (
+        protectedStorageMutationVersion.get(STEWARD_TOKEN_KEY) !==
+        persisted.mutationVersion
+      ) {
+        return false;
+      }
+      if (persisted.rollbackAuthority) {
+        if (committed) {
+          const compensation =
+            await compensateCommittedDesktopProtectedStoreReceipt(
+              STEWARD_TOKEN_KEY,
+              {
+                ...persisted.rollbackAuthority,
+                expectedToken: token,
+              },
+            );
+          return compensation.restored;
+        }
+        return compareAndRestoreStorageValue(
+          STEWARD_TOKEN_KEY,
+          token,
+          null,
+          persisted.rollbackAuthority.receipt,
+        );
+      }
+      return compareAndRestoreStorageValue(
+        STEWARD_TOKEN_KEY,
+        token,
+        persisted.previousValue ?? null,
+      );
+    })();
+    restoration = operation;
+    void operation.catch(() => {
+      if (restoration === operation) restoration = null;
+    });
+    return operation;
+  };
+
+  return {
+    async commit(validate) {
+      if (validate?.() === false) return;
+      if (!persisted.rollbackAuthority) {
+        committed = true;
+        return;
+      }
+      await commitDesktopProtectedStoreReceipt(
+        STEWARD_TOKEN_KEY,
+        persisted.rollbackAuthority.receipt,
+        token,
+        persisted.rollbackAuthority.setRevision,
+      );
+      committed = true;
+      // A newer renderer can plant its marker while the commit RPC awaits.
+      // Restore through this exact tombstone before shared code can publish.
+      if (validate?.() === false) await restorePredecessor();
+    },
+    restorePredecessor,
+  };
 });
 registerStewardTokenCompareAndRestore(async (expectedToken, restoreToken) => {
-  const rollbackAuthority = stewardTokenRollbackAuthority;
-  try {
-    return await compareAndRestoreStorageValue(
-      STEWARD_TOKEN_KEY,
-      expectedToken,
-      restoreToken,
-      rollbackAuthority?.expectedToken === expectedToken
-        ? rollbackAuthority.receipt
-        : null,
-    );
-  } finally {
-    if (stewardTokenRollbackAuthority === rollbackAuthority) {
-      stewardTokenRollbackAuthority = null;
-    }
+  if (
+    isElectrobunRuntime() &&
+    !isNativePlatform() &&
+    PROTECTED_STORAGE_KIND.has(STEWARD_TOKEN_KEY)
+  ) {
+    // Bytes alone cannot identify a write across same-value ABA. Every modern
+    // protected write receives the opaque transaction above; a legacy fallback
+    // without that receipt must lose authority instead of guessing or throwing.
+    return false;
   }
+  return compareAndRestoreStorageValue(
+    STEWARD_TOKEN_KEY,
+    expectedToken,
+    restoreToken,
+  );
 });

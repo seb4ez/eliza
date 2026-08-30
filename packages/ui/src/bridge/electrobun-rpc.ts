@@ -120,19 +120,37 @@ export type DesktopSecureStoreKind =
   | "runtime.agent_profiles";
 
 export type DesktopSecureStoreResult =
-  | { ok: true; value?: string; deleted?: boolean }
+  | { ok: true; value?: string; deleted?: boolean; revision?: number }
   | {
       ok: false;
       reason: "not_found" | "denied" | "unavailable" | "error";
       message?: string;
+      revision?: number;
     };
 
 export type DesktopSecureStoreSetResult =
-  | { ok: true; rollbackReceipt: string }
+  | {
+      ok: true;
+      rollbackReceipt: string;
+      changed?: boolean;
+      revision?: number;
+    }
   | {
       ok: false;
       reason: "not_found" | "denied" | "unavailable" | "error";
       message?: string;
+      rollbackReceipt?: string;
+      changed?: boolean;
+      revision?: number;
+    };
+
+export type DesktopSecureStoreCommitReceiptResult =
+  | { ok: true; committed: boolean; revision?: number }
+  | {
+      ok: false;
+      reason: "not_found" | "denied" | "unavailable" | "error";
+      message?: string;
+      revision?: number;
     };
 
 export type DesktopSecureStoreCompareAndRestoreResult =
@@ -140,12 +158,66 @@ export type DesktopSecureStoreCompareAndRestoreResult =
       ok: true;
       restored: boolean;
       value: string | null;
+      revision?: number;
     }
   | {
       ok: false;
       reason: "not_found" | "denied" | "unavailable" | "error";
       message?: string;
+      revision?: number;
     };
+
+export type DesktopSecureStoreCompensateCommittedReceiptResult =
+  | {
+      ok: true;
+      restored: boolean;
+      changed: boolean;
+      value: string | null;
+      revision?: number;
+    }
+  | {
+      ok: false;
+      reason: "not_found" | "denied" | "unavailable" | "error";
+      message?: string;
+      revision?: number;
+    };
+
+export type DesktopSecureStoreCompareAndDeleteResult =
+  | {
+      ok: true;
+      deleted: boolean;
+      changed: boolean;
+      value: string | null;
+      revision?: number;
+    }
+  | {
+      ok: false;
+      reason: "not_found" | "denied" | "unavailable" | "error";
+      message?: string;
+      changed?: boolean;
+      revision?: number;
+    };
+
+export type DesktopSecureStoreCompareAndSetResult =
+  | {
+      ok: true;
+      applied: boolean;
+      changed: boolean;
+      value: string | null;
+      revision?: number;
+    }
+  | {
+      ok: false;
+      reason: "not_found" | "denied" | "unavailable" | "error";
+      message?: string;
+      changed?: boolean;
+      revision?: number;
+    };
+
+export interface DesktopSecureStoreChangedEvent {
+  kind: DesktopSecureStoreKind;
+  revision: number;
+}
 
 export async function desktopSecureStoreGet(
   kind: DesktopSecureStoreKind,
@@ -157,15 +229,51 @@ export async function desktopSecureStoreGet(
   });
 }
 
+export async function desktopSecureStoreRevision(
+  kind: DesktopSecureStoreKind,
+): Promise<{ ok: true; revision: number } | null> {
+  return invokeDesktopBridgeRequest<{ ok: true; revision: number }>({
+    rpcMethod: "secureStoreRevision",
+    ipcChannel: "secureStore:revision",
+    params: { kind },
+  });
+}
+
 export async function desktopSecureStoreSet(
   kind: DesktopSecureStoreKind,
   value: string,
+  mutationId: string,
 ): Promise<DesktopSecureStoreSetResult | null> {
   return invokeDesktopBridgeRequest<DesktopSecureStoreSetResult>({
     rpcMethod: "secureStoreSet",
     ipcChannel: "secureStore:set",
-    params: { kind, value },
+    params: { kind, value, mutationId },
   });
+}
+
+export async function desktopSecureStoreCommitReceipt(
+  kind: DesktopSecureStoreKind,
+  rollbackReceipt: string,
+): Promise<DesktopSecureStoreCommitReceiptResult | null> {
+  return invokeDesktopBridgeRequest<DesktopSecureStoreCommitReceiptResult>({
+    rpcMethod: "secureStoreCommitReceipt",
+    ipcChannel: "secureStore:commitReceipt",
+    params: { kind, rollbackReceipt },
+  });
+}
+
+export async function desktopSecureStoreCompensateCommittedReceipt(
+  kind: DesktopSecureStoreKind,
+  rollbackReceipt: string,
+  expectedRevision: number,
+): Promise<DesktopSecureStoreCompensateCommittedReceiptResult | null> {
+  return invokeDesktopBridgeRequest<DesktopSecureStoreCompensateCommittedReceiptResult>(
+    {
+      rpcMethod: "secureStoreCompensateCommittedReceipt",
+      ipcChannel: "secureStore:compensateCommittedReceipt",
+      params: { kind, rollbackReceipt, expectedRevision },
+    },
+  );
 }
 
 export async function desktopSecureStoreDelete(
@@ -175,6 +283,33 @@ export async function desktopSecureStoreDelete(
     rpcMethod: "secureStoreDelete",
     ipcChannel: "secureStore:delete",
     params: { kind },
+  });
+}
+
+export async function desktopSecureStoreCompareAndDelete(
+  kind: DesktopSecureStoreKind,
+  expectedValue: string | null,
+  expectedRevision: number,
+  mutationId: string,
+): Promise<DesktopSecureStoreCompareAndDeleteResult | null> {
+  return invokeDesktopBridgeRequest<DesktopSecureStoreCompareAndDeleteResult>({
+    rpcMethod: "secureStoreCompareAndDelete",
+    ipcChannel: "secureStore:compareAndDelete",
+    params: { kind, expectedValue, expectedRevision, mutationId },
+  });
+}
+
+export async function desktopSecureStoreCompareAndSet(
+  kind: DesktopSecureStoreKind,
+  expectedValue: string,
+  value: string,
+  expectedRevision: number,
+  mutationId: string,
+): Promise<DesktopSecureStoreCompareAndSetResult | null> {
+  return invokeDesktopBridgeRequest<DesktopSecureStoreCompareAndSetResult>({
+    rpcMethod: "secureStoreCompareAndSet",
+    ipcChannel: "secureStore:compareAndSet",
+    params: { kind, expectedValue, value, expectedRevision, mutationId },
   });
 }
 

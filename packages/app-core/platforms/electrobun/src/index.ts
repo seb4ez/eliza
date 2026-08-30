@@ -52,6 +52,12 @@ import {
   classifyDeepLinkRoute,
   readOpenUrlEventUrl,
 } from "./desktop-deep-link-events";
+import {
+  awaitDesktopRpcSecureStoreCleanup,
+  createDesktopRpc,
+  type ElizaDesktopRpc,
+  quitAfterDesktopCleanup,
+} from "./desktop-rpc";
 import { startDesktopTestBridgeServer } from "./desktop-test-bridge-server";
 import {
   hasKnownMacosStatusItemSceneRegression,
@@ -125,11 +131,7 @@ import {
   resolveRendererAsset,
   resolveRendererAssetByteRange,
 } from "./renderer-static";
-import {
-  buildBunRpcHandlers,
-  wireBrowserWorkspaceCaller,
-} from "./rpc-handlers";
-import type { ElizaDesktopRPCSchema } from "./rpc-schema";
+import { wireBrowserWorkspaceCaller } from "./rpc-handlers";
 import {
   readResolvedPreloadScript,
   resolveRendererAssetDir,
@@ -143,7 +145,6 @@ import {
 } from "./runtime-preflight";
 import { startScreenCaptureBridgeServer } from "./screen-capture-bridge-server";
 import { startScreenshotDevServer } from "./screenshot-dev-server";
-import { registerShellSyncEndpoint } from "./shell-sync-relay";
 import {
   desktopRehydrateSshRuntimes,
   desktopShutdownSshRuntimes,
@@ -744,12 +745,22 @@ function requestAppQuit(): Promise<void> {
 
   isQuitting = true;
   quitRequestPromise = (async () => {
-    await runShutdownCleanup("explicit-quit").catch((err) => {
+    try {
+      await quitAfterDesktopCleanup(
+        () => runShutdownCleanup("explicit-quit"),
+        () => Utils.quit(),
+      );
+    } catch (err) {
       logger.warn(
         `[Main] Shutdown cleanup failed before explicit quit: ${formatError(err)}`,
       );
-    });
-    Utils.quit();
+      // Keep the process and rollback authority alive. A later explicit quit
+      // retries the owner cleanup instead of silently exiting with a credential
+      // mutation that the host could not reconcile.
+      quitRequestPromise = null;
+      isQuitting = false;
+      return;
+    }
   })();
   return quitRequestPromise;
 }
@@ -1718,15 +1729,6 @@ function toggleFocusedWindowDevTools(): void {
 }
 
 /**
- * The exact rpc object that BrowserView.defineRPC<ElizaDesktopRPCSchema>
- * returns. Carries the schema generic so call sites get typed `request`
- * and `send` proxies.
- */
-type ElizaDesktopRpc = ReturnType<
-  typeof BrowserView.defineRPC<ElizaDesktopRPCSchema>
->;
-
-/**
  * Internal: type-erased view of the rpc shape that
  * `wireBrowserWorkspaceCaller` consumes. The handler module declares its
  * own structural type with `params: any`, so we widen here at the
@@ -1737,82 +1739,6 @@ type RpcRequestProxy = Record<string, (params: any) => Promise<any>>;
 
 function asRpcRequestProxy(request: unknown): RpcRequestProxy {
   return request as RpcRequestProxy;
-}
-
-function asRpcSend(
-  send: unknown,
-): (message: string, payload?: unknown) => void {
-  return send as (message: string, payload?: unknown) => void;
-}
-
-const MAX_RPC_REQUEST_TIME_MS = 600_000;
-
-/**
- * Build a typed RPC instance plus its `sendToWebview` companion, ready to
- * be passed to a `BrowserWindow` / `BrowserView` constructor via the `rpc`
- * option.
- *
- * This is the constructor-time injection pattern required by the
- * Electrobun rules: handlers are declared up front and bound when the
- * webview is created, not patched in post-hoc via `setRequestHandler`.
- *
- * `sendToWebview` closes over the RPC by reference so it can be passed
- * into `buildBunRpcHandlers` before `defineRPC` returns — we only need
- * the actual `send` proxy at call time, after the webview is alive.
- *
- * @param label  Diagnostic tag included in the "no RPC method" warning so
- *               main / settings / surface windows are distinguishable.
- */
-function createDesktopRpc(label: string): {
-  rpc: ElizaDesktopRpc;
-  sendToWebview: SendToWebview;
-  releaseShellSync: () => void;
-} {
-  let rpc: ElizaDesktopRpc | undefined;
-
-  const sendToWebview: SendToWebview = (message, payload) => {
-    if (!rpc) {
-      logger.warn(
-        `[sendToWebview:${label}] RPC not yet initialised; dropping message: ${message}`,
-      );
-      return;
-    }
-    try {
-      // `rpc.send` is a Proxy<sendFn> from defineElectrobunRPC: both
-      // `rpc.send(message, payload)` and `rpc.send.<message>(payload)`
-      // dispatch through the same underlying sendFn. Cast to a plain
-      // function signature to call it dynamically by name without the
-      // schema-typed overloads narrowing the message string.
-      asRpcSend(rpc.send)(message, payload ?? null);
-    } catch (err) {
-      logger.warn(
-        `[sendToWebview:${label}] send(${message}) failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-  };
-
-  type BunRpcRequestsHandlers = NonNullable<
-    Parameters<
-      typeof BrowserView.defineRPC<ElizaDesktopRPCSchema>
-    >[0]["handlers"]
-  >["requests"];
-
-  // Register this window with the main-process shell-controller authority
-  // (#16442). Every renderer flows through this factory, so ownership,
-  // generations, commands, and targeted capture results share one boundary.
-  const shellSyncEndpoint = registerShellSyncEndpoint(label, sendToWebview);
-
-  rpc = BrowserView.defineRPC<ElizaDesktopRPCSchema>({
-    maxRequestTime: MAX_RPC_REQUEST_TIME_MS,
-    handlers: {
-      requests: buildBunRpcHandlers({
-        sendToWebview,
-        shellControllerEndpoint: shellSyncEndpoint,
-      }) as BunRpcRequestsHandlers,
-    },
-  });
-
-  return { rpc, sendToWebview, releaseShellSync: shellSyncEndpoint.release };
 }
 
 /**
@@ -2493,7 +2419,7 @@ async function runShutdownCleanup(reason: string): Promise<void> {
     return shutdownCleanupPromise;
   }
 
-  shutdownCleanupPromise = (async () => {
+  const cleanup = (async () => {
     logger.info(`[Main] App quitting (${reason}), disposing native modules...`);
     isQuitting = true;
     sendToActiveRenderer("desktopShutdownStarted", { reason });
@@ -2511,6 +2437,19 @@ async function runShutdownCleanup(reason: string): Promise<void> {
           }`,
         );
       }
+    }
+    let secureStoreCleanupFailure: unknown = null;
+    try {
+      await awaitDesktopRpcSecureStoreCleanup();
+    } catch (error) {
+      // error-policy:J2 dispose the remaining native modules, then rethrow so
+      // explicit quit remains fail-closed and can retry this tracked owner.
+      secureStoreCleanupFailure = error;
+      logger.warn(
+        `[Main] Renderer secure-store cleanup is still pending: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
     }
     try {
       await stopBrowserBridgeDesktopLifecycle();
@@ -2531,14 +2470,26 @@ async function runShutdownCleanup(reason: string): Promise<void> {
         }`,
       );
     }
+    if (secureStoreCleanupFailure) throw secureStoreCleanupFailure;
   })();
-
-  return shutdownCleanupPromise;
+  shutdownCleanupPromise = cleanup;
+  try {
+    await cleanup;
+  } catch (error) {
+    if (shutdownCleanupPromise === cleanup) shutdownCleanupPromise = null;
+    throw error;
+  }
 }
 
 function setupShutdown(): void {
   Electrobun.events.on("before-quit", () => {
-    void runShutdownCleanup("before-quit");
+    // error-policy:J5 the explicit-quit path observes and retries the same
+    // tracked cleanup; OS-initiated quit can only report its final failure.
+    void runShutdownCleanup("before-quit").catch((error) => {
+      logger.warn(
+        `[Main] Cleanup failed during before-quit: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
   });
 }
 

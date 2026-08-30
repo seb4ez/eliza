@@ -10,7 +10,14 @@ import { isTerminalIosNativeAgentBootErrorMessage } from "../api/ios-local-agent
 import { getShaderPreset } from "../backgrounds/shader-presets";
 import { normalizeUniforms } from "../backgrounds/shader-schema";
 import { isElectrobunRuntime } from "../bridge/electrobun-runtime";
-import { removeStorageValue, setStorageValue } from "../bridge/storage-bridge";
+import {
+  removeStorageValue,
+  removeStorageValueIfCurrent,
+  type StorageWriteValidationOptions,
+  setStorageValue,
+  setStorageValueIfCurrent,
+  setStorageValueWithCompensation,
+} from "../bridge/storage-bridge";
 import { MAX_BACKGROUND_HISTORY } from "./background-history";
 import { getBuildConfiguredRemoteApiBaseUrl } from "./runtime-url-trust";
 
@@ -1441,6 +1448,43 @@ export function savePersistedActiveServer(
   }
 }
 
+/** Await the host-authoritative active-server write before reporting success. */
+export async function savePersistedActiveServerDurably(
+  server: PersistedActiveServer,
+  options: StorageWriteValidationOptions = {},
+): Promise<boolean> {
+  if (typeof localStorage === "undefined") return false;
+
+  const pinnedRemoteApiBase = getBuildConfiguredRemoteApiBaseUrl();
+  if (
+    pinnedRemoteApiBase &&
+    (server.kind !== "remote" ||
+      server.apiBase?.replace(/\/+$/, "") !== pinnedRemoteApiBase)
+  ) {
+    logger.warn(
+      "[persistence] rejected active-server change outside the build-pinned remote target",
+    );
+    return false;
+  }
+
+  try {
+    return (
+      (await setStorageValueWithCompensation(
+        ACTIVE_SERVER_STORAGE_KEY,
+        JSON.stringify(server),
+        options,
+      )) !== null
+    );
+  } catch (cause) {
+    // error-policy:J1 a protected-store rejection is an explicit transaction
+    // failure. No caller may repoint the live client on this false result.
+    logger.warn(
+      `[persistence] failed to durably save active server: ${describePersistenceError(cause)}`,
+    );
+    return false;
+  }
+}
+
 export function clearPersistedActiveServer(): void {
   const pinnedRemoteApiBase = getBuildConfiguredRemoteApiBaseUrl();
   if (pinnedRemoteApiBase) {
@@ -1495,6 +1539,25 @@ export function clearPersistedSharedCloudActiveServer(): boolean {
   return true;
 }
 
+/** Clear only an account-owned shared Cloud selection after its host write commits. */
+export async function clearPersistedSharedCloudActiveServerDurably(
+  options: StorageWriteValidationOptions = {},
+): Promise<boolean> {
+  const raw =
+    typeof localStorage === "undefined"
+      ? null
+      : localStorage.getItem(ACTIVE_SERVER_STORAGE_KEY);
+  if (!raw) return false;
+  let current: PersistedActiveServer | null = null;
+  try {
+    current = normalizePersistedActiveServer(JSON.parse(raw));
+  } catch {
+    return false;
+  }
+  if (!isManagedCloudSharedAgentBase(current?.apiBase)) return false;
+  return removeStorageValueIfCurrent(ACTIVE_SERVER_STORAGE_KEY, raw, options);
+}
+
 /**
  * Drop the bearer access token from the persisted active server while keeping
  * the server selection (kind/apiBase/label). Call this on sign-out: the token
@@ -1508,4 +1571,62 @@ export function scrubPersistedActiveServerToken(): void {
   const scrubbed = { ...current };
   delete scrubbed.accessToken;
   savePersistedActiveServer(scrubbed);
+}
+
+/** Remove only the active server bearer while preserving its selected target. */
+export async function scrubPersistedActiveServerTokenDurably(
+  options: StorageWriteValidationOptions = {},
+): Promise<boolean> {
+  if (options.validate?.() === false || typeof localStorage === "undefined") {
+    return false;
+  }
+  const raw = localStorage.getItem(ACTIVE_SERVER_STORAGE_KEY);
+  if (!raw) return false;
+  let current: PersistedActiveServer | null;
+  try {
+    current = normalizePersistedActiveServer(JSON.parse(raw));
+  } catch {
+    return false;
+  }
+  if (!current?.accessToken) return false;
+  const { accessToken: _accessToken, ...scrubbed } = current;
+  return setStorageValueIfCurrent(
+    ACTIVE_SERVER_STORAGE_KEY,
+    raw,
+    JSON.stringify(scrubbed),
+    { ...options, compensateOnValidationFailure: false },
+  );
+}
+
+/**
+ * One-snapshot terminal active-server teardown. Shared account selections are
+ * removed; dedicated/self-hosted selections keep their target but lose the
+ * bearer. A failed first CAS never falls through to a fresh read of renderer B.
+ */
+export async function clearSharedOrScrubActiveServerTokenDurably(
+  options: StorageWriteValidationOptions = {},
+): Promise<boolean> {
+  if (options.validate?.() === false || typeof localStorage === "undefined") {
+    return false;
+  }
+  const raw = localStorage.getItem(ACTIVE_SERVER_STORAGE_KEY);
+  if (!raw) return false;
+  let current: PersistedActiveServer | null;
+  try {
+    current = normalizePersistedActiveServer(JSON.parse(raw));
+  } catch {
+    return false;
+  }
+  if (!current) return false;
+  if (isManagedCloudSharedAgentBase(current.apiBase)) {
+    return removeStorageValueIfCurrent(ACTIVE_SERVER_STORAGE_KEY, raw, options);
+  }
+  if (!current.accessToken) return false;
+  const { accessToken: _accessToken, ...scrubbed } = current;
+  return setStorageValueIfCurrent(
+    ACTIVE_SERVER_STORAGE_KEY,
+    raw,
+    JSON.stringify(scrubbed),
+    { ...options, compensateOnValidationFailure: false },
+  );
 }

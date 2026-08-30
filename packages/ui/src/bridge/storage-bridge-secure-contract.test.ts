@@ -31,9 +31,12 @@ const nativeStores = vi.hoisted(() => ({
   secureAvailable: true,
   secureSetError: null as null | "dropped" | "rejected" | "thrown",
   secureDeleteError: null as null | "denied" | "unavailable" | "native_error",
+  secureDeleteMutatesBeforeError: false,
+  secureDeleteNoopSuccess: false,
   secureSetWait: null as Promise<void> | null,
   secureDeleteWait: null as Promise<void> | null,
   secureGetWait: null as Promise<void> | null,
+  secureGetFailures: 0,
   secureSetHook: null as null | ((key: string, value: string) => Promise<void>),
   secureGetHook: null as null | ((key: string) => void),
   operations: [] as string[],
@@ -79,6 +82,10 @@ vi.mock("@elizaos/capacitor-secure-store", () => ({
     get: async ({ key }: { key: string }) => {
       nativeStores.operations.push(`get:start:${key}`);
       await nativeStores.secureGetWait;
+      if (nativeStores.secureGetFailures > 0) {
+        nativeStores.secureGetFailures -= 1;
+        throw new Error("deterministic native secure-store GET failure");
+      }
       if (!nativeStores.secureAvailable) throw new Error("bridge cold");
       nativeStores.secureGetHook?.(key);
       nativeStores.operations.push(`get:done:${key}`);
@@ -105,7 +112,13 @@ vi.mock("@elizaos/capacitor-secure-store", () => ({
       nativeStores.operations.push(`delete:start:${key}`);
       await nativeStores.secureDeleteWait;
       if (!nativeStores.secureAvailable) throw new Error("bridge cold");
+      if (nativeStores.secureDeleteNoopSuccess) {
+        return { ok: true, deleted: false };
+      }
       if (nativeStores.secureDeleteError) {
+        if (nativeStores.secureDeleteMutatesBeforeError) {
+          nativeStores.secure.delete(key);
+        }
         return { ok: false, error: nativeStores.secureDeleteError };
       }
       const deleted = nativeStores.secure.delete(key);
@@ -121,9 +134,13 @@ vi.mock("./electrobun-runtime", () => ({
 
 vi.mock("./electrobun-rpc", () => ({
   desktopSecureStoreCompareAndRestore: vi.fn(),
+  desktopSecureStoreCompareAndSet: vi.fn(),
+  desktopSecureStoreCommitReceipt: vi.fn(),
   desktopSecureStoreDelete: vi.fn(),
   desktopSecureStoreGet: vi.fn(),
+  desktopSecureStoreRevision: vi.fn(),
   desktopSecureStoreSet: vi.fn(),
+  subscribeDesktopBridgeEvent: vi.fn(() => () => undefined),
 }));
 
 vi.mock("../surface-realm-channel", () => ({
@@ -137,9 +154,12 @@ describe("native protected-storage bridge contract", () => {
     nativeStores.secureAvailable = true;
     nativeStores.secureSetError = null;
     nativeStores.secureDeleteError = null;
+    nativeStores.secureDeleteMutatesBeforeError = false;
+    nativeStores.secureDeleteNoopSuccess = false;
     nativeStores.secureSetWait = null;
     nativeStores.secureDeleteWait = null;
     nativeStores.secureGetWait = null;
+    nativeStores.secureGetFailures = 0;
     nativeStores.secureSetHook = null;
     nativeStores.secureGetHook = null;
     nativeStores.operations.length = 0;
@@ -177,6 +197,161 @@ describe("native protected-storage bridge contract", () => {
     expect(rawGetItem(STEWARD_TOKEN_KEY)).toBeNull();
     expect(window.localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
     expect(nativeStores.secure.has("session.steward_token")).toBe(false);
+  });
+
+  it("restores the exact native predecessor when SET mutates and its readback GET fails", async () => {
+    const bridge = await import("./storage-bridge");
+    await bridge.setStorageValue(STEWARD_TOKEN_KEY, "prior-native-token");
+    nativeStores.operations.length = 0;
+    nativeStores.secureSetHook = async () => {
+      nativeStores.secureSetHook = null;
+      nativeStores.secureGetFailures = 1;
+    };
+
+    await expect(
+      bridge.setStorageValue(STEWARD_TOKEN_KEY, "latent-native-token"),
+    ).rejects.toThrow("deterministic native secure-store GET failure");
+
+    expect(nativeStores.secure.get("session.steward_token")).toBe(
+      "prior-native-token",
+    );
+    // The proxy is installed during app initialization; this early direct
+    // contract test asserts the durable host predecessor and no plaintext.
+    expect(rawGetItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(nativeStores.operations).toEqual([
+      "get:start:session.steward_token",
+      "get:done:session.steward_token",
+      "set:start:session.steward_token",
+      "set:done:session.steward_token",
+      "get:start:session.steward_token",
+      "set:start:session.steward_token",
+      "set:done:session.steward_token",
+      "get:start:session.steward_token",
+      "get:done:session.steward_token",
+    ]);
+  });
+
+  it("restores the exact native predecessor when SET readback is readable but mismatched", async () => {
+    const bridge = await import("./storage-bridge");
+    await bridge.setStorageValue(STEWARD_TOKEN_KEY, "prior-native-token");
+    nativeStores.operations.length = 0;
+    let reads = 0;
+    nativeStores.secureGetHook = (key) => {
+      reads += 1;
+      if (reads === 2) {
+        nativeStores.secureGetHook = null;
+        nativeStores.secure.set(key, "unexpected-native-token");
+      }
+    };
+
+    await expect(
+      bridge.setStorageValue(STEWARD_TOKEN_KEY, "requested-native-token"),
+    ).rejects.toThrow("Protected storage rejected write");
+
+    expect(nativeStores.secure.get("session.steward_token")).toBe(
+      "prior-native-token",
+    );
+    expect(nativeStores.operations).toEqual([
+      "get:start:session.steward_token",
+      "get:done:session.steward_token",
+      "set:start:session.steward_token",
+      "set:done:session.steward_token",
+      "get:start:session.steward_token",
+      "get:done:session.steward_token",
+      "set:start:session.steward_token",
+      "set:done:session.steward_token",
+      "get:start:session.steward_token",
+      "get:done:session.steward_token",
+    ]);
+  });
+
+  it("rejects a successful native DELETE acknowledgement when readback still finds the credential", async () => {
+    const bridge = await import("./storage-bridge");
+    await bridge.setStorageValue(STEWARD_TOKEN_KEY, "must-remain-visible");
+    nativeStores.secureDeleteNoopSuccess = true;
+
+    await expect(bridge.removeStorageValue(STEWARD_TOKEN_KEY)).rejects.toThrow(
+      "Native protected storage rejected deletion",
+    );
+    expect(nativeStores.secure.get("session.steward_token")).toBe(
+      "must-remain-visible",
+    );
+  });
+
+  it("accepts a native DELETE that mutates before returning an error when readback proves absence", async () => {
+    const bridge = await import("./storage-bridge");
+    await bridge.setStorageValue(STEWARD_TOKEN_KEY, "delete-before-error");
+    nativeStores.secureDeleteError = "native_error";
+    nativeStores.secureDeleteMutatesBeforeError = true;
+
+    await expect(
+      bridge.removeStorageValue(STEWARD_TOKEN_KEY),
+    ).resolves.toBeUndefined();
+    expect(nativeStores.secure.has("session.steward_token")).toBe(false);
+    expect(await bridge.getStorageValue(STEWARD_TOKEN_KEY)).toBeNull();
+  });
+
+  it("keeps an exact native terminal scrub when its validator changes after SET", async () => {
+    const bridge = await import("./storage-bridge");
+    const key = "elizaos:active-server";
+    const kind = "runtime.active_server";
+    await bridge.setStorageValue(key, "native-a-with-token");
+    let checks = 0;
+
+    await expect(
+      bridge.setStorageValueIfCurrent(
+        key,
+        "native-a-with-token",
+        "native-a-scrubbed",
+        {
+          validate: () => {
+            checks += 1;
+            return checks < 3;
+          },
+        },
+      ),
+    ).resolves.toBe(false);
+
+    expect(nativeStores.secure.get(kind)).toBe("native-a-scrubbed");
+  });
+
+  it("does not restore native terminal A when SET mutates then readback fails", async () => {
+    const bridge = await import("./storage-bridge");
+    const key = "elizaos:agent-profiles";
+    const kind = "runtime.agent_profiles";
+    await bridge.setStorageValue(key, "native-profile-a-with-token");
+    nativeStores.secureSetHook = async () => {
+      nativeStores.secureSetHook = null;
+      nativeStores.secureGetFailures = 1;
+    };
+
+    await expect(
+      bridge.setStorageValueIfCurrent(
+        key,
+        "native-profile-a-with-token",
+        "native-profile-a-scrubbed",
+      ),
+    ).rejects.toThrow("deterministic native secure-store GET failure");
+
+    expect(nativeStores.secure.get(kind)).toBe("native-profile-a-scrubbed");
+  });
+
+  it("generation-fences native compensation across same-value ABA", async () => {
+    const bridge = await import("./storage-bridge");
+    const key = "elizaos:active-server";
+    const kind = "runtime.active_server";
+    await bridge.setStorageValue(key, "native-predecessor");
+    const a = await bridge.setStorageValueWithCompensation(
+      key,
+      "same-native-bytes",
+    );
+    if (!a) throw new Error("native A write did not return compensation");
+
+    // Renderer B publishes the same bytes as a distinct logical write.
+    await bridge.setStorageValue(key, "same-native-bytes");
+
+    await expect(a.compensate()).resolves.toBe(false);
+    expect(nativeStores.secure.get(kind)).toBe("same-native-bytes");
   });
 
   it("publishes a Steward login only after secure write and exact readback", async () => {
@@ -330,13 +505,10 @@ describe("native protected-storage bridge contract", () => {
     await init;
 
     expect(bridge.isStorageBridgeInitialized()).toBe(false);
-    // Drain the concurrent write's deferred native-persist attempt (scheduled
-    // via `setTimeout`) so it cannot leak a pending timer into the next test.
-    await vi.waitFor(() => {
-      expect(nativeStores.operations).toContain(
-        "set:start:session.device_auth",
-      );
-    });
+    // Drain the concurrent write's deferred attempt. The new transaction reads
+    // its predecessor first and therefore fails before SET while the bridge is
+    // deliberately unavailable.
+    await new Promise((resolve) => setTimeout(resolve, 20));
     expect(rawGetItem("eliza.device.auth")).toBeNull();
     nativeStores.secureAvailable = true;
   });
@@ -362,14 +534,22 @@ describe("native protected-storage bridge contract", () => {
     // chain real time to run (it is only microtasks away from touching the
     // native bridge if nothing queues it) before asserting it stayed queued.
     await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(nativeStores.operations).toEqual(["set:start:session.device_auth"]);
+    expect(nativeStores.operations).toEqual([
+      "get:start:session.device_auth",
+      "get:done:session.device_auth",
+      "set:start:session.device_auth",
+    ]);
 
     releaseFirst();
     await Promise.all([first, second]);
 
     expect(nativeStores.operations).toEqual([
+      "get:start:session.device_auth",
+      "get:done:session.device_auth",
       "set:start:session.device_auth",
       "set:done:session.device_auth",
+      "get:start:session.device_auth",
+      "get:done:session.device_auth",
       "get:start:session.device_auth",
       "get:done:session.device_auth",
       "set:start:session.device_auth",
@@ -625,7 +805,7 @@ describe("native protected-storage bridge contract", () => {
     nativeStores.secureGetHook = (key) => {
       if (key !== "session.steward_token") return;
       stewardGetCount += 1;
-      if (stewardGetCount === 2) {
+      if (stewardGetCount === 3) {
         nativeStores.secure.set(key, "external-newer-token");
       }
     };
@@ -755,12 +935,16 @@ describe("native protected-storage bridge contract", () => {
     releaseSet();
     await Promise.all([write, removal]);
     expect(nativeStores.operations).toEqual([
+      "get:start:session.device_auth",
+      "get:done:session.device_auth",
       "set:start:session.device_auth",
       "set:done:session.device_auth",
       "get:start:session.device_auth",
       "get:done:session.device_auth",
       "delete:start:session.device_auth",
       "delete:done:session.device_auth",
+      "get:start:session.device_auth",
+      "get:done:session.device_auth",
     ]);
     expect(await bridge.getStorageValue("eliza.device.auth")).toBeNull();
   });
@@ -790,6 +974,10 @@ describe("native protected-storage bridge contract", () => {
     expect(nativeStores.operations).toEqual([
       "delete:start:runtime.active_server",
       "delete:done:runtime.active_server",
+      "get:start:runtime.active_server",
+      "get:done:runtime.active_server",
+      "get:start:runtime.active_server",
+      "get:done:runtime.active_server",
       "set:start:runtime.active_server",
       "set:done:runtime.active_server",
       "get:start:runtime.active_server",

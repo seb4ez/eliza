@@ -11,9 +11,14 @@ import {
   DESKTOP_LAUNCHER_WINDOW_PATH,
   type DynamicViewManifest,
   desktopOpenPath,
+  desktopSecureStoreCommitReceipt,
+  desktopSecureStoreCompareAndDelete,
   desktopSecureStoreCompareAndRestore,
+  desktopSecureStoreCompareAndSet,
+  desktopSecureStoreCompensateCommittedReceipt,
   desktopSecureStoreDelete,
   desktopSecureStoreGet,
+  desktopSecureStoreRevision,
   desktopSecureStoreSet,
   desktopShowItemInFolder,
   type ElectrobunMessageListener,
@@ -292,7 +297,23 @@ describe("desktopSecureStore helpers", () => {
     ]);
   });
 
-  it("routes set to secureStoreSet with kind and value", async () => {
+  it("routes a secret-free revision lease check to secureStoreRevision", async () => {
+    const harness = createBridgeHarness();
+    installOnWindow(harness.rpc);
+    harness.handle("secureStoreRevision", () => ({ ok: true, revision: 7 }));
+
+    await expect(
+      desktopSecureStoreRevision("session.device_auth"),
+    ).resolves.toEqual({ ok: true, revision: 7 });
+    expect(harness.calls).toEqual([
+      {
+        method: "secureStoreRevision",
+        params: { kind: "session.device_auth" },
+      },
+    ]);
+  });
+
+  it("routes set to secureStoreSet with one logical mutation id", async () => {
     const harness = createBridgeHarness();
     installOnWindow(harness.rpc);
     harness.handle("secureStoreSet", () => ({
@@ -301,12 +322,20 @@ describe("desktopSecureStore helpers", () => {
     }));
 
     await expect(
-      desktopSecureStoreSet("session.steward_token", "tok"),
+      desktopSecureStoreSet(
+        "session.steward_token",
+        "tok",
+        "renderer-mutation-1",
+      ),
     ).resolves.toEqual({ ok: true, rollbackReceipt: "opaque-receipt" });
     expect(harness.calls).toEqual([
       {
         method: "secureStoreSet",
-        params: { kind: "session.steward_token", value: "tok" },
+        params: {
+          kind: "session.steward_token",
+          mutationId: "renderer-mutation-1",
+          value: "tok",
+        },
       },
     ]);
   });
@@ -323,6 +352,67 @@ describe("desktopSecureStore helpers", () => {
       {
         method: "secureStoreDelete",
         params: { kind: "runtime.agent_profiles" },
+      },
+    ]);
+  });
+
+  it("routes receipt commit as one host request", async () => {
+    const harness = createBridgeHarness();
+    installOnWindow(harness.rpc);
+    harness.handle("secureStoreCommitReceipt", () => ({
+      ok: true,
+      committed: true,
+    }));
+
+    await expect(
+      desktopSecureStoreCommitReceipt(
+        "session.steward_token",
+        "opaque-receipt",
+      ),
+    ).resolves.toEqual({ ok: true, committed: true });
+    expect(harness.calls).toEqual([
+      {
+        method: "secureStoreCommitReceipt",
+        params: {
+          kind: "session.steward_token",
+          rollbackReceipt: "opaque-receipt",
+        },
+      },
+    ]);
+  });
+
+  it("routes committed-receipt compensation with its exact SET revision", async () => {
+    const harness = createBridgeHarness();
+    installOnWindow(harness.rpc);
+    harness.handle("secureStoreCompensateCommittedReceipt", () => ({
+      ok: true,
+      restored: true,
+      changed: true,
+      value: "prior-token",
+      revision: 2,
+    }));
+
+    await expect(
+      desktopSecureStoreCompensateCommittedReceipt(
+        "session.steward_token",
+        "opaque-receipt",
+        1,
+      ),
+    ).resolves.toEqual({
+      ok: true,
+      restored: true,
+      changed: true,
+      value: "prior-token",
+      revision: 2,
+    });
+    expect(harness.calls).toEqual([
+      {
+        method: "secureStoreCompensateCommittedReceipt",
+        params: {
+          kind: "session.steward_token",
+          rollbackReceipt: "opaque-receipt",
+          expectedRevision: 1,
+        },
       },
     ]);
   });
@@ -357,12 +447,88 @@ describe("desktopSecureStore helpers", () => {
     ]);
   });
 
+  it("routes exact CAS delete with its owner mutation id", async () => {
+    const harness = createBridgeHarness();
+    installOnWindow(harness.rpc);
+    harness.handle("secureStoreCompareAndDelete", () => ({
+      ok: true,
+      deleted: true,
+      changed: true,
+      value: null,
+      revision: 8,
+    }));
+
+    await expect(
+      desktopSecureStoreCompareAndDelete(
+        "session.steward_token",
+        "expired-a",
+        7,
+        "delete-a",
+      ),
+    ).resolves.toMatchObject({ ok: true, deleted: true, revision: 8 });
+    expect(harness.calls).toEqual([
+      {
+        method: "secureStoreCompareAndDelete",
+        params: {
+          kind: "session.steward_token",
+          expectedValue: "expired-a",
+          expectedRevision: 7,
+          mutationId: "delete-a",
+        },
+      },
+    ]);
+  });
+
+  it("routes exact CAS transform without exposing its values in events", async () => {
+    const harness = createBridgeHarness();
+    installOnWindow(harness.rpc);
+    harness.handle("secureStoreCompareAndSet", () => ({
+      ok: true,
+      applied: true,
+      changed: true,
+      value: "scrubbed",
+      revision: 12,
+    }));
+
+    await expect(
+      desktopSecureStoreCompareAndSet(
+        "runtime.agent_profiles",
+        "with-token",
+        "scrubbed",
+        11,
+        "scrub-a",
+      ),
+    ).resolves.toMatchObject({ ok: true, applied: true, revision: 12 });
+    expect(harness.calls).toEqual([
+      {
+        method: "secureStoreCompareAndSet",
+        params: {
+          kind: "runtime.agent_profiles",
+          expectedValue: "with-token",
+          value: "scrubbed",
+          expectedRevision: 11,
+          mutationId: "scrub-a",
+        },
+      },
+    ]);
+  });
+
   it("returns null for secure-store helpers when the bridge is missing", async () => {
     await expect(
       desktopSecureStoreGet("session.device_auth"),
     ).resolves.toBeNull();
     await expect(
-      desktopSecureStoreSet("session.device_auth", "x"),
+      desktopSecureStoreSet(
+        "session.device_auth",
+        "x",
+        "renderer-mutation-missing-bridge",
+      ),
+    ).resolves.toBeNull();
+    await expect(
+      desktopSecureStoreCommitReceipt(
+        "session.steward_token",
+        "opaque-receipt",
+      ),
     ).resolves.toBeNull();
     await expect(
       desktopSecureStoreDelete("session.device_auth"),

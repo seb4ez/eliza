@@ -16,6 +16,7 @@ import { MOBILE_RUNTIME_MODE_STORAGE_KEY } from "../first-run/mobile-runtime-mod
 import { shellLocalStorage } from "../surface-realm-channel";
 import { ELIZA_CLOUD_CONTROL_PLANE_HOSTS } from "../utils/cloud-agent-base";
 import {
+  clearSharedOrScrubActiveServerTokenDurably,
   createPersistedActiveServer,
   loadPersistedActiveServer,
   savePersistedActiveServer,
@@ -359,6 +360,44 @@ describe("Cloud active server persistence", () => {
 
   it("scrubbing the token is a safe no-op when nothing is persisted", () => {
     expect(() => scrubPersistedActiveServerToken()).not.toThrow();
+    expect(loadPersistedActiveServer()).toBeNull();
+  });
+
+  it("uses one terminal snapshot to scrub a dedicated active server", async () => {
+    savePersistedActiveServer(
+      createPersistedActiveServer({
+        kind: "cloud",
+        id: "cloud:dedicated-a",
+        label: "Dedicated A",
+        apiBase: "https://dedicated-a.cloud.eliza.app",
+        accessToken: "dedicated-a-token",
+      }),
+    );
+
+    await expect(clearSharedOrScrubActiveServerTokenDurably()).resolves.toBe(
+      true,
+    );
+    expect(loadPersistedActiveServer()).toMatchObject({
+      id: "cloud:dedicated-a",
+      apiBase: "https://dedicated-a.cloud.eliza.app",
+    });
+    expect(loadPersistedActiveServer()?.accessToken).toBeUndefined();
+  });
+
+  it("uses the same terminal snapshot to delete a shared active server", async () => {
+    savePersistedActiveServer(
+      createPersistedActiveServer({
+        kind: "cloud",
+        id: `cloud:${agentId}`,
+        label: "Shared A",
+        apiBase: `https://api.eliza.app/api/v1/eliza/agents/${agentId}`,
+        accessToken: "shared-a-token",
+      }),
+    );
+
+    await expect(clearSharedOrScrubActiveServerTokenDurably()).resolves.toBe(
+      true,
+    );
     expect(loadPersistedActiveServer()).toBeNull();
   });
 

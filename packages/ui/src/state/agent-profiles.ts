@@ -6,7 +6,13 @@
  */
 
 import { logger } from "@elizaos/logger";
-import { setStorageValue } from "../bridge/storage-bridge";
+import {
+  type StorageWriteCompensation,
+  type StorageWriteValidationOptions,
+  setStorageValue,
+  setStorageValueIfCurrent,
+  setStorageValueWithCompensation,
+} from "../bridge/storage-bridge";
 import { shellLocalStorage } from "../surface-realm-channel";
 import { isManagedCloudSharedAgentBase } from "../utils/cloud-agent-base";
 import type { AgentProfile, AgentProfileRegistry } from "./agent-profile-types";
@@ -16,6 +22,16 @@ import {
 } from "./persistence";
 
 export type { AgentProfile, AgentProfileRegistry } from "./agent-profile-types";
+
+export interface AgentProfileConnectionPersistenceOptions
+  extends StorageWriteValidationOptions {
+  /** Final awaited authority step run while both record compensators are live. */
+  finalize?: () => Promise<boolean>;
+  /** Roll back a partially/finally published authority before record rollback. */
+  compensateFinalization?: () => Promise<void>;
+  /** Capture the exact composite compensator after the transaction commits. */
+  captureCompensation?: (compensate: () => Promise<void>) => void;
+}
 
 /* ── Helpers ─────────────────────────────────────────────────────────── */
 
@@ -125,6 +141,29 @@ export function saveAgentProfileRegistry(
   }
 }
 
+/** Await the host-authoritative registry write before reporting success. */
+export async function saveAgentProfileRegistryDurably(
+  registry: AgentProfileRegistry,
+  options: StorageWriteValidationOptions = {},
+): Promise<boolean> {
+  try {
+    return (
+      (await setStorageValueWithCompensation(
+        STORAGE_KEY,
+        JSON.stringify(registry),
+        options,
+      )) !== null
+    );
+  } catch (cause) {
+    // error-policy:J1 security-critical connection mutations treat a rejected
+    // protected write as a transaction failure and publish no live switch.
+    logger.warn(
+      `[agent-profiles] failed to durably save registry: ${describePersistenceError(cause)}`,
+    );
+    return false;
+  }
+}
+
 /**
  * Resolve a free-text switch query (from the AGENT_SWITCH action / `shell:
  * switch-agent` WS event) to a saved profile: exact id, then exact label
@@ -206,6 +245,143 @@ export function persistAgentProfileSelection(
   return false;
 }
 
+/**
+ * Await both records that define a runtime selection. If the boot-authority
+ * write fails after the registry committed, restore the exact registry
+ * predecessor before returning false. This is serialized by each caller's
+ * awaited control flow; cross-renderer ordering remains host-revision fenced.
+ */
+export async function persistAgentProfileSelectionDurably(
+  profileId: string,
+  server: PersistedActiveServer,
+  options: StorageWriteValidationOptions = {},
+): Promise<boolean> {
+  const registry = loadAgentProfileRegistry();
+  if (!registry.profiles.some((profile) => profile.id === profileId)) {
+    return false;
+  }
+  const nextRegistry: AgentProfileRegistry = {
+    ...registry,
+    activeProfileId: profileId,
+  };
+  return persistRegistryAndServerDurably(nextRegistry, server, options);
+}
+
+async function persistRegistryAndServerDurably(
+  registry: AgentProfileRegistry,
+  server: PersistedActiveServer,
+  options: AgentProfileConnectionPersistenceOptions,
+): Promise<boolean> {
+  const registryWrite = await setStorageValueWithCompensation(
+    STORAGE_KEY,
+    JSON.stringify(registry),
+    options,
+  );
+  if (!registryWrite) return false;
+
+  let serverWrite: Awaited<ReturnType<typeof setStorageValueWithCompensation>> =
+    null;
+  try {
+    serverWrite = await setStorageValueWithCompensation(
+      ACTIVE_SERVER_KEY,
+      JSON.stringify(server),
+      options,
+    );
+  } catch (cause) {
+    await compensateStorageWrites(registryWrite);
+    logger.warn(
+      `[agent-profiles] failed to durably save active server: ${describePersistenceError(cause)}`,
+    );
+    return false;
+  }
+  if (!serverWrite) {
+    await compensateStorageWrites(registryWrite);
+    return false;
+  }
+  if (options.validate?.() === false) {
+    await compensateStorageWrites(serverWrite, registryWrite);
+    return false;
+  }
+  let transactionCompensation: Promise<void> | null = null;
+  const compensateTransaction = (): Promise<void> => {
+    transactionCompensation ??= compensateConnectionWrites(
+      options.compensateFinalization,
+      serverWrite,
+      registryWrite,
+    );
+    return transactionCompensation;
+  };
+  if (options.finalize) {
+    let finalized: boolean;
+    try {
+      finalized = await options.finalize();
+    } catch (cause) {
+      try {
+        await compensateTransaction();
+      } catch (rollbackError) {
+        throw new AggregateError(
+          [cause, rollbackError],
+          "Connection finalization and protected-record compensation failed",
+        );
+      }
+      throw cause;
+    }
+    if (!finalized || options.validate?.() === false) {
+      await compensateTransaction();
+      return false;
+    }
+  }
+  options.captureCompensation?.(compensateTransaction);
+  return true;
+}
+
+async function compensateStorageWrites(
+  ...writes: StorageWriteCompensation[]
+): Promise<void> {
+  const outcomes = await Promise.allSettled(
+    writes.map((write) => write.compensate()),
+  );
+  const failures = outcomes.flatMap((outcome) =>
+    outcome.status === "rejected" ? [outcome.reason] : [],
+  );
+  if (failures.length > 0) {
+    throw new AggregateError(
+      failures,
+      "One or more protected connection records could not be compensated",
+    );
+  }
+}
+
+async function compensateConnectionWrites(
+  compensateFinalization: (() => Promise<void>) | undefined,
+  ...writes: StorageWriteCompensation[]
+): Promise<void> {
+  const failures: unknown[] = [];
+  if (compensateFinalization) {
+    try {
+      // Durable token authority must settle before client/boot publication is
+      // changed; the finalizer owns that dependency ordering internally.
+      await compensateFinalization();
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  const outcomes = await Promise.allSettled(
+    writes.map((write) => write.compensate()),
+  );
+  failures.push(
+    ...outcomes.flatMap((outcome) =>
+      outcome.status === "rejected" ? [outcome.reason] : [],
+    ),
+  );
+  if (failures.length > 0) {
+    throw new AggregateError(
+      failures,
+      "Connection finalization and protected-record compensation failed",
+    );
+  }
+}
+
 export function addAgentProfile(
   profile: Omit<AgentProfile, "id" | "createdAt">,
   options: { activate?: boolean; id?: string } = {},
@@ -220,6 +396,26 @@ export function addAgentProfile(
   if (options.activate !== false) registry.activeProfileId = full.id;
   saveAgentProfileRegistry(registry);
   return full;
+}
+
+/** Add a profile only after its protected host write has committed. */
+export async function addAgentProfileDurably(
+  profile: Omit<AgentProfile, "id" | "createdAt">,
+  options: { activate?: boolean; id?: string } = {},
+): Promise<AgentProfile | null> {
+  const registry = loadAgentProfileRegistry();
+  const full: AgentProfile = {
+    ...profile,
+    id: options.id ?? generateId(),
+    createdAt: new Date().toISOString(),
+  };
+  const nextRegistry: AgentProfileRegistry = {
+    ...registry,
+    profiles: [...registry.profiles, full],
+    activeProfileId:
+      options.activate === false ? registry.activeProfileId : full.id,
+  };
+  return (await saveAgentProfileRegistryDurably(nextRegistry)) ? full : null;
 }
 
 /** Trailing-slash-insensitive apiBase compare (both sides may be normalized differently). */
@@ -248,6 +444,46 @@ function sameProfileIdentity(
   return sameApiBase(stored.apiBase, incoming.apiBase);
 }
 
+function upsertAgentProfileRegistry(
+  registry: AgentProfileRegistry,
+  profile: Omit<AgentProfile, "id" | "createdAt">,
+): { profile: AgentProfile; registry: AgentProfileRegistry } {
+  const nextRegistry: AgentProfileRegistry = {
+    ...registry,
+    profiles: [...registry.profiles],
+  };
+  const existingIdx = nextRegistry.profiles.findIndex((stored) =>
+    sameProfileIdentity(stored, profile),
+  );
+  if (existingIdx === -1) {
+    const full: AgentProfile = {
+      ...profile,
+      id: generateId(),
+      createdAt: new Date().toISOString(),
+    };
+    nextRegistry.profiles.push(full);
+    nextRegistry.activeProfileId = full.id;
+    return { profile: full, registry: nextRegistry };
+  }
+  const current = nextRegistry.profiles[existingIdx];
+  const merged: AgentProfile = {
+    ...current,
+    label: profile.label || current.label,
+    ...(profile.cloudAgentId ? { cloudAgentId: profile.cloudAgentId } : {}),
+    ...(profile.cloudRuntimeAgentId
+      ? { cloudRuntimeAgentId: profile.cloudRuntimeAgentId }
+      : {}),
+    ...(profile.cloudRuntime ? { cloudRuntime: profile.cloudRuntime } : {}),
+    ...(profile.apiBase !== undefined ? { apiBase: profile.apiBase } : {}),
+    // A fresh token supersedes a stale one; an absent token leaves the prior in
+    // place (a re-activate that carries no new token must not blank it out).
+    ...(profile.accessToken ? { accessToken: profile.accessToken } : {}),
+  };
+  nextRegistry.profiles[existingIdx] = merged;
+  nextRegistry.activeProfileId = merged.id;
+  return { profile: merged, registry: nextRegistry };
+}
+
 /**
  * Idempotently record + activate a connection in the profile registry so every
  * runtime-switch surface ("My Runtimes", Settings) stays truthful. Bound Cloud
@@ -259,27 +495,43 @@ export function upsertAndActivateAgentProfile(
   profile: Omit<AgentProfile, "id" | "createdAt">,
 ): AgentProfile {
   const registry = loadAgentProfileRegistry();
-  const existingIdx = registry.profiles.findIndex((stored) =>
-    sameProfileIdentity(stored, profile),
-  );
-  if (existingIdx === -1) return addAgentProfile(profile);
-  const merged: AgentProfile = {
-    ...registry.profiles[existingIdx],
-    label: profile.label || registry.profiles[existingIdx].label,
-    ...(profile.cloudAgentId ? { cloudAgentId: profile.cloudAgentId } : {}),
-    ...(profile.cloudRuntimeAgentId
-      ? { cloudRuntimeAgentId: profile.cloudRuntimeAgentId }
-      : {}),
-    ...(profile.cloudRuntime ? { cloudRuntime: profile.cloudRuntime } : {}),
-    ...(profile.apiBase !== undefined ? { apiBase: profile.apiBase } : {}),
-    // A fresh token supersedes a stale one; an absent token leaves the prior in
-    // place (a re-activate that carries no new token must not blank it out).
-    ...(profile.accessToken ? { accessToken: profile.accessToken } : {}),
-  };
-  registry.profiles[existingIdx] = merged;
-  registry.activeProfileId = merged.id;
-  saveAgentProfileRegistry(registry);
-  return merged;
+  const upserted = upsertAgentProfileRegistry(registry, profile);
+  saveAgentProfileRegistry(upserted.registry);
+  return upserted.profile;
+}
+
+/** Persist an upserted profile without publishing an optimistic cache entry. */
+export async function upsertAndActivateAgentProfileDurably(
+  profile: Omit<AgentProfile, "id" | "createdAt">,
+): Promise<AgentProfile | null> {
+  const registry = loadAgentProfileRegistry();
+  const upserted = upsertAgentProfileRegistry(registry, profile);
+  return (await saveAgentProfileRegistryDurably(upserted.registry))
+    ? upserted.profile
+    : null;
+}
+
+/**
+ * Persist an upserted profile and its boot-authoritative active server as one
+ * fail-closed renderer transaction. The previous registry is restored if the
+ * second durable write rejects, and callers receive null so they cannot switch
+ * or publish credentials.
+ */
+export async function persistAgentProfileConnectionDurably(
+  profile: Omit<AgentProfile, "id" | "createdAt">,
+  server: PersistedActiveServer,
+  options: AgentProfileConnectionPersistenceOptions = {},
+): Promise<AgentProfile | null> {
+  if (options.validate?.() === false) return null;
+  const registry = loadAgentProfileRegistry();
+  const upserted = upsertAgentProfileRegistry(registry, profile);
+  return (await persistRegistryAndServerDurably(
+    upserted.registry,
+    server,
+    options,
+  ))
+    ? upserted.profile
+    : null;
 }
 
 /** Preserve a cloud agent's platform identity when a profile becomes active. */
@@ -331,6 +583,92 @@ export async function removeManagedCloudAgentProfilesDurably(): Promise<void> {
   );
 }
 
+/** Remove only shared, account-owned Cloud rows; keep Dedicated/self-hosted rows. */
+export async function removeManagedSharedCloudAgentProfilesDurably(
+  options: StorageWriteValidationOptions = {},
+): Promise<boolean> {
+  if (options.validate?.() === false || typeof localStorage === "undefined") {
+    return false;
+  }
+  const raw = localStorage.getItem(STORAGE_KEY);
+  if (!raw) return false;
+  let registry: AgentProfileRegistry;
+  try {
+    registry = JSON.parse(raw) as AgentProfileRegistry;
+  } catch {
+    return false;
+  }
+  if (registry?.version !== 1 || !Array.isArray(registry.profiles)) {
+    return false;
+  }
+  const profiles = registry.profiles.filter(
+    (profile) => !isManagedCloudSharedAgentBase(profile.apiBase),
+  );
+  if (profiles.length === registry.profiles.length) return false;
+  const activeStillPresent = profiles.some(
+    (profile) => profile.id === registry.activeProfileId,
+  );
+  return setStorageValueIfCurrent(
+    STORAGE_KEY,
+    raw,
+    JSON.stringify({
+      version: 1,
+      activeProfileId: activeStillPresent ? registry.activeProfileId : null,
+      profiles,
+    } satisfies AgentProfileRegistry),
+    { ...options, compensateOnValidationFailure: false },
+  );
+}
+
+/**
+ * One exact terminal transform for account teardown: remove shared-managed A
+ * rows and scrub bearer copies on every retained dedicated/self-hosted row.
+ * Combining both operations prevents a second read from ever targeting B.
+ */
+export async function clearManagedSharedCloudProfilesAndTokensDurably(
+  options: StorageWriteValidationOptions = {},
+): Promise<boolean> {
+  if (options.validate?.() === false || typeof localStorage === "undefined") {
+    return false;
+  }
+  const raw = localStorage.getItem(STORAGE_KEY);
+  if (!raw) return false;
+  let registry: AgentProfileRegistry;
+  try {
+    registry = JSON.parse(raw) as AgentProfileRegistry;
+  } catch {
+    return false;
+  }
+  if (registry?.version !== 1 || !Array.isArray(registry.profiles)) {
+    return false;
+  }
+  let changed = false;
+  const profiles = registry.profiles.flatMap((profile) => {
+    if (isManagedCloudSharedAgentBase(profile.apiBase)) {
+      changed = true;
+      return [];
+    }
+    if (!profile.accessToken) return [profile];
+    changed = true;
+    const { accessToken: _accessToken, ...scrubbed } = profile;
+    return [scrubbed];
+  });
+  if (!changed) return false;
+  const activeStillPresent = profiles.some(
+    (profile) => profile.id === registry.activeProfileId,
+  );
+  return setStorageValueIfCurrent(
+    STORAGE_KEY,
+    raw,
+    JSON.stringify({
+      version: 1,
+      activeProfileId: activeStillPresent ? registry.activeProfileId : null,
+      profiles,
+    } satisfies AgentProfileRegistry),
+    { ...options, compensateOnValidationFailure: false },
+  );
+}
+
 export function removeAgentProfile(id: string): void {
   const registry = loadAgentProfileRegistry();
   registry.profiles = registry.profiles.filter((p) => p.id !== id);
@@ -357,6 +695,39 @@ export function scrubPersistedAgentProfileTokens(): void {
     return rest;
   });
   if (changed) saveAgentProfileRegistry(registry);
+}
+
+/** Remove persisted profile bearers while retaining every runtime selection. */
+export async function scrubPersistedAgentProfileTokensDurably(
+  options: StorageWriteValidationOptions = {},
+): Promise<boolean> {
+  if (options.validate?.() === false) return false;
+  if (typeof localStorage === "undefined") return false;
+  const raw = localStorage.getItem(STORAGE_KEY);
+  if (!raw) return false;
+  let registry: AgentProfileRegistry;
+  try {
+    registry = JSON.parse(raw) as AgentProfileRegistry;
+  } catch {
+    return false;
+  }
+  if (registry?.version !== 1 || !Array.isArray(registry.profiles)) {
+    return false;
+  }
+  let changed = false;
+  const profiles = registry.profiles.map((profile) => {
+    if (!profile.accessToken) return profile;
+    changed = true;
+    const { accessToken: _accessToken, ...rest } = profile;
+    return rest;
+  });
+  if (!changed) return false;
+  return setStorageValueIfCurrent(
+    STORAGE_KEY,
+    raw,
+    JSON.stringify({ ...registry, profiles }),
+    { ...options, compensateOnValidationFailure: false },
+  );
 }
 
 export function updateAgentProfile(

@@ -506,19 +506,45 @@ export type RendererSecureStoreKind =
   | "runtime.agent_profiles";
 
 export type RendererSecureStoreResult =
-  | { ok: true; value?: string; deleted?: boolean }
+  | { ok: true; value?: string; deleted?: boolean; revision?: number }
   | {
       ok: false;
       reason: "not_found" | "denied" | "unavailable" | "error";
       message?: string;
+      changed?: boolean;
+      revision?: number;
     };
 
 export type RendererSecureStoreSetResult =
-  | { ok: true; rollbackReceipt: string }
+  | {
+      ok: true;
+      rollbackReceipt: string;
+      /** False only when this response replays an already-applied mutation. */
+      changed?: boolean;
+      revision?: number;
+    }
   | {
       ok: false;
       reason: "not_found" | "denied" | "unavailable" | "error";
       message?: string;
+      /**
+       * Present only when the backend write outcome could not be read back.
+       * The renderer must reconcile this exact receipt before surfacing the
+       * failure so a mutate-then-error backend cannot leave a latent secret.
+       */
+      rollbackReceipt?: string;
+      /** False only when no new host mutation was attempted by this call. */
+      changed?: boolean;
+      revision?: number;
+    };
+
+export type RendererSecureStoreCommitReceiptResult =
+  | { ok: true; committed: boolean; revision?: number }
+  | {
+      ok: false;
+      reason: "not_found" | "denied" | "unavailable" | "error";
+      message?: string;
+      revision?: number;
     };
 
 export type RendererSecureStoreCompareAndRestoreResult =
@@ -526,12 +552,69 @@ export type RendererSecureStoreCompareAndRestoreResult =
       ok: true;
       restored: boolean;
       value: string | null;
+      revision?: number;
     }
   | {
       ok: false;
       reason: "not_found" | "denied" | "unavailable" | "error";
       message?: string;
+      revision?: number;
     };
+
+export type RendererSecureStoreCompensateCommittedReceiptResult =
+  | {
+      ok: true;
+      restored: boolean;
+      /** True only for the first host call that changed the durable value. */
+      changed: boolean;
+      value: string | null;
+      revision?: number;
+    }
+  | {
+      ok: false;
+      reason: "not_found" | "denied" | "unavailable" | "error";
+      message?: string;
+      revision?: number;
+    };
+
+export type RendererSecureStoreCompareAndDeleteResult =
+  | {
+      ok: true;
+      deleted: boolean;
+      changed: boolean;
+      value: string | null;
+      revision?: number;
+    }
+  | {
+      ok: false;
+      reason: "not_found" | "denied" | "unavailable" | "error";
+      message?: string;
+      /** False only when this response replays an already-journaled attempt. */
+      changed?: boolean;
+      revision?: number;
+    };
+
+export type RendererSecureStoreCompareAndSetResult =
+  | {
+      ok: true;
+      applied: boolean;
+      changed: boolean;
+      value: string | null;
+      revision?: number;
+    }
+  | {
+      ok: false;
+      reason: "not_found" | "denied" | "unavailable" | "error";
+      message?: string;
+      /** False only when this response replays an already-journaled attempt. */
+      changed?: boolean;
+      revision?: number;
+    };
+
+export interface RendererSecureStoreChangedEvent {
+  kind: RendererSecureStoreKind;
+  revision: number;
+}
 
 export interface RendererSecureStoreStatus {
   backend:
@@ -2199,13 +2282,55 @@ export type ElizaDesktopRPCSchema = {
         params: { kind: RendererSecureStoreKind };
         response: RendererSecureStoreResult;
       };
+      secureStoreRevision: {
+        params: { kind: RendererSecureStoreKind };
+        response: { ok: true; revision: number };
+      };
       secureStoreSet: {
-        params: { kind: RendererSecureStoreKind; value: string };
+        params: {
+          kind: RendererSecureStoreKind;
+          value: string;
+          mutationId: string;
+        };
         response: RendererSecureStoreSetResult;
+      };
+      secureStoreCommitReceipt: {
+        params: {
+          kind: RendererSecureStoreKind;
+          rollbackReceipt: string;
+        };
+        response: RendererSecureStoreCommitReceiptResult;
+      };
+      secureStoreCompensateCommittedReceipt: {
+        params: {
+          kind: RendererSecureStoreKind;
+          rollbackReceipt: string;
+          expectedRevision: number;
+        };
+        response: RendererSecureStoreCompensateCommittedReceiptResult;
       };
       secureStoreDelete: {
         params: { kind: RendererSecureStoreKind };
         response: RendererSecureStoreResult;
+      };
+      secureStoreCompareAndDelete: {
+        params: {
+          kind: RendererSecureStoreKind;
+          expectedValue: string | null;
+          expectedRevision: number;
+          mutationId: string;
+        };
+        response: RendererSecureStoreCompareAndDeleteResult;
+      };
+      secureStoreCompareAndSet: {
+        params: {
+          kind: RendererSecureStoreKind;
+          expectedValue: string;
+          value: string;
+          expectedRevision: number;
+          mutationId: string;
+        };
+        response: RendererSecureStoreCompareAndSetResult;
       };
       secureStoreCompareAndRestore: {
         params: {
@@ -2615,6 +2740,10 @@ export type ElizaDesktopRPCSchema = {
     };
     messages: {
       // Push events FROM bun TO webview
+
+      // Host-authoritative credential-cache invalidation. Values never cross
+      // this channel; each renderer re-reads through secureStoreGet.
+      secureStoreChanged: RendererSecureStoreChangedEvent;
 
       // Main-authoritative shell controller state, command, delivery, and ping.
       shellControllerAuthorityState: ShellAuthorityState;
@@ -3056,8 +3185,14 @@ export const CHANNEL_TO_RPC_METHOD: Record<string, string> = {
   "credentials:scanProviders": "credentialsScanProviders",
   "credentials:scanAndValidate": "credentialsScanAndValidate",
   "secureStore:get": "secureStoreGet",
+  "secureStore:revision": "secureStoreRevision",
   "secureStore:set": "secureStoreSet",
+  "secureStore:commitReceipt": "secureStoreCommitReceipt",
+  "secureStore:compensateCommittedReceipt":
+    "secureStoreCompensateCommittedReceipt",
   "secureStore:delete": "secureStoreDelete",
+  "secureStore:compareAndDelete": "secureStoreCompareAndDelete",
+  "secureStore:compareAndSet": "secureStoreCompareAndSet",
   "secureStore:compareAndRestore": "secureStoreCompareAndRestore",
   "secureStore:status": "secureStoreStatus",
   "runtimeCredential:store": "runtimeCredentialStore",

@@ -26,14 +26,13 @@ import { isMobileLocalAgentIpcUrl } from "../first-run/mobile-runtime-mode";
 import { isAndroidLocalSideloadBuild } from "../platform/android-runtime";
 import {
   loadAgentProfileRegistry,
+  persistAgentProfileConnectionDurably,
   saveAgentProfileRegistry,
-  upsertAndActivateAgentProfile,
 } from "../state/agent-profiles";
 import {
   clearPersistedActiveServer,
   createPersistedActiveServer,
   loadPersistedActiveServer,
-  savePersistedActiveServer,
 } from "../state/persistence";
 import {
   getBuildConfiguredRemoteApiBaseUrl,
@@ -864,6 +863,13 @@ function sleepUnlessAborted(
 // Client
 // ---------------------------------------------------------------------------
 
+/** Opaque authority for one staged, revision-fenced client target pair. */
+export interface SessionTargetAuthority {
+  publish(): boolean;
+  restoreIfCurrent(): boolean;
+  clearIfCurrent(): boolean;
+}
+
 export class ElizaClient {
   private _baseUrl: string;
   private _userSetBase: boolean;
@@ -1064,6 +1070,11 @@ export class ElizaClient {
       return;
     }
     this.installToken(token, true);
+  }
+
+  /** Clear the request bearer without publishing a session-sync event. */
+  clearTokenSilently(): void {
+    this.installToken(null, false);
   }
 
   /** A pinned build accepts a bearer only after durable exact-origin binding. */
@@ -1271,14 +1282,18 @@ export class ElizaClient {
    * The "invisible" wins (no `disconnected` flap, no `StartupScreen`, no draft
    * clear) hold independent of whether a socket is involved.
    */
-  repointBaseUrl(baseUrl: string, token?: string | null): void {
+  repointBaseUrl(
+    baseUrl: string,
+    token?: string | null,
+    options: { persist?: boolean; notify?: boolean } = {},
+  ): boolean {
     const normalized = normalizeBaseUrl(baseUrl);
-    if (!normalized) return;
+    if (!normalized) return false;
     if (this.pinnedRemoteApiBase && normalized !== this.pinnedRemoteApiBase) {
       logger.warn(
         "[ElizaClient] ignored a repoint outside the build-pinned remote target",
       );
-      return;
+      return false;
     }
     if (
       this.pinnedRemoteApiBase &&
@@ -1288,8 +1303,24 @@ export class ElizaClient {
       logger.warn(
         "[ElizaClient] ignored a repoint credential not bound to the build-pinned remote target",
       );
-      return;
+      return false;
     }
+    const previousAuthorityRevision = this.authorityRevision;
+    this.prepareRepointedAuthority();
+    const installsToken = token !== undefined;
+    if (installsToken) this.installToken(token ?? null, false);
+    this._userSetBase = normalized.length > 0;
+    this._baseUrl = normalized;
+    if (options.persist !== false) this.persistBaseUrlFailClosed(normalized);
+    // Every logical target install owns one epoch, including same-value ABA.
+    this.authorityRevision = previousAuthorityRevision + 1;
+    if (options.notify === false) return true;
+    this.publishRepointedAuthority(installsToken);
+    return true;
+  }
+
+  /** Drop transport state before silently replacing a complete authority pair. */
+  private prepareRepointedAuthority(): void {
     // Quietly drop the old socket. We intentionally do NOT call disconnectWs():
     // it sets connectionState = "disconnected" and emits, which would surface a
     // visible "reconnecting" flicker mid-handoff. Suppress onclose (which would
@@ -1315,28 +1346,164 @@ export class ElizaClient {
     // offline buffering, not cross-host carry-over.
     this.wsSendQueue = [];
     this.wsEventBacklog.clear();
+  }
 
-    const installsToken = token !== undefined;
-    if (installsToken) this.installToken(token ?? null, false);
-    this._userSetBase = normalized.length > 0;
-    this._baseUrl = normalized;
-    this.persistBaseUrlFailClosed(normalized);
+  /** Publish a pair already staged by repointBaseUrl without another mutation. */
+  private publishRepointedAuthority(installsToken: boolean): void {
     this.notifyBaseUrlChange();
     // Publish the complete target only after both bearer and base URL have
     // been installed, so resource consumers never observe a mixed authority.
     this.notifyAuthorityChange();
 
-    // Reconnect immediately against the new base. connectWs() derives the WS
-    // host from this.baseUrl, so the socket comes up on the dedicated host; its
-    // onopen fires `ws-reconnected` (this.wsHasConnectedOnce is already true),
-    // re-hydrating live state without a reload.
+    this.reconnectRepointedAuthority();
+    if (installsToken && typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("steward-token-sync"));
+    }
+  }
+
+  /** Reconnect a silently staged/restored pair without exposing a mixed pair. */
+  private reconnectRepointedAuthority(): void {
     this.backoffMs = 500;
     this.reconnectAttempt = 0;
     this.disconnectedAt = null;
     this.connectWs();
-    if (installsToken && typeof window !== "undefined") {
-      window.dispatchEvent(new CustomEvent("steward-token-sync"));
+  }
+
+  /**
+   * Stage a coherent base+token pair without notifying observers. The caller
+   * retires its external recovery receipt, then calls `publish()` synchronously;
+   * any failure can restore the predecessor without ever exposing the pair.
+   */
+  stageSessionTarget(
+    target: {
+      baseUrl: string;
+      token: string;
+    },
+    options: { persist?: boolean } = {},
+  ): SessionTargetAuthority | null {
+    const normalizedBase = normalizeBaseUrl(target.baseUrl);
+    const normalizedToken = target.token.trim();
+    if (!normalizedBase || !normalizedToken) return null;
+
+    const previousBase = this.getBaseUrl();
+    const previousToken = this.getRestAuthToken();
+    const previousInstalledToken = this._token;
+    const previousBootToken = getBootConfig().apiToken;
+    const previousStoredBase = this._baseUrl;
+    const previousUserSetBase = this._userSetBase;
+    const previousRevision = this.authorityRevision;
+    if (
+      !this.repointBaseUrl(normalizedBase, normalizedToken, {
+        persist: options.persist,
+        notify: false,
+      })
+    ) {
+      return null;
     }
+    const installedRevision = this.authorityRevision;
+    if (
+      installedRevision !== previousRevision + 1 ||
+      this.getBaseUrl() !== normalizedBase ||
+      this.getRestAuthToken() !== normalizedToken
+    ) {
+      return null;
+    }
+
+    let live = true;
+    let published = false;
+    const consumeIfCurrent = (): boolean => {
+      if (!live) return false;
+      if (
+        this.authorityRevision !== installedRevision ||
+        this.getBaseUrl() !== normalizedBase ||
+        this.getRestAuthToken() !== normalizedToken
+      ) {
+        live = false;
+        return false;
+      }
+      live = false;
+      return true;
+    };
+    return {
+      publish: () => {
+        if (!live) return false;
+        if (published) return true;
+        if (
+          this.authorityRevision !== installedRevision ||
+          this.getBaseUrl() !== normalizedBase ||
+          this.getRestAuthToken() !== normalizedToken
+        ) {
+          live = false;
+          return false;
+        }
+        published = true;
+        this.publishRepointedAuthority(true);
+        return true;
+      },
+      restoreIfCurrent: () => {
+        if (!consumeIfCurrent()) return false;
+        const restoredRevision = this.authorityRevision + 1;
+        this.prepareRepointedAuthority();
+        this._token = previousInstalledToken;
+        const currentBootConfig = getBootConfig();
+        setBootConfig({
+          ...currentBootConfig,
+          apiToken: previousBootToken,
+        });
+        this._userSetBase = previousUserSetBase;
+        this._baseUrl = previousStoredBase;
+        if (options.persist !== false) {
+          this.persistBaseUrlFailClosed(previousBase);
+        }
+        this.authorityRevision = restoredRevision;
+        if (published) this.publishRepointedAuthority(true);
+        else this.reconnectRepointedAuthority();
+        return (
+          this.getBaseUrl() === previousBase &&
+          this.getRestAuthToken() === previousToken
+        );
+      },
+      clearIfCurrent: () => {
+        if (!consumeIfCurrent()) return false;
+        if (
+          !this.repointBaseUrl(normalizedBase, null, {
+            persist: options.persist,
+            notify: published,
+          })
+        ) {
+          return false;
+        }
+        if (!published) this.reconnectRepointedAuthority();
+        return (
+          this.getBaseUrl() === normalizedBase &&
+          this.getRestAuthToken() === null
+        );
+      },
+    };
+  }
+
+  /**
+   * Convenience wrapper for ordinary callers that do not own an external
+   * receipt: stage, run a synchronous finalizer, then publish the pair.
+   */
+  installSessionTarget(
+    target: { baseUrl: string; token: string },
+    options: {
+      persist?: boolean;
+      finalizeBeforePublish?: () => void;
+    } = {},
+  ): SessionTargetAuthority | null {
+    const authority = this.stageSessionTarget(target, options);
+    if (!authority) return null;
+    try {
+      options.finalizeBeforePublish?.();
+    } catch (error) {
+      authority.restoreIfCurrent();
+      throw error;
+    }
+    if (authority.publish()) return authority;
+    authority.restoreIfCurrent();
+    return null;
   }
 
   /** True when we have a usable HTTP(S) API endpoint. */
@@ -1460,20 +1627,24 @@ export class ElizaClient {
           cloudRuntimeAgentId: resolved.activeAgentId,
           cloudRuntime: "dedicated",
         });
-        if (!savePersistedActiveServer(server)) {
+        const persistedProfile = await persistAgentProfileConnectionDurably(
+          {
+            kind: "cloud",
+            label: server.label,
+            cloudAgentId: personalElizaId,
+            cloudRuntimeAgentId: resolved.activeAgentId,
+            cloudRuntime: "dedicated",
+            apiBase: resolved.apiBase,
+            accessToken: authToken,
+          },
+          server,
+        );
+        if (!persistedProfile) {
           logger.warn(
             "[ElizaClient] Dedicated runtime resolved but active-server persistence was unavailable",
           );
+          return false;
         }
-        upsertAndActivateAgentProfile({
-          kind: "cloud",
-          label: server.label,
-          cloudAgentId: personalElizaId,
-          cloudRuntimeAgentId: resolved.activeAgentId,
-          cloudRuntime: "dedicated",
-          apiBase: resolved.apiBase,
-          accessToken: authToken,
-        });
 
         if (normalizeBaseUrl(this.baseUrl) !== normalizedRequestBase) {
           return isDedicatedCloudAgentBase(this.baseUrl);
