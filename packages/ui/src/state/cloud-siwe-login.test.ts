@@ -45,8 +45,25 @@ vi.mock("@elizaos/logger", () => ({
 }));
 
 vi.mock("@elizaos/shared/steward-session-client", () => ({
-  writeStoredStewardToken: (token: string) => {
+  writeStoredStewardToken: async (
+    token: string,
+    options?: {
+      validate?: () => boolean;
+      commitBeforePublish?: () => boolean;
+    },
+  ) => {
+    if (options?.validate?.() === false) return null;
+    const predecessor = window.localStorage.getItem("steward_session_token");
     window.localStorage.setItem("steward_session_token", token);
+    if (options?.commitBeforePublish?.() === false) {
+      if (predecessor === null) {
+        window.localStorage.removeItem("steward_session_token");
+      } else {
+        window.localStorage.setItem("steward_session_token", predecessor);
+      }
+      return null;
+    }
+    return { rollback: async () => true };
   },
 }));
 
@@ -252,7 +269,15 @@ describe("e2e wallet + SIWE login", () => {
     await installE2eWalletIfRequested();
     const { calls, verified } = mockFetch();
     const tokenSync = vi.fn();
-    window.addEventListener("steward-token-sync", tokenSync, { once: true });
+    let receiptsObservedAtPublication: readonly string[] | null = null;
+    window.addEventListener(
+      "steward-token-sync",
+      () => {
+        receiptsObservedAtPublication = recoverySnapshot().receipts;
+        tokenSync();
+      },
+      { once: true },
+    );
 
     const apiKey = await siweLoginWithInjectedWallet("https://api.test/");
     expect(apiKey).toBe("eliza_test_api_key");
@@ -260,6 +285,7 @@ describe("e2e wallet + SIWE login", () => {
       "eliza_test_api_key",
     );
     expect(tokenSync).toHaveBeenCalledTimes(1);
+    expect(receiptsObservedAtPublication).toEqual([]);
     expect(recoverySnapshot().receipts).toEqual([]);
 
     // The nonce request binds the wallet's ACTUAL connected chain (#18458):

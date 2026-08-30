@@ -31,7 +31,7 @@ import { writeStoredStewardToken } from "@elizaos/shared/steward-session-client"
 import { enqueueStewardSessionMutation } from "../cloud/lib/steward-session-mutation-queue";
 import {
   beginStewardSessionRecovery,
-  completeStewardSessionRecovery,
+  commitStewardSessionRecoveryForPublication,
   isStewardSessionRecoveryReceiptLive,
   rejectStewardSessionRecovery,
   type StewardSessionRecoveryReceipt,
@@ -401,10 +401,13 @@ async function siweLoginWithInjectedWalletAttempt(
     }
     if (!isStewardSessionRecoveryReceiptLive(recovery)) return null;
 
-    await writeStoredStewardToken(verified.apiKey);
-    if (!isStewardSessionRecoveryReceiptLive(recovery)) return null;
+    const tokenAuthority = await writeStoredStewardToken(verified.apiKey, {
+      validate: () => isStewardSessionRecoveryReceiptLive(recovery),
+      commitBeforePublish: () =>
+        commitStewardSessionRecoveryForPublication(recovery),
+    });
+    if (!tokenAuthority) return null;
     window.dispatchEvent(new CustomEvent("steward-token-sync"));
-    completeStewardSessionRecovery(recovery);
     return verified.apiKey;
   });
   if (!apiKey) return null;
