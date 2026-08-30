@@ -20,9 +20,18 @@ const iosBoot = vi.hoisted(() => ({
   render: vi.fn(),
   createRoot: vi.fn(),
   runEmbedHandshake: vi.fn(async () => undefined),
+  applyLaunchConnection: vi.fn(
+    async (connection: { apiBase: string; token?: string | null }) => ({
+      apiBase: connection.apiBase.replace(/\/+$/, ""),
+      token: connection.token?.trim() || null,
+    }),
+  ),
+  applyLaunchConnectionFromUrl: vi.fn(async () => false),
   registerServiceWorker: vi.fn(),
   lifecycleDependencies: undefined as
-    | { handleDeepLink: (url: string) => void }
+    | {
+        handleDeepLink: (url: string) => undefined | Promise<boolean>;
+      }
     | undefined,
   initializeDeepLinks: vi.fn(),
   initializeAppLifecycle: vi.fn(),
@@ -44,6 +53,10 @@ vi.mock("@elizaos/ui/bridge/storage-bridge", () => ({
 }));
 vi.mock("@elizaos/ui/bridge/capacitor-bridge", () => ({
   initializeCapacitorBridge: iosBoot.initializeCapacitor,
+}));
+vi.mock("@elizaos/ui/platform/browser-launch", () => ({
+  applyLaunchConnection: iosBoot.applyLaunchConnection,
+  applyLaunchConnectionFromUrl: iosBoot.applyLaunchConnectionFromUrl,
 }));
 vi.mock("@elizaos/app-core/api/ios-local-agent-transport", () => ({
   installIosLocalAgentNativeRequestBridge: iosBoot.installNativeRequest,
@@ -81,7 +94,9 @@ vi.mock("@elizaos/capacitor-agent", () => ({
 }));
 vi.mock("./mobile-lifecycle", () => ({
   createMobileLifecycle: vi.fn(
-    (dependencies: { handleDeepLink: (url: string) => void }) => {
+    (dependencies: {
+      handleDeepLink: (url: string) => undefined | Promise<boolean>;
+    }) => {
       iosBoot.lifecycleDependencies = dependencies;
       return {
         initializeDeepLinks: iosBoot.initializeDeepLinks,
@@ -186,7 +201,16 @@ describe("renderer interactive iOS composition", () => {
       "elizaos://auth/callback?state=smoke&code=synthetic",
       "elizaos://unknown-path",
     ]) {
-      handleDeepLink?.(url);
+      const result = handleDeepLink?.(url);
+      if (url === "elizaos://settings") {
+        // The mocked App renders no navigation-intent listener, so this one
+        // promise intentionally remains queued for the real shell. Capture a
+        // potential rejection without blocking the rest of the composition
+        // contract; connect/auth promises below are awaited normally.
+        void result?.catch(() => undefined);
+      } else {
+        await result;
+      }
     }
 
     await vi.waitFor(() =>

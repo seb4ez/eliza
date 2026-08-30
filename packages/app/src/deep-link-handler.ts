@@ -77,7 +77,7 @@ export function isTrustedAppLink(
 }
 
 export function createDeepLinkHandler(ctx: DeepLinkHandlerContext) {
-  function handle(url: string): void {
+  function handle(url: string): void | Promise<void> {
     if (routeFirstRunDeepLink(url, ctx.urlScheme)) {
       return;
     }
@@ -152,8 +152,7 @@ export function createDeepLinkHandler(ctx: DeepLinkHandlerContext) {
         }
         break;
       case "connect":
-        handleConnect(parsed);
-        break;
+        return handleConnect(parsed);
       case "share":
         handleShare(parsed.searchParams);
         break;
@@ -163,7 +162,7 @@ export function createDeepLinkHandler(ctx: DeepLinkHandlerContext) {
     }
   }
 
-  function handleConnect(parsed: URL): void {
+  function handleConnect(parsed: URL): void | Promise<void> {
     const gatewayUrl = parsed.searchParams.get("url");
     if (!gatewayUrl) return;
     let validatedUrl: URL;
@@ -198,7 +197,14 @@ export function createDeepLinkHandler(ctx: DeepLinkHandlerContext) {
     // way — remote auth goes through the cloudLaunchSession exchange
     // (applyLaunchConnectionFromUrl already refuses raw `token` params). The
     // host repoint is preserved for the legitimate local-agent connect feature.
-    const connection = applyLaunchConnection({
+    return applyRemoteConnection(validatedUrl);
+  }
+
+  async function applyRemoteConnection(validatedUrl: URL): Promise<void> {
+    // Do not publish CONNECT_EVENT until the registry + active-server
+    // transaction has durably committed and the live client target has been
+    // fenced/published by applyLaunchConnection.
+    const connection = await applyLaunchConnection({
       kind: "remote",
       apiBase: validatedUrl.href,
       token: null,

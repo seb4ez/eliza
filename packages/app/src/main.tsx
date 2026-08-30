@@ -80,10 +80,7 @@ import {
   subscribeDesktopBridgeEvent,
 } from "@elizaos/ui/bridge";
 import { initializeCapacitorBridge } from "@elizaos/ui/bridge/capacitor-bridge";
-import {
-  initializeStorageBridge,
-  setStorageValue,
-} from "@elizaos/ui/bridge/storage-bridge";
+import { initializeStorageBridge } from "@elizaos/ui/bridge/storage-bridge";
 import { RenderTelemetryProfiler } from "@elizaos/ui/cloud-ui/runtime/render-telemetry";
 import { ShellModalityProvider } from "@elizaos/ui/components/ShellModalityProvider";
 import { ShellRoleProvider } from "@elizaos/ui/components/ShellRoleProvider";
@@ -1699,7 +1696,10 @@ async function runIosOnboardingSmokeIfRequested(): Promise<boolean> {
     // same hardened remote-connect handler that the OS deep-link route uses,
     // after React has had a chance to install its CONNECT_EVENT listener.
     await new Promise((resolve) => window.setTimeout(resolve, 750));
-    connectFirstRunRemoteDeepLink(request.apiBase);
+    const connected = await connectFirstRunRemoteDeepLink(request.apiBase);
+    if (connected !== true) {
+      throw new Error("The first-run remote URL was rejected");
+    }
 
     // Prove the post-connect surface, decoupled from the onboarding DOM — no
     // remote-address field to fill, resilient to the in-chat redesign.
@@ -2029,7 +2029,9 @@ const APP_LINK_HOSTS = ["eliza.app"];
 // remote and lands on home. Routed through the same hardened CONNECT_EVENT path
 // as `<scheme>://connect?url=` (trust-policy gated, token never accepted from a
 // deep link) but with `completeFirstRun` so it also finishes onboarding.
-function connectFirstRunRemoteDeepLink(rawApiBase: string): void {
+function connectFirstRunRemoteDeepLink(
+  rawApiBase: string,
+): undefined | Promise<boolean> {
   let validatedUrl: URL;
   try {
     validatedUrl = new URL(rawApiBase);
@@ -2055,32 +2057,34 @@ function connectFirstRunRemoteDeepLink(rawApiBase: string): void {
   // SECURITY: never accept a bearer token from an OS-delivered deep link (see
   // the `connect` case below). A pairing-disabled remote that needs a token is
   // connected via the trusted in-app Settings entry instead.
-  const connection = applyLaunchConnection({
+  return applyRemoteDeepLinkConnection(validatedUrl, true);
+}
+
+async function applyRemoteDeepLinkConnection(
+  validatedUrl: URL,
+  completeFirstRun: boolean,
+): Promise<boolean> {
+  // applyLaunchConnection owns the durable registry + active-server
+  // transaction and only publishes the live client target after both writes
+  // commit. Dispatching earlier lets consumers race ahead on a target that a
+  // reload cannot restore.
+  const connection = await applyLaunchConnection({
     kind: "remote",
     apiBase: validatedUrl.href,
     token: null,
   });
-  const dispatchConnect = () => {
+  if (completeFirstRun) {
     dispatchConnectRequest({
       gatewayUrl: connection.apiBase,
       completeFirstRun: true,
     });
-  };
-  const activeServer = JSON.stringify({
-    id: `remote:${connection.apiBase}`,
-    kind: "remote",
-    label: validatedUrl.hostname || "Remote agent",
-    apiBase: connection.apiBase,
-  });
-  // error-policy:J6 best-effort persist — the connect below still lands;
-  // only re-selection after restart is lost, and the failure is logged
-  void setStorageValue("elizaos:active-server", activeServer).catch((error) => {
-    console.warn(
-      `${APP_LOG_PREFIX} Failed to persist first-run remote active server:`,
-      error,
-    );
-  });
-  dispatchConnect();
+  } else {
+    dispatchConnectRequest({
+      gatewayUrl: connection.apiBase,
+      token: connection.token ?? undefined,
+    });
+  }
+  return true;
 }
 
 async function recordIosAuthCallbackSmoke(
@@ -2226,11 +2230,10 @@ async function handleAuthCallbackDeepLink(
 }
 
 /**
- * Returns `void` for every branch except the top-level-surface navigation
- * intent, which returns the `dispatchNavigateViewRequest` promise so a caller
- * that needs to know the intent actually LANDED (not merely enqueued) — today
- * `mobile-lifecycle.ts`, gating its Android deep-link-buffer acknowledgement —
- * can await it instead of acking on dispatch alone.
+ * Returns `void` for routes completed synchronously. Top-level navigation and
+ * remote-connect routes return a promise so `mobile-lifecycle.ts` only
+ * acknowledges Android's deep-link buffer once the navigation has landed or
+ * the durable runtime-connection transaction has committed.
  */
 function handleDeepLink(url: string): undefined | Promise<boolean> {
   const remotePairing = parseRemoteControllerPairingDeepLink(
@@ -2266,8 +2269,7 @@ function handleDeepLink(url: string): undefined | Promise<boolean> {
     APP_URL_SCHEME,
   );
   if (firstRunRemote) {
-    connectFirstRunRemoteDeepLink(firstRunRemote.apiBase);
-    return;
+    return connectFirstRunRemoteDeepLink(firstRunRemote.apiBase);
   }
   if (routeFirstRunDeepLink(url, APP_URL_SCHEME)) {
     return;
@@ -2302,7 +2304,7 @@ function handleDeepLink(url: string): undefined | Promise<boolean> {
       parsed.searchParams.get("url")?.trim() ||
       parsed.searchParams.get("host")?.trim();
     if (rawApiBase) {
-      connectFirstRunRemoteDeepLink(rawApiBase);
+      return connectFirstRunRemoteDeepLink(rawApiBase);
     }
     return;
   }
@@ -2391,15 +2393,7 @@ function handleDeepLink(url: string): undefined | Promise<boolean> {
           // legitimate flow passes a token this way — remote auth goes through
           // the cloudLaunchSession exchange. The host repoint is preserved for
           // the legitimate local-agent connect feature.
-          const connection = applyLaunchConnection({
-            kind: "remote",
-            apiBase: validatedUrl.href,
-            token: null,
-          });
-          dispatchConnectRequest({
-            gatewayUrl: connection.apiBase,
-            token: connection.token ?? undefined,
-          });
+          return applyRemoteDeepLinkConnection(validatedUrl, false);
         } catch {
           // error-policy:J3 untrusted deep-link input — rejected loudly
           console.error(`${APP_LOG_PREFIX} Invalid gateway URL format`);
@@ -2669,7 +2663,17 @@ async function initializeDesktopShell(): Promise<void> {
       if (typeof url !== "string" || url.trim().length === 0) {
         return;
       }
-      void handleDeepLink(url);
+      const result = handleDeepLink(url);
+      if (result) {
+        void result.catch((error) => {
+          // error-policy:J1 desktop share-target boundary surfaces a failed
+          // durable connection apply instead of leaking an unhandled rejection.
+          console.warn(
+            `${APP_LOG_PREFIX} Desktop deep-link application failed:`,
+            error instanceof Error ? error.message : error,
+          );
+        });
+      }
     },
   });
 }

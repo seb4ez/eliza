@@ -21,7 +21,7 @@ import {
 } from "./deep-link-handler";
 
 const mocks = vi.hoisted(() => ({
-  applyLaunchConnection: vi.fn(() => ({
+  applyLaunchConnection: vi.fn(async () => ({
     apiBase: "http://100.96.0.1:31337/v1",
     token: null,
   })),
@@ -58,7 +58,7 @@ function makeHandler(over: Partial<DeepLinkHandlerContext> = {}) {
 beforeEach(() => {
   window.location.hash = "";
   vi.clearAllMocks();
-  mocks.applyLaunchConnection.mockReturnValue({
+  mocks.applyLaunchConnection.mockResolvedValue({
     apiBase: "http://100.96.0.1:31337/v1",
     token: null,
   });
@@ -222,32 +222,66 @@ describe("createDeepLinkHandler — universal (https) app links", () => {
 });
 
 describe("createDeepLinkHandler — remote runtime connect links", () => {
-  it("routes trusted connect links through the registry-sync launch seam", () => {
+  it("waits for the durable launch transaction before dispatching a trusted connect", async () => {
     const { handle } = makeHandler();
     const seen: unknown[] = [];
+    let resolveConnection!: (connection: {
+      apiBase: string;
+      token: null;
+    }) => void;
+    mocks.applyLaunchConnection.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveConnection = resolve;
+        }),
+    );
     const onConnect = (event: Event) => {
       seen.push((event as CustomEvent).detail);
     };
     document.addEventListener(CONNECT_EVENT, onConnect);
     try {
-      handle(
+      const handled = handle(
         "elizaos://connect?url=http%3A%2F%2F100.96.0.1%3A31337%2Fv1%2F&token=attacker-token",
       );
+      expect(mocks.applyLaunchConnection).toHaveBeenCalledWith({
+        kind: "remote",
+        apiBase: "http://100.96.0.1:31337/v1/",
+        token: null,
+      });
+      expect(seen).toEqual([]);
+
+      resolveConnection({
+        apiBase: "http://100.96.0.1:31337/v1",
+        token: null,
+      });
+      await handled;
     } finally {
       document.removeEventListener(CONNECT_EVENT, onConnect);
     }
 
-    expect(mocks.applyLaunchConnection).toHaveBeenCalledWith({
-      kind: "remote",
-      apiBase: "http://100.96.0.1:31337/v1/",
-      token: null,
-    });
     expect(seen).toEqual([
       {
         gatewayUrl: "http://100.96.0.1:31337/v1",
         token: undefined,
       },
     ]);
+  });
+
+  it("does not dispatch when the durable launch transaction rejects", async () => {
+    const { handle } = makeHandler();
+    const onConnect = vi.fn();
+    mocks.applyLaunchConnection.mockRejectedValueOnce(
+      new Error("durable write failed"),
+    );
+    document.addEventListener(CONNECT_EVENT, onConnect);
+    try {
+      await expect(
+        handle("elizaos://connect?url=http%3A%2F%2F100.96.0.1%3A31337%2Fv1%2F"),
+      ).rejects.toThrow("durable write failed");
+      expect(onConnect).not.toHaveBeenCalled();
+    } finally {
+      document.removeEventListener(CONNECT_EVENT, onConnect);
+    }
   });
 
   it("rejects untrusted connect links before persisting or dispatching", () => {
