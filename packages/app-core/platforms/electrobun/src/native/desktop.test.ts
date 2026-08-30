@@ -142,6 +142,7 @@ const electrobunMock = vi.hoisted(() => {
       Screen.getPrimaryDisplay.mockClear();
       Utils.openFileDialog.mockClear();
       Utils.openFileDialog.mockResolvedValue([]);
+      Utils.quit.mockClear();
       Utils.showMessageBox.mockClear();
       Utils.showNotification.mockClear();
       Utils.setDockIconVisible.mockClear();
@@ -507,6 +508,8 @@ describe("DesktopManager shortcuts, notifications, and callbacks", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
     resetDesktopManagerForTesting();
     delete process.env.ELIZA_DESKTOP_TEST_AUTO_CONFIRM_DIALOGS;
     delete process.env.ELIZA_DESKTOP_TEST_AUTO_CONFIRM_RESET;
@@ -645,6 +648,43 @@ describe("DesktopManager shortcuts, notifications, and callbacks", () => {
       bookmark: null,
     });
     expect(writeWorkspaceFolderConfig).not.toHaveBeenCalled();
+  });
+
+  it("awaits a pending secure-store receipt cleanup before relaunch and Utils.quit", async () => {
+    vi.useFakeTimers();
+    const unref = vi.fn();
+    const spawn = vi.fn(() => ({ unref }));
+    vi.stubGlobal("Bun", { version: "1.3.14-test", spawn });
+    let finishCleanup: () => void = () => {};
+    const cleanup = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finishCleanup = resolve;
+        }),
+    );
+    const manager = new DesktopManager();
+    manager.setRequestQuitCallback(cleanup);
+
+    const relaunch = manager.relaunch();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(150);
+
+    expect(cleanup).toHaveBeenCalledWith("desktop-relaunch");
+    expect(spawn).not.toHaveBeenCalled();
+    expect(electrobunMock.Utils.quit).not.toHaveBeenCalled();
+
+    finishCleanup();
+    await relaunch;
+    expect(spawn).toHaveBeenCalledOnce();
+    expect(unref).toHaveBeenCalledOnce();
+    expect(electrobunMock.Utils.quit).toHaveBeenCalledOnce();
+    expect(cleanup.mock.invocationCallOrder[0]).toBeLessThan(
+      spawn.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY,
+    );
+    expect(spawn.mock.invocationCallOrder[0]).toBeLessThan(
+      electrobunMock.Utils.quit.mock.invocationCallOrder[0] ??
+        Number.POSITIVE_INFINITY,
+    );
   });
 });
 

@@ -25,6 +25,10 @@ interface PendingOwnerRelease {
   promise: Promise<void> | null;
 }
 
+interface RendererDocumentLifecycle {
+  on(name: "did-commit-navigation", handler: () => void): void;
+}
+
 const pendingOwnerReleases = new Map<symbol, PendingOwnerRelease>();
 const MAX_RPC_REQUEST_TIME_MS = 600_000;
 
@@ -65,18 +69,20 @@ function startOwnerRelease(entry: PendingOwnerRelease): Promise<void> {
 
 /** Wait for every released renderer owner, retrying a prior failed attempt. */
 export async function awaitDesktopRpcSecureStoreCleanup(): Promise<void> {
-  const entries = Array.from(pendingOwnerReleases.values());
-  const results = await Promise.allSettled(
-    entries.map((entry) => startOwnerRelease(entry)),
-  );
-  const failures = results.flatMap((result) =>
-    result.status === "rejected" ? [result.reason] : [],
-  );
-  if (failures.length > 0) {
-    throw new AggregateError(
-      failures,
-      "One or more renderer secure-store releases are still pending.",
+  while (pendingOwnerReleases.size > 0) {
+    const entries = Array.from(pendingOwnerReleases.values());
+    const results = await Promise.allSettled(
+      entries.map((entry) => startOwnerRelease(entry)),
     );
+    const failures = results.flatMap((result) =>
+      result.status === "rejected" ? [result.reason] : [],
+    );
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        "One or more renderer secure-store releases are still pending.",
+      );
+    }
   }
 }
 
@@ -93,11 +99,55 @@ export async function quitAfterDesktopCleanup(
 export function createDesktopRpc(label: string): {
   rpc: ElizaDesktopRpc;
   sendToWebview: SendToWebview;
+  bindRendererLifecycle: (lifecycle: RendererDocumentLifecycle) => void;
   releaseShellSync: () => void;
 } {
   let rpc: ElizaDesktopRpc | undefined;
   let released = false;
-  const secureStoreOwner = Symbol(`renderer-secure-store-owner:${label}`);
+  let lifecycleBound = false;
+  let ownerGeneration = 0;
+
+  const createOwnerRelease = (): PendingOwnerRelease => {
+    ownerGeneration += 1;
+    const entry: PendingOwnerRelease = {
+      label: `${label}:document-${ownerGeneration}`,
+      owner: Symbol(
+        `renderer-secure-store-owner:${label}:document-${ownerGeneration}`,
+      ),
+      promise: null,
+    };
+    pendingOwnerReleases.set(entry.owner, entry);
+    return entry;
+  };
+
+  let currentOwnerRelease = createOwnerRelease();
+  let ownerReady: Promise<void> = Promise.resolve();
+
+  const prepareForRendererDocument = (): Promise<void> => {
+    if (released) return ownerReady;
+    ownerReady = ownerReady
+      .catch(() => undefined)
+      .then(async () => {
+        await startOwnerRelease(currentOwnerRelease);
+        if (!released) currentOwnerRelease = createOwnerRelease();
+      });
+    // error-policy:J5 resolver RPC calls and shutdown both observe this same
+    // rejection; this branch only prevents an unhandled navigation callback.
+    void ownerReady.catch((error) => {
+      logger.warn(
+        `[secure-store:${label}] document rollover failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
+    return ownerReady;
+  };
+
+  const resolveSecureStoreOwner = async (): Promise<symbol> => {
+    while (true) {
+      const observedReady = ownerReady;
+      await observedReady;
+      if (observedReady === ownerReady) return currentOwnerRelease.owner;
+    }
+  };
 
   const sendToWebview: SendToWebview = (message, payload) => {
     if (!rpc) {
@@ -134,27 +184,39 @@ export function createDesktopRpc(label: string): {
     handlers: {
       requests: buildBunRpcHandlers({
         sendToWebview,
-        secureStoreOwner,
+        secureStoreOwner: resolveSecureStoreOwner,
         shellControllerEndpoint: shellSyncEndpoint,
       }) as BunRpcRequestsHandlers,
     },
   });
-  const ownerRelease: PendingOwnerRelease = {
-    label,
-    owner: secureStoreOwner,
-    promise: null,
-  };
-  pendingOwnerReleases.set(secureStoreOwner, ownerRelease);
 
   return {
     rpc,
     sendToWebview,
+    bindRendererLifecycle: (lifecycle) => {
+      if (lifecycleBound) return;
+      lifecycleBound = true;
+      // A committed top-level document boundary covers reload, allowed
+      // navigation, and renderer crash recovery. Rotate before its preload can
+      // hydrate: every secure-store RPC awaits ownerReady, so the old
+      // document's pending receipts are reconciled before the new owner exists.
+      lifecycle.on("did-commit-navigation", () => {
+        void prepareForRendererDocument();
+      });
+    },
     releaseShellSync: () => {
       if (released) return;
       released = true;
       releaseSecureStoreRevisions();
       shellSyncEndpoint.release();
-      void startOwnerRelease(ownerRelease);
+      ownerReady = ownerReady
+        .catch(() => undefined)
+        .then(() => startOwnerRelease(currentOwnerRelease));
+      void ownerReady.catch((error) => {
+        logger.warn(
+          `[secure-store:${label}] endpoint cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
     },
   };
 }

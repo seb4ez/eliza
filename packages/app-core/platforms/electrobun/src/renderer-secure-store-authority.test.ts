@@ -225,10 +225,10 @@ describe("RendererSecureStoreAuthority", () => {
       releasedOwners: Set<symbol>;
     };
     expect(ownerState.ownerIds.has(owner)).toBe(false);
-    expect(ownerState.releasedOwners.has(owner)).toBe(false);
+    expect(ownerState.releasedOwners.has(owner)).toBe(true);
   });
 
-  it("forgets a released ancestor owner after a descendant consumes its receipt", async () => {
+  it("drops a released ancestor journal identity but retains its deny tombstone", async () => {
     const store = new MemorySecureStore();
     const authority = createAuthority(store);
     const releasedOwner = Symbol("released-renderer");
@@ -266,7 +266,101 @@ describe("RendererSecureStoreAuthority", () => {
     await Promise.resolve();
 
     expect(ownerState.ownerIds.has(releasedOwner)).toBe(false);
-    expect(ownerState.releasedOwners.has(releasedOwner)).toBe(false);
+    expect(ownerState.releasedOwners.has(releasedOwner)).toBe(true);
+  });
+
+  it("keeps a released-owner deny tombstone after cleanup drains", async () => {
+    const store = new MemorySecureStore();
+    const authority = createAuthority(store);
+    const owner = Symbol("released-renderer");
+    const write = await authority.set(
+      VAULT_ID,
+      TOKEN_KIND,
+      "committed-renderer-token",
+      owner,
+      "committed-renderer-mutation",
+    );
+    if (!write.ok) throw new Error("renderer write failed");
+    await authority.commitReceipt(
+      VAULT_ID,
+      TOKEN_KIND,
+      write.rollbackReceipt,
+      owner,
+    );
+
+    await authority.releaseOwner(owner);
+    expect(pendingReceiptCount(authority)).toBe(0);
+
+    await expect(
+      authority.set(
+        VAULT_ID,
+        TOKEN_KIND,
+        "must-not-write",
+        owner,
+        "post-release-set",
+      ),
+    ).resolves.toMatchObject({
+      ok: false,
+      reason: "denied",
+      changed: false,
+    });
+    await expect(
+      authority.delete(VAULT_ID, TOKEN_KIND, owner),
+    ).resolves.toEqual({
+      ok: false,
+      reason: "denied",
+      message: "Secure credential endpoint is closed.",
+    });
+    await expect(
+      authority.compareAndDelete(
+        VAULT_ID,
+        TOKEN_KIND,
+        "committed-renderer-token",
+        1,
+        1,
+        owner,
+        "post-release-delete",
+      ),
+    ).resolves.toMatchObject({ ok: false, reason: "denied" });
+    await expect(
+      authority.compareAndSet(
+        VAULT_ID,
+        TOKEN_KIND,
+        "committed-renderer-token",
+        "must-not-transform",
+        1,
+        1,
+        owner,
+        "post-release-transform",
+      ),
+    ).resolves.toMatchObject({ ok: false, reason: "denied" });
+    await expect(
+      authority.commitReceipt(
+        VAULT_ID,
+        TOKEN_KIND,
+        write.rollbackReceipt,
+        owner,
+      ),
+    ).resolves.toMatchObject({ ok: false, reason: "denied" });
+    await expect(
+      authority.compensateCommittedReceipt(
+        VAULT_ID,
+        TOKEN_KIND,
+        write.rollbackReceipt,
+        1,
+        1,
+        owner,
+      ),
+    ).resolves.toMatchObject({ ok: false, reason: "denied" });
+    await expect(
+      authority.compareAndRestore(
+        VAULT_ID,
+        TOKEN_KIND,
+        write.rollbackReceipt,
+        owner,
+      ),
+    ).resolves.toMatchObject({ ok: false, reason: "denied" });
+    expect(store.value).toBe("committed-renderer-token");
   });
 
   it("rejects renderer A's receipt after renderer B writes the same value", async () => {
@@ -1180,6 +1274,53 @@ describe("RendererSecureStoreAuthority", () => {
       value: "active-a-scrubbed",
     });
     expect(store.value).toBe("active-a-scrubbed");
+  });
+
+  it("retains a live predecessor rollback chain when terminal SET does not mutate", async () => {
+    const store = new MemorySecureStore();
+    const authority = createAuthority(store);
+    const owner = Symbol("terminal-renderer-a");
+    const write = await authority.set(
+      VAULT_ID,
+      TOKEN_KIND,
+      "pending-renderer-token",
+      owner,
+      "pending-renderer-set",
+    );
+    if (!write.ok) throw new Error("renderer write failed");
+    store.failNextSet = true;
+
+    await expect(
+      authority.compareAndSet(
+        VAULT_ID,
+        TOKEN_KIND,
+        "pending-renderer-token",
+        "terminal-scrubbed-token",
+        4,
+        4,
+        owner,
+        "failed-terminal-transform",
+      ),
+    ).resolves.toMatchObject({
+      ok: false,
+      reason: "error",
+      message: "injected set failure",
+    });
+    expect(pendingReceiptCount(authority)).toBe(1);
+
+    await expect(
+      authority.compareAndRestore(
+        VAULT_ID,
+        TOKEN_KIND,
+        write.rollbackReceipt,
+        owner,
+      ),
+    ).resolves.toEqual({
+      ok: true,
+      restored: true,
+      value: "prior-token",
+    });
+    expect(store.value).toBe("prior-token");
   });
 
   it("keeps an empty-predecessor receipt retryable when deletion fails", async () => {

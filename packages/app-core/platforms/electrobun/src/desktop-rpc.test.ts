@@ -13,7 +13,9 @@ import {
 import { rendererSecureStoreRevisions } from "./renderer-secure-store-revisions";
 
 const mocks = vi.hoisted(() => ({
+  buildHandlers: vi.fn(),
   releaseOwner: vi.fn<() => Promise<void>>(() => Promise.resolve()),
+  resolveSecureStoreOwner: null as null | (() => Promise<symbol>),
   rpcSend: vi.fn<(message: string, payload: unknown) => void>(),
   shellRelease: vi.fn(),
 }));
@@ -28,7 +30,12 @@ vi.mock("electrobun/bun", () => ({
 }));
 
 vi.mock("./rpc-handlers", () => ({
-  buildBunRpcHandlers: vi.fn(() => ({})),
+  buildBunRpcHandlers: mocks.buildHandlers.mockImplementation(
+    (options: { secureStoreOwner: () => Promise<symbol> }) => {
+      mocks.resolveSecureStoreOwner = options.secureStoreOwner;
+      return {};
+    },
+  ),
   releaseRendererSecureStoreOwner: mocks.releaseOwner,
 }));
 
@@ -45,6 +52,8 @@ vi.mock("./logger", () => ({
 
 afterEach(async () => {
   mocks.releaseOwner.mockImplementation(() => Promise.resolve());
+  mocks.buildHandlers.mockClear();
+  mocks.resolveSecureStoreOwner = null;
   mocks.rpcSend.mockReset();
   mocks.shellRelease.mockReset();
   await awaitDesktopRpcSecureStoreCleanup();
@@ -109,6 +118,44 @@ describe("createDesktopRpc secure-store lifecycle", () => {
     finishRelease();
     await shutdown;
     expect(quit).toHaveBeenCalledOnce();
+  });
+
+  it("rolls the prior document back before a reload can hydrate under a new owner", async () => {
+    let finishRelease: () => void = () => {};
+    mocks.releaseOwner.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          finishRelease = resolve;
+        }),
+    );
+    const endpoint = createDesktopRpc("reload-renderer");
+    const lifecycleHandlers = new Map<string, () => void>();
+    endpoint.bindRendererLifecycle({
+      on: (name, handler) => lifecycleHandlers.set(name, handler),
+    });
+    const resolveOwner = mocks.resolveSecureStoreOwner;
+    if (!resolveOwner) throw new Error("secure-store owner resolver missing");
+    const priorOwner = await resolveOwner();
+
+    lifecycleHandlers.get("did-commit-navigation")?.();
+    const hydrationOwner = resolveOwner();
+    let hydrationSettled = false;
+    void hydrationOwner.then(() => {
+      hydrationSettled = true;
+    });
+    await vi.waitFor(() => {
+      expect(mocks.releaseOwner).toHaveBeenCalledWith(priorOwner);
+    });
+    expect(hydrationSettled).toBe(false);
+
+    finishRelease();
+    const nextOwner = await hydrationOwner;
+    expect(nextOwner).not.toBe(priorOwner);
+    expect(hydrationSettled).toBe(true);
+
+    endpoint.releaseShellSync();
+    mocks.releaseOwner.mockResolvedValue(undefined);
+    await awaitDesktopRpcSecureStoreCleanup();
   });
 
   it("retains a failed owner cleanup so the next shutdown attempt retries it", async () => {

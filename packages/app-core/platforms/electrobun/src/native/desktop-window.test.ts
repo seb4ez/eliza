@@ -615,7 +615,7 @@ describe("DesktopManager main window controls", () => {
     expect(second.on).toHaveBeenCalledWith("blur", expect.any(Function));
   });
 
-  it("routes tray quit through the app quit callback", async () => {
+  it("awaits tray quit cleanup before invoking the host quit primitive", async () => {
     const manager = new DesktopManager();
     const requestQuit = vi.fn(async () => {});
     manager.setRequestQuitCallback(requestQuit);
@@ -629,8 +629,14 @@ describe("DesktopManager main window controls", () => {
       data: { action: "quit" },
     });
 
-    await vi.waitFor(() => expect(requestQuit).toHaveBeenCalledTimes(1));
-    expect(electrobunMock.Utils.quit).not.toHaveBeenCalled();
+    await vi.waitFor(() =>
+      expect(electrobunMock.Utils.quit).toHaveBeenCalled(),
+    );
+    expect(requestQuit).toHaveBeenCalledWith("desktop-quit");
+    expect(requestQuit.mock.invocationCallOrder[0]).toBeLessThan(
+      electrobunMock.Utils.quit.mock.invocationCallOrder[0] ??
+        Number.POSITIVE_INFINITY,
+    );
   });
 
   it("attaches a native Windows and Quit fallback menu at tray creation", async () => {

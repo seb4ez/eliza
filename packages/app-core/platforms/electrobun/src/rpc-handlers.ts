@@ -485,8 +485,14 @@ export function buildBunRpcHandlers({
 }: {
   sendToWebview: SendToWebview;
   shellControllerEndpoint?: ShellControllerEndpoint;
-  secureStoreOwner?: RendererSecureStoreOwner;
+  secureStoreOwner?:
+    | RendererSecureStoreOwner
+    | (() => Promise<RendererSecureStoreOwner>);
 }): BunRpcHandlers {
+  const resolveSecureStoreOwner =
+    typeof secureStoreOwner === "function"
+      ? secureStoreOwner
+      : async () => secureStoreOwner;
   const agent = getAgentManager();
   const camera = getCameraManager();
   const canvas = getCanvasManager();
@@ -1476,6 +1482,9 @@ export function buildBunRpcHandlers({
       return { providers: await scanAndValidateProviderCredentials() };
     },
     secureStoreGet: async (params) => {
+      // A new renderer document cannot hydrate secure state until the host has
+      // rolled back every uncommitted receipt owned by its predecessor.
+      await resolveSecureStoreOwner();
       const vaultId = deriveAgentVaultId();
       const kind = requireRendererSecureStoreKind(params?.kind);
       return rendererSecureStoreRevisions.run(
@@ -1486,6 +1495,7 @@ export function buildBunRpcHandlers({
       );
     },
     secureStoreRevision: async (params) => {
+      await resolveSecureStoreOwner();
       const vaultId = deriveAgentVaultId();
       const kind = requireRendererSecureStoreKind(params?.kind);
       return rendererSecureStoreRevisions.run(
@@ -1496,6 +1506,7 @@ export function buildBunRpcHandlers({
       );
     },
     secureStoreSet: async (params) => {
+      const owner = await resolveSecureStoreOwner();
       const vaultId = deriveAgentVaultId();
       const kind = requireRendererSecureStoreKind(params?.kind);
       const value = requireRendererSecureStoreValue(params?.value);
@@ -1510,7 +1521,7 @@ export function buildBunRpcHandlers({
             vaultId,
             kind,
             value,
-            secureStoreOwner,
+            owner,
             mutationId,
           ),
         {
@@ -1520,6 +1531,7 @@ export function buildBunRpcHandlers({
       );
     },
     secureStoreCommitReceipt: async (params) => {
+      const owner = await resolveSecureStoreOwner();
       const vaultId = deriveAgentVaultId();
       const kind = requireRendererSecureStoreKind(params?.kind);
       const receipt = requireRendererSecureStoreRollbackReceipt(
@@ -1533,12 +1545,13 @@ export function buildBunRpcHandlers({
             vaultId,
             kind,
             receipt,
-            secureStoreOwner,
+            owner,
           ),
         { invalidates: () => false },
       );
     },
     secureStoreCompensateCommittedReceipt: async (params) => {
+      const owner = await resolveSecureStoreOwner();
       const vaultId = deriveAgentVaultId();
       const kind = requireRendererSecureStoreKind(params?.kind);
       const receipt = requireRendererSecureStoreRollbackReceipt(
@@ -1557,7 +1570,7 @@ export function buildBunRpcHandlers({
             receipt,
             expectedRevision,
             currentRevision,
-            secureStoreOwner,
+            owner,
           ),
         {
           invalidates: (result) => result.ok && result.changed,
@@ -1566,16 +1579,18 @@ export function buildBunRpcHandlers({
       );
     },
     secureStoreDelete: async (params) => {
+      const owner = await resolveSecureStoreOwner();
       const vaultId = deriveAgentVaultId();
       const kind = requireRendererSecureStoreKind(params?.kind);
       return rendererSecureStoreRevisions.run(
         vaultId,
         kind,
-        () => rendererSecureStoreAuthority.delete(vaultId, kind),
+        () => rendererSecureStoreAuthority.delete(vaultId, kind, owner),
         { invalidates: () => true, invalidatesOnError: true },
       );
     },
     secureStoreCompareAndDelete: async (params) => {
+      const owner = await resolveSecureStoreOwner();
       const vaultId = deriveAgentVaultId();
       const kind = requireRendererSecureStoreKind(params?.kind);
       const expectedValue =
@@ -1598,7 +1613,7 @@ export function buildBunRpcHandlers({
             expectedValue,
             expectedRevision,
             currentRevision,
-            secureStoreOwner,
+            owner,
             mutationId,
           ),
         {
@@ -1608,6 +1623,7 @@ export function buildBunRpcHandlers({
       );
     },
     secureStoreCompareAndSet: async (params) => {
+      const owner = await resolveSecureStoreOwner();
       const vaultId = deriveAgentVaultId();
       const kind = requireRendererSecureStoreKind(params?.kind);
       const expectedValue = requireRendererSecureStoreValue(
@@ -1631,7 +1647,7 @@ export function buildBunRpcHandlers({
             value,
             expectedRevision,
             currentRevision,
-            secureStoreOwner,
+            owner,
             mutationId,
           ),
         {
@@ -1641,6 +1657,7 @@ export function buildBunRpcHandlers({
       );
     },
     secureStoreCompareAndRestore: async (params) => {
+      const owner = await resolveSecureStoreOwner();
       const vaultId = deriveAgentVaultId();
       const kind = requireRendererSecureStoreKind(params?.kind);
       const receipt = requireRendererSecureStoreRollbackReceipt(
@@ -1654,7 +1671,7 @@ export function buildBunRpcHandlers({
             vaultId,
             kind,
             receipt,
-            secureStoreOwner,
+            owner,
           ),
         // A stale rollback can still cancel an abandoned ancestor. Broadcast
         // its returned host snapshot as an invalidation even when no value was

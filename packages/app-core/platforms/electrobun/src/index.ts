@@ -1359,6 +1359,9 @@ function attachMainWindow(
   win: BrowserWindow,
   rpc: ElizaDesktopRpc,
   sendToWebview: SendToWebview,
+  bindRendererLifecycle: ReturnType<
+    typeof createDesktopRpc
+  >["bindRendererLifecycle"],
   releaseShellSync: () => void,
 ): BrowserWindow {
   wireMainWindowAfterCreate(win, rpc, sendToWebview);
@@ -1377,6 +1380,7 @@ function attachMainWindow(
   getDesktopManager().setMainWindowFullWindow(
     presentation.mode !== "bottom-bar",
   );
+  bindRendererLifecycle(win.webview);
 
   win.webview.on("dom-ready", () => {
     injectApiBase(win);
@@ -1516,11 +1520,13 @@ async function restoreWindow(): Promise<void> {
     return;
   }
   backgroundWindowPromise = (async () => {
-    const { rpc, sendToWebview, releaseShellSync } = createDesktopRpc("main");
+    const { rpc, sendToWebview, bindRendererLifecycle, releaseShellSync } =
+      createDesktopRpc("main");
     const win = attachMainWindow(
       await createMainWindow(rpc),
       rpc,
       sendToWebview,
+      bindRendererLifecycle,
       releaseShellSync,
     );
     injectApiBase(win);
@@ -2839,12 +2845,14 @@ async function main(): Promise<void> {
   const {
     rpc: mainRpc,
     sendToWebview: mainSendToWebview,
+    bindRendererLifecycle: bindMainRendererLifecycle,
     releaseShellSync: releaseMainShellSync,
   } = createDesktopRpc("main");
   const mainWin: BrowserWindow | null = attachMainWindow(
     await createMainWindow(mainRpc),
     mainRpc,
     mainSendToWebview,
+    bindMainRendererLifecycle,
     releaseMainShellSync,
   );
   recordStartupPhase("window_ready", {
@@ -2884,11 +2892,13 @@ async function main(): Promise<void> {
 
   surfaceWindowManager = new SurfaceWindowManager({
     createWindow: (options) => {
-      const { rpc, releaseShellSync } = createDesktopRpc("surface");
+      const { rpc, bindRendererLifecycle, releaseShellSync } =
+        createDesktopRpc("surface");
       const window = createElectrobunBrowserWindow({
         ...options,
         rpc,
       }) as BrowserWindow & ManagedWindowLike;
+      bindRendererLifecycle(window.webview);
       surfaceRpcs.set(window, rpc);
       // Drop this window's relay endpoint when it closes so a churned detached
       // surface does not leak (#16442).
@@ -2935,9 +2945,9 @@ async function main(): Promise<void> {
     void createSettingsWindow(tabHint);
   });
   getDesktopManager().setRestoreMainWindowCallback(() => restoreWindow());
-  getDesktopManager().setRequestQuitCallback(() => {
-    void requestAppQuit();
-  });
+  getDesktopManager().setRequestQuitCallback((reason) =>
+    runShutdownCleanup(reason),
+  );
   getDesktopManager().setOpenSurfaceWindowCallback(
     (surface, browse, alwaysOnTop) => {
       if (!surfaceWindowManager) {
@@ -3034,7 +3044,8 @@ async function main(): Promise<void> {
         const base = await resolveRendererUrlForCurrentRuntime();
         const popoverUrl = new URL(base);
         popoverUrl.searchParams.set("shellMode", "tray-popover");
-        const { rpc, releaseShellSync } = createDesktopRpc("tray-popover");
+        const { rpc, bindRendererLifecycle, releaseShellSync } =
+          createDesktopRpc("tray-popover");
         const buildInfo = await BuildConfig.get();
         const mainWindowPartition = resolveMainWindowPartition(process.env, {
           platform: process.platform,
@@ -3045,6 +3056,7 @@ async function main(): Promise<void> {
           preload: readResolvedPreloadScript(import.meta.dir),
           partition: mainWindowPartition,
           rpc,
+          bindRendererLifecycle,
           wireRpc: () => wireSettingsRpcAfterCreate(rpc),
           injectApiBase,
           onWindowFocused: (window) => {

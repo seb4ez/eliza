@@ -154,6 +154,7 @@ interface TrayPopoverConfig {
   preload: string;
   partition?: string | null;
   rpc?: TrayPopoverRpc;
+  bindRendererLifecycle?: (lifecycle: BrowserWindow["webview"]) => void;
   injectApiBase?: (window: BrowserWindow) => void;
   wireRpc?: (window: BrowserWindow) => void;
   onWindowFocused?: (window: BrowserWindow) => void;
@@ -415,7 +416,9 @@ export class DesktopManager {
   private openExternalHandler:
     | ((url: string) => boolean | Promise<boolean>)
     | null = null;
-  private requestQuitCallback: (() => void | Promise<void>) | null = null;
+  private requestQuitCallback:
+    | ((reason: string) => void | Promise<void>)
+    | null = null;
   private restoreMainWindowCallback: (() => void | Promise<void>) | null = null;
   /**
    * Dockless (tray-first) mode: the Dock icon reflects the presence of FULL
@@ -548,7 +551,9 @@ export class DesktopManager {
     this.openExternalHandler = cb;
   }
 
-  setRequestQuitCallback(cb: (() => void | Promise<void>) | null): void {
+  setRequestQuitCallback(
+    cb: ((reason: string) => void | Promise<void>) | null,
+  ): void {
     this.requestQuitCallback = cb;
   }
 
@@ -1855,14 +1860,16 @@ X-GNOME-Autostart-enabled=true
   async quit(): Promise<void> {
     await this.beginAppExit("desktop-quit");
     if (this.requestQuitCallback) {
-      await this.requestQuitCallback();
-      return;
+      await this.requestQuitCallback("desktop-quit");
     }
     Utils.quit();
   }
 
   async relaunch(): Promise<void> {
     await this.beginAppExit("desktop-relaunch");
+    if (this.requestQuitCallback) {
+      await this.requestQuitCallback("desktop-relaunch");
+    }
     try {
       const child = Bun.spawn([process.execPath, ...process.argv.slice(1)], {
         detached: true,
@@ -2453,6 +2460,7 @@ X-GNOME-Autostart-enabled=true
       ...(config.rpc ? { rpc: config.rpc } : {}),
     };
     const win = createElectrobunBrowserWindow(options);
+    config.bindRendererLifecycle?.(win.webview);
     config.wireRpc?.(win);
     win.webview.on("dom-ready", () => {
       config.injectApiBase?.(win);

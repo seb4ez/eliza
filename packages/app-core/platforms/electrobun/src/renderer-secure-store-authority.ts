@@ -438,6 +438,9 @@ export class RendererSecureStoreAuthority {
       slot,
       async (): Promise<RendererSecureStoreSetResult> => {
         this.pruneJournal();
+        if (this.releasedOwners.has(owner)) {
+          return { ...releasedOwnerFailure, changed: false };
+        }
         const journalKey = this.journalKey("set", owner, mutationId);
         const valueFingerprint = this.valueFingerprint(value);
         const replay = this.mutationJournal.get(journalKey);
@@ -453,9 +456,6 @@ export class RendererSecureStoreAuthority {
             };
           }
           return { ...replay.result, changed: false };
-        }
-        if (this.releasedOwners.has(owner)) {
-          return { ...releasedOwnerFailure, changed: false };
         }
         if (!this.reserveJournalEntry(LIVE_SET_JOURNAL_WEIGHT)) {
           return {
@@ -586,6 +586,7 @@ export class RendererSecureStoreAuthority {
     const slot = this.slotKey(vaultId, kind);
     return this.serializeSlot(slot, async () => {
       this.pruneJournal();
+      if (this.releasedOwners.has(owner)) return releasedOwnerFailure;
       const journalKey = this.journalKey("commit", owner, rollbackReceipt);
       const replay = this.commitJournal.get(journalKey);
       if (replay) {
@@ -597,12 +598,7 @@ export class RendererSecureStoreAuthority {
       let result: RendererSecureStoreCommitReceiptResult;
       const state = this.stateFor(slot, vaultId, kind);
       const committed = state.rollbacks.get(rollbackReceipt);
-      if (
-        this.releasedOwners.has(owner) ||
-        !committed ||
-        committed.owner !== owner ||
-        committed.cancelled
-      ) {
+      if (!committed || committed.owner !== owner || committed.cancelled) {
         // A receipt that belongs to another slot must not poison the correct
         // slot with a false replay tombstone. Unknown/released receipts do not
         // mutate authority and therefore need no response-loss journal entry.
@@ -660,6 +656,7 @@ export class RendererSecureStoreAuthority {
       slot,
       async (): Promise<RendererSecureStoreCompensateCommittedReceiptResult> => {
         this.pruneJournal();
+        if (this.releasedOwners.has(owner)) return releasedOwnerFailure;
         const journalKey = this.journalKey("commit", owner, rollbackReceipt);
         const commit = this.commitJournal.get(journalKey);
         if (!commit || commit.slot !== slot || commit.owner !== owner) {
@@ -728,6 +725,7 @@ export class RendererSecureStoreAuthority {
             value: current.value,
           };
         }
+        if (this.releasedOwners.has(owner)) return releasedOwnerFailure;
 
         let result: RendererSecureStoreCompensateCommittedReceiptResult;
         if (commit.compensation.predecessor === null) {
@@ -775,8 +773,11 @@ export class RendererSecureStoreAuthority {
   delete(
     vaultId: string,
     kind: SecureStoreSecretKind,
+    owner: RendererSecureStoreOwner = defaultOwner,
   ): Promise<SecureStoreDeleteResult> {
+    this.beginOwnerOperation(owner);
     return this.serialize(vaultId, kind, async () => {
+      if (this.releasedOwners.has(owner)) return releasedOwnerFailure;
       const result = await this.store.delete(vaultId, kind);
       if (result.ok || result.reason === "not_found") {
         const state = this.stateFor(this.slotKey(vaultId, kind), vaultId, kind);
@@ -784,7 +785,7 @@ export class RendererSecureStoreAuthority {
         state.rollbacks.clear();
       }
       return result;
-    });
+    }).finally(() => this.endOwnerOperation(owner));
   }
 
   /** Delete only the exact value + host revision observed by the renderer. */
@@ -803,6 +804,7 @@ export class RendererSecureStoreAuthority {
       slot,
       async (): Promise<RendererSecureStoreCompareAndDeleteResult> => {
         this.pruneJournal();
+        if (this.releasedOwners.has(owner)) return releasedOwnerFailure;
         const journalKey = this.journalKey("delete", owner, mutationId);
         const valueFingerprint = this.valueFingerprint(
           expectedValue === null ? "\u0000absent" : `\u0001${expectedValue}`,
@@ -822,7 +824,6 @@ export class RendererSecureStoreAuthority {
           }
           return { ...replay.result, changed: false };
         }
-        if (this.releasedOwners.has(owner)) return releasedOwnerFailure;
         if (!this.reserveJournalEntry()) {
           return {
             ok: false,
@@ -868,6 +869,9 @@ export class RendererSecureStoreAuthority {
             value: current.value,
           });
         }
+        if (this.releasedOwners.has(owner)) {
+          return finish(releasedOwnerFailure);
+        }
 
         const deletion = await this.store.delete(vaultId, kind);
         const verified = await this.store.get(vaultId, kind);
@@ -909,6 +913,7 @@ export class RendererSecureStoreAuthority {
       slot,
       async (): Promise<RendererSecureStoreCompareAndSetResult> => {
         this.pruneJournal();
+        if (this.releasedOwners.has(owner)) return releasedOwnerFailure;
         const journalKey = this.journalKey("compare-set", owner, mutationId);
         const expectedValueFingerprint = this.valueFingerprint(expectedValue);
         const valueFingerprint = this.valueFingerprint(value);
@@ -928,7 +933,6 @@ export class RendererSecureStoreAuthority {
           }
           return { ...replay.result, changed: false };
         }
-        if (this.releasedOwners.has(owner)) return releasedOwnerFailure;
         if (!this.reserveJournalEntry()) {
           return {
             ok: false,
@@ -991,6 +995,9 @@ export class RendererSecureStoreAuthority {
             value,
           });
         }
+        if (this.releasedOwners.has(owner)) {
+          return finish(releasedOwnerFailure);
+        }
 
         let write: SecureStoreSetResult;
         try {
@@ -1002,11 +1009,6 @@ export class RendererSecureStoreAuthority {
             message: "Secure credential backend write failed.",
           };
         }
-        // This is a terminal transform: after the exact CAS acquired A, no
-        // pending ancestor may later restore its bearer during endpoint close.
-        const state = this.stateFor(slot, vaultId, kind);
-        state.currentReceipt = null;
-        state.rollbacks.clear();
         let verified: SecureStoreGetResult;
         try {
           verified = await this.store.get(vaultId, kind);
@@ -1018,6 +1020,12 @@ export class RendererSecureStoreAuthority {
           };
         }
         if (verified.ok && verified.value === value) {
+          // This is a terminal transform: only a verified mutation acquires A.
+          // A failed backend call that left A unchanged must retain its live
+          // predecessor chain so endpoint cleanup can still roll A back.
+          const state = this.stateFor(slot, vaultId, kind);
+          state.currentReceipt = null;
+          state.rollbacks.clear();
           return finish({
             ok: true,
             applied: true,
@@ -1113,13 +1121,14 @@ export class RendererSecureStoreAuthority {
     owner: RendererSecureStoreOwner = defaultOwner,
   ): Promise<RendererSecureStoreCompareAndRestoreResult> {
     const slot = this.slotKey(vaultId, kind);
-    return this.serializeSlot(slot, () =>
-      this.compareAndRestoreUnlocked(
+    return this.serializeSlot(slot, async () => {
+      if (this.releasedOwners.has(owner)) return releasedOwnerFailure;
+      return this.compareAndRestoreUnlocked(
         this.stateFor(slot, vaultId, kind),
         rollbackReceipt,
         owner,
-      ),
-    );
+      );
+    });
   }
 
   /** Prevents a closing endpoint from starting or finalizing new mutations. */
@@ -1204,7 +1213,9 @@ export class RendererSecureStoreAuthority {
       !this.ownerHasReceipts(owner)
     ) {
       this.ownerIds.delete(owner);
-      this.releasedOwners.delete(owner);
+      // Keep releasedOwners as a permanent process-lifetime deny tombstone.
+      // Late closures still hold the symbol after every receipt and retry
+      // journal entry drains; deleting it would silently re-authorize them.
     }
   }
 
