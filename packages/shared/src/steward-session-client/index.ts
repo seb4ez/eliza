@@ -851,7 +851,8 @@ function publishedWriteAuthority(
       if (
         window.localStorage.getItem(STEWARD_TOKEN_KEY) !== previousToken ||
         (requiredScope &&
-          window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY) !== previousScope)
+          window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY) !==
+            previousScope)
       ) {
         return false;
       }
