@@ -701,6 +701,7 @@ describe("authMe against a managed shared-agent base", () => {
     readStewardSessionRecoveryMock.mockReset().mockReturnValue({
       tenantId: "elizacloud",
       receipts: [],
+      generation: null,
       hasOAuth: false,
       storageAvailable: true,
     });
@@ -932,6 +933,7 @@ describe("authMe against a managed shared-agent base", () => {
     readStewardSessionRecoveryMock.mockReturnValue({
       tenantId: "elizacloud",
       receipts: ["account-b"],
+      generation: "account-b",
       hasOAuth: false,
       storageAvailable: true,
     });
