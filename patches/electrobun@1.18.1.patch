@@ -1,23 +1,25 @@
 diff --git a/dist/api/bun/core/Socket.ts b/dist/api/bun/core/Socket.ts
-index cdaa2bca0fabe577cb667056aa6f8f84211189c2..2d291f7dd7b97a644d40f2d105b0e7028387b0ce 100644
 --- a/dist/api/bun/core/Socket.ts
 +++ b/dist/api/bun/core/Socket.ts
-@@ -65,6 +65,7 @@ const startRPCServer = () => {
- 	while (port <= endPort) {
- 		try {
- 			server = Bun.serve<{ webviewId: number }>({
+@@ -67,0 +68 @@ const startRPCServer = () => {
 +				hostname: "127.0.0.1",
- 				port,
- 				fetch(req: Request, server: Server<{ webviewId: number }>) {
- 					const url = new URL(req.url);
+diff --git a/src/cli/package.json b/src/cli/package.json
+index c1a5327280b3c88ab6b14e7629838116b93066a0..68486adbaceb35b75f60ddc7da8a966daed5054a 100644
+--- a/src/cli/package.json
++++ b/src/cli/package.json
+@@ -4,7 +4,7 @@
+ 	"type": "module",
+ 	"devDependencies": {},
+ 	"peerDependencies": {
+-		"typescript": "^5.0.0"
++		"typescript": ">=5.0.0"
+ 	},
+ 	"dependencies": {},
+ 	"trustedDependencies": []
 diff --git a/dist/api/bun/proc/native.ts b/dist/api/bun/proc/native.ts
-index f0f6c2532ba2eb467ec1d452a25c835b6db72661..922e21e812becf3225058d761261d53f7bb692dc 100644
 --- a/dist/api/bun/proc/native.ts
 +++ b/dist/api/bun/proc/native.ts
-@@ -2574,7 +2574,18 @@ const eventBridgeHandler = new JSCallback(
- 			// Only handle webviewEvent messages - no RPC
- 			if (jsonMessage.id === "webviewEvent") {
- 				const { payload } = jsonMessage;
+@@ -2577 +2577,12 @@
 -				webviewEventHandler(payload.id, payload.eventName, payload.detail);
 +				if (
 +					payload?.id !== _id ||
@@ -31,13 +33,7 @@ index f0f6c2532ba2eb467ec1d452a25c835b6db72661..922e21e812becf3225058d761261d53f
 +					return;
 +				}
 +				webviewEventHandler(_id, payload.eventName, payload.detail);
- 			}
- 			// Silently ignore any other message types - sandboxed webviews shouldn't send them
- 		} catch (err) {
-@@ -2600,7 +2611,18 @@ const internalBridgeHandler = new JSCallback(
- 				// Note: Some WebviewEvents from inside the webview are routed through here
- 				// Others call the JSCallback directly from native code.
- 				const { payload } = jsonBatch;
+@@ -2603 +2614,12 @@
 -				webviewEventHandler(payload.id, payload.eventName, payload.detail);
 +				if (
 +					payload?.id !== _id ||
@@ -51,23 +47,12 @@ index f0f6c2532ba2eb467ec1d452a25c835b6db72661..922e21e812becf3225058d761261d53f
 +					return;
 +				}
 +				webviewEventHandler(_id, payload.eventName, payload.detail);
- 				return;
- 			}
- 
 diff --git a/dist/api/shared/rpc.ts b/dist/api/shared/rpc.ts
-index 090381db0c0a7214f51ee1cb2b728244487cbbe1..7a10626748aef84d8d64951cfae3b9c998204e51 100644
 --- a/dist/api/shared/rpc.ts
 +++ b/dist/api/shared/rpc.ts
-@@ -3,13 +3,26 @@
- type _RPCRequestPacket = {
- 	type: "request";
- 	id: number;
+@@ -5,0 +6 @@ type _RPCRequestPacket = {
 +	instanceId: string;
- 	method: string;
- 	params: any;
- };
- 
- type _RPCResponsePacket =
+@@ -11,2 +12,14 @@ type _RPCResponsePacket =
 -	| { type: "response"; id: number; success: true; payload: any }
 -	| { type: "response"; id: number; success: false; error?: string };
 +	| {
@@ -84,13 +69,7 @@ index 090381db0c0a7214f51ee1cb2b728244487cbbe1..7a10626748aef84d8d64951cfae3b9c9
 +			success: false;
 +			error?: string;
 +	  };
- 
- type _RPCMessagePacket = {
- 	type: "message";
-@@ -176,6 +189,22 @@ export type RPCOptions<
- 
- const MAX_ID = 1e10;
- const DEFAULT_MAX_REQUEST_TIME = 1000;
+@@ -178,0 +192,16 @@ const DEFAULT_MAX_REQUEST_TIME = 1000;
 +const MAX_INSTANCE_ID_LENGTH = 128;
 +
 +function createRPCInstanceId(): string {
@@ -107,29 +86,11 @@ index 090381db0c0a7214f51ee1cb2b728244487cbbe1..7a10626748aef84d8d64951cfae3b9c9
 +	}
 +	throw new Error("RPC instance isolation requires secure randomness.");
 +}
- 
- function missingTransportMethodError(
- 	methods: string[],
-@@ -191,6 +220,7 @@ export function createRPC<
- 	Schema extends RPCSchema = RPCSchema,
- 	RemoteSchema extends RPCSchema = Schema,
- >(options: _RPCAllOptions<Schema> = {}) {
+@@ -193,0 +223 @@ export function createRPC<
 +	const rpcInstanceId = createRPCInstanceId();
- 	// ---- transport ----
- 
- 	let debugHooks: DebugHooks = {};
-@@ -263,6 +293,7 @@ export function createRPC<
- 			const request: _RPCRequestPacket = {
- 				type: "request",
- 				id: requestId,
+@@ -265,0 +296 @@ export function createRPC<
 +				instanceId: rpcInstanceId,
- 				method: method as string,
- 				params,
- 			};
-@@ -386,12 +417,20 @@ export function createRPC<
- 					["send", "requestHandler"],
- 					"handle requests",
- 				);
+@@ -389 +420,8 @@ export function createRPC<
 -			const { id, method, params } = message;
 +			const { id, instanceId, method, params } = message;
 +			if (
@@ -139,41 +100,9 @@ index 090381db0c0a7214f51ee1cb2b728244487cbbe1..7a10626748aef84d8d64951cfae3b9c9
 +			) {
 +				return;
 +			}
- 			let response: _RPCResponsePacket;
- 			try {
- 				response = {
- 					type: "response",
- 					id,
+@@ -394,0 +433 @@ export function createRPC<
 +					instanceId,
- 					success: true,
- 					payload: await requestHandler(method as any, params),
- 				};
-@@ -400,6 +439,7 @@ export function createRPC<
- 				response = {
- 					type: "response",
- 					id,
+@@ -402,0 +442 @@ export function createRPC<
 +					instanceId,
- 					success: false,
- 					error: error.message,
- 				};
-@@ -410,6 +450,7 @@ export function createRPC<
- 		}
- 
- 		if (message.type === "response") {
+@@ -412,0 +453 @@ export function createRPC<
 +			if (message.instanceId !== rpcInstanceId) return;
- 			const timeout = requestTimeouts.get(message.id);
- 			if (timeout != null) clearTimeout(timeout);
- 			requestTimeouts.delete(message.id);
-diff --git a/src/cli/package.json b/src/cli/package.json
-index c1a5327280b3c88ab6b14e7629838116b93066a0..68486adbaceb35b75f60ddc7da8a966daed5054a 100644
---- a/src/cli/package.json
-+++ b/src/cli/package.json
-@@ -4,7 +4,7 @@
- 	"type": "module",
- 	"devDependencies": {},
- 	"peerDependencies": {
--		"typescript": "^5.0.0"
-+		"typescript": ">=5.0.0"
- 	},
- 	"dependencies": {},
- 	"trustedDependencies": []
