@@ -31,9 +31,14 @@ const signOutAndroidCloudMock = vi.hoisted(() => vi.fn());
 const nativePlatformState = vi.hoisted(() => ({ enabled: false }));
 const isElizaCloudRuntimeLockedMock = vi.hoisted(() => vi.fn());
 const isAppModeHostMock = vi.hoisted(() => vi.fn());
+const captureManagedCloudAccountBindingAuthorityMock = vi.hoisted(() =>
+  vi.fn(),
+);
 const clearManagedCloudAccountBindingMock = vi.hoisted(() => vi.fn());
 
 vi.mock("./shared-cloud-account-binding", () => ({
+  captureManagedCloudAccountBindingAuthority:
+    captureManagedCloudAccountBindingAuthorityMock,
   clearManagedCloudAccountBinding: clearManagedCloudAccountBindingMock,
 }));
 
@@ -111,6 +116,11 @@ describe("useCloudState — Cloud account sign-out", () => {
     cloudDisconnectMock.mockResolvedValue(undefined);
     signOutFromSsoBridgedHostMock.mockResolvedValue(undefined);
     signOutAndroidCloudMock.mockResolvedValue(undefined);
+    captureManagedCloudAccountBindingAuthorityMock.mockResolvedValue({
+      activeServerRaw: "account-a-active-server",
+      registryRaw: "account-a-registry",
+      stewardToken: "account-a-token",
+    });
     clearManagedCloudAccountBindingMock.mockImplementation(async () => {
       clearPersistedActiveServer();
     });
@@ -146,7 +156,22 @@ describe("useCloudState — Cloud account sign-out", () => {
       await result.current.handleCloudSignOut();
     });
 
+    expect(
+      captureManagedCloudAccountBindingAuthorityMock,
+    ).toHaveBeenCalledTimes(1);
     expect(signOutAndroidCloud).toHaveBeenCalledWith("https://eliza.app");
+    expect(
+      captureManagedCloudAccountBindingAuthorityMock.mock
+        .invocationCallOrder[0],
+    ).toBeLessThan(signOutAndroidCloudMock.mock.invocationCallOrder[0] ?? 0);
+    expect(clearManagedCloudAccountBindingMock).toHaveBeenCalledWith({
+      activeServerRaw: "account-a-active-server",
+      registryRaw: "account-a-registry",
+      stewardToken: "account-a-token",
+    });
+    expect(signOutAndroidCloudMock.mock.invocationCallOrder[0]).toBeLessThan(
+      clearManagedCloudAccountBindingMock.mock.invocationCallOrder[0] ?? 0,
+    );
     expect(isAndroidCloudAccountSwitchPending()).toBe(true);
     expect(signOutFromSsoBridgedHost).not.toHaveBeenCalled();
     expect(client.cloudDisconnect).not.toHaveBeenCalled();
@@ -183,6 +208,17 @@ describe("useCloudState — Cloud account sign-out", () => {
     });
 
     expect(signOutFromSsoBridgedHost).toHaveBeenCalledTimes(1);
+    expect(
+      captureManagedCloudAccountBindingAuthorityMock.mock
+        .invocationCallOrder[0],
+    ).toBeLessThan(
+      signOutFromSsoBridgedHostMock.mock.invocationCallOrder[0] ?? 0,
+    );
+    expect(
+      signOutFromSsoBridgedHostMock.mock.invocationCallOrder[0],
+    ).toBeLessThan(
+      clearManagedCloudAccountBindingMock.mock.invocationCallOrder[0] ?? 0,
+    );
     expect(client.cloudDisconnect).not.toHaveBeenCalled();
     expect(result.current.elizaCloudConnected).toBe(false);
     expect(result.current.elizaCloudEnabled).toBe(false);

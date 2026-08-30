@@ -6,6 +6,7 @@
  */
 
 import { logger } from "@elizaos/logger";
+import { STEWARD_TOKEN_KEY } from "@elizaos/shared/steward-session-client";
 import {
   getStorageValue,
   removeStorageValueIfCurrent,
@@ -75,8 +76,18 @@ export type AgentProfileRemovalPersistenceResult =
 export interface CloudRuntimeAuthorityClearOptions
   extends StorageWriteValidationOptions {
   scope: "shared" | "managed";
+  /** Exact host snapshots captured before an explicit account sign-out. */
+  expectedAuthority?: CloudRuntimeAuthorityLease;
+  /** Refuse passive cleanup while any host-authoritative Steward token exists. */
+  requireStewardTokenAbsent?: boolean;
   /** Publish the terminal live-client state while the runtime lock is held. */
   finalize?: (server: PersistedActiveServer) => void | Promise<void>;
+}
+
+export interface CloudRuntimeAuthorityLease {
+  activeServerRaw: string | null;
+  registryRaw: string | null;
+  stewardToken: string | null;
 }
 
 export type CloudRuntimeAuthorityClearResult =
@@ -869,6 +880,29 @@ export function removeManagedSharedCloudAgentProfiles(): void {
 }
 
 /**
+ * Capture the account/runtime authority that an explicit sign-out is allowed
+ * to retire. The token is read on both sides of the runtime snapshots because
+ * Steward token publication uses its own protected-storage transaction; a
+ * concurrent account switch must not produce a mixed A/B lease.
+ */
+export async function captureCloudRuntimeAuthorityLeaseDurably(): Promise<CloudRuntimeAuthorityLease> {
+  return serializeRuntimeConnectionPersistence(async () => {
+    const stewardTokenBefore = await getStorageValue(STEWARD_TOKEN_KEY);
+    const activeServerRaw = await getStorageValue(ACTIVE_SERVER_KEY);
+    const registryRaw = await getStorageValue(STORAGE_KEY);
+    const stewardTokenAfter = await getStorageValue(STEWARD_TOKEN_KEY);
+    if (stewardTokenBefore !== stewardTokenAfter) {
+      throw new Error("Cloud account authority changed while it was captured");
+    }
+    return {
+      activeServerRaw,
+      registryRaw,
+      stewardToken: stewardTokenAfter,
+    };
+  });
+}
+
+/**
  * Clear account-scoped Cloud runtime records from one pair of host-authority
  * snapshots. Registry mutation, exact active-server deletion, and live-client
  * publication all remain inside the runtime Web Lock, so a queued login B can
@@ -886,7 +920,32 @@ export async function clearCloudRuntimeAuthorityDurably(
         return { ok: false, reason: "authority-lost" };
       }
 
+      const stewardTokenBefore = await getStorageValue(STEWARD_TOKEN_KEY);
       const activeServerRaw = await getStorageValue(ACTIVE_SERVER_KEY);
+      const registryRaw = await getStorageValue(STORAGE_KEY);
+      const stewardTokenAfter = await getStorageValue(STEWARD_TOKEN_KEY);
+      if (stewardTokenBefore !== stewardTokenAfter) {
+        return { ok: false, reason: "conflict" };
+      }
+      if (options.expectedAuthority) {
+        const expected = options.expectedAuthority;
+        const stewardTokenMatches =
+          stewardTokenAfter === expected.stewardToken ||
+          (expected.stewardToken !== null && stewardTokenAfter === null);
+        if (
+          !stewardTokenMatches ||
+          activeServerRaw !== expected.activeServerRaw ||
+          registryRaw !== expected.registryRaw
+        ) {
+          return { ok: false, reason: "conflict" };
+        }
+      } else if (
+        options.requireStewardTokenAbsent &&
+        stewardTokenAfter !== null
+      ) {
+        return { ok: false, reason: "authority-lost" };
+      }
+
       const activeServer = parsePersistedActiveServer(activeServerRaw);
       if (activeServer === undefined) {
         return { ok: false, reason: "invalid-state" };
@@ -900,7 +959,6 @@ export async function clearCloudRuntimeAuthorityDurably(
         return { ok: false, reason: "not-target" };
       }
 
-      const registryRaw = await getStorageValue(STORAGE_KEY);
       const registry = parseAgentProfileRegistry(registryRaw);
       if (registryRaw !== null && !registry) {
         return { ok: false, reason: "invalid-state" };

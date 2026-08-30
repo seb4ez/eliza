@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { STEWARD_TOKEN_KEY } from "@elizaos/shared/steward-session-client";
 /** Deterministic failure coverage for multi-record protected transactions. */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -36,6 +37,7 @@ vi.mock("@elizaos/logger", () => ({
 }));
 
 import {
+  captureCloudRuntimeAuthorityLeaseDurably,
   clearCloudRuntimeAuthorityDurably,
   persistAgentProfileConnectionDurably,
   persistAgentProfileSelectionDurably,
@@ -862,6 +864,116 @@ describe("durable agent-profile compensation", () => {
     expect(mocks.removeStorageValueIfCurrent).not.toHaveBeenCalled();
     expect(localStorage.getItem("elizaos:active-server")).toBe(serverRaw);
     expect(finalize).not.toHaveBeenCalled();
+  });
+
+  it("preserves account B when it committed before account A acquires the clear lock", async () => {
+    const sharedBaseA =
+      "https://api.eliza.app/api/v1/eliza/agents/account-a-agent";
+    const sharedBaseB =
+      "https://api.eliza.app/api/v1/eliza/agents/account-b-agent";
+    const activeServerRawA = JSON.stringify(
+      createPersistedActiveServer({
+        kind: "cloud",
+        id: "cloud:account-a-agent",
+        label: "Account A",
+        apiBase: sharedBaseA,
+        accessToken: "token-a",
+      }),
+    );
+    const registryRawA = JSON.stringify({
+      version: 1,
+      activeProfileId: "shared-a",
+      profiles: [
+        {
+          id: "shared-a",
+          kind: "cloud",
+          label: "Account A",
+          apiBase: sharedBaseA,
+          accessToken: "token-a",
+          createdAt: "2026-08-30T00:00:00.000Z",
+        },
+      ],
+    });
+    const activeServerRawB = JSON.stringify(
+      createPersistedActiveServer({
+        kind: "cloud",
+        id: "cloud:account-b-agent",
+        label: "Account B",
+        apiBase: sharedBaseB,
+        accessToken: "token-b",
+      }),
+    );
+    const registryRawB = JSON.stringify({
+      version: 1,
+      activeProfileId: "shared-b",
+      profiles: [
+        {
+          id: "shared-b",
+          kind: "cloud",
+          label: "Account B",
+          apiBase: sharedBaseB,
+          accessToken: "token-b",
+          createdAt: "2026-08-30T00:01:00.000Z",
+        },
+      ],
+    });
+    localStorage.setItem("elizaos:active-server", activeServerRawB);
+    localStorage.setItem("elizaos:agent-profiles", registryRawB);
+    // The renderer-local protected cache was invalidated, so it sees no token;
+    // the host-authoritative read still returns account B's bearer.
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    mocks.getStorageValue.mockImplementation(async (key: string) =>
+      key === STEWARD_TOKEN_KEY ? "token-b" : localStorage.getItem(key),
+    );
+    const finalize = vi.fn();
+
+    await expect(
+      clearCloudRuntimeAuthorityDurably({
+        expectedAuthority: {
+          activeServerRaw: activeServerRawA,
+          registryRaw: registryRawA,
+          stewardToken: "token-a",
+        },
+        scope: "managed",
+        finalize,
+      }),
+    ).resolves.toEqual({ ok: false, reason: "conflict" });
+
+    expect(localStorage.getItem("elizaos:active-server")).toBe(
+      activeServerRawB,
+    );
+    expect(localStorage.getItem("elizaos:agent-profiles")).toBe(registryRawB);
+    expect(mocks.setStorageValueIfCurrent).not.toHaveBeenCalled();
+    expect(mocks.removeStorageValueIfCurrent).not.toHaveBeenCalled();
+    expect(finalize).not.toHaveBeenCalled();
+  });
+
+  it("refuses passive shared cleanup when another renderer has a host token", async () => {
+    mocks.getStorageValue.mockImplementation(async (key: string) =>
+      key === STEWARD_TOKEN_KEY ? "token-b" : localStorage.getItem(key),
+    );
+
+    await expect(
+      clearCloudRuntimeAuthorityDurably({
+        requireStewardTokenAbsent: true,
+        scope: "shared",
+      }),
+    ).resolves.toEqual({ ok: false, reason: "authority-lost" });
+
+    expect(mocks.setStorageValueIfCurrent).not.toHaveBeenCalled();
+    expect(mocks.removeStorageValueIfCurrent).not.toHaveBeenCalled();
+  });
+
+  it("rejects a mixed host lease when the Steward token changes mid-capture", async () => {
+    mocks.getStorageValue
+      .mockResolvedValueOnce("token-a")
+      .mockResolvedValueOnce("active-a")
+      .mockResolvedValueOnce("registry-a")
+      .mockResolvedValueOnce("token-b");
+
+    await expect(captureCloudRuntimeAuthorityLeaseDurably()).rejects.toThrow(
+      "Cloud account authority changed while it was captured",
+    );
   });
 
   it("finishes account A teardown before a queued account B connection publishes", async () => {

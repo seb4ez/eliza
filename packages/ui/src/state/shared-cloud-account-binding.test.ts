@@ -13,6 +13,7 @@ import {
   savePersistedActiveServer,
 } from "./persistence";
 import {
+  captureManagedCloudAccountBindingAuthority,
   clearManagedCloudAccountBinding,
   clearSharedCloudAccountBinding,
   clearSharedCloudAccountBindingDurably,
@@ -130,7 +131,8 @@ describe("clearSharedCloudAccountBinding", () => {
       ],
     });
 
-    await clearManagedCloudAccountBinding();
+    const authority = await captureManagedCloudAccountBindingAuthority();
+    await clearManagedCloudAccountBinding(authority);
 
     expect(loadPersistedActiveServer()).toBeNull();
     expect(loadAgentProfileRegistry()).toEqual({

@@ -118,7 +118,10 @@ import {
 } from "./persistence";
 import { isPrivateNetworkHost } from "./private-network-host";
 import { getBuildConfiguredRemoteApiBaseUrl } from "./runtime-url-trust";
-import { clearManagedCloudAccountBinding } from "./shared-cloud-account-binding";
+import {
+  captureManagedCloudAccountBindingAuthority,
+  clearManagedCloudAccountBinding,
+} from "./shared-cloud-account-binding";
 import type { CloudLoginOptions } from "./types";
 
 // ── Constants ──────────────────────────────────────────────────────────────
@@ -2366,6 +2369,12 @@ export function useCloudState({
     setElizaCloudDisconnecting(true);
 
     try {
+      // Capture the exact protected A records before remote sign-out clears its
+      // Steward bearer. A different renderer may publish account B while the
+      // network request is in flight; the terminal transaction must then
+      // reject instead of targeting whichever host records are current.
+      const runtimeAuthority =
+        await captureManagedCloudAccountBindingAuthority();
       // Hosted Cloud runs inside the normal agent shell now, so it no longer
       // inherits the retired console's sign-out menu. Preserve the hardened
       // cross-origin teardown here: synchronously suppress auto-bridging,
@@ -2383,7 +2392,7 @@ export function useCloudState({
       // A managed agent selection is scoped to the account that proved
       // ownership. Account switching must not restore that target under the
       // next account or strand the cloud-only app in backend-unreachable.
-      await clearManagedCloudAccountBinding();
+      await clearManagedCloudAccountBinding(runtimeAuthority);
       clearCloudPairApiToken();
       savePersistedFirstRunComplete(false);
       setElizaCloudEnabled(false);

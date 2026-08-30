@@ -11,6 +11,8 @@ import { clearElizaApiBase, getElizaApiToken } from "../utils/eliza-globals";
 import {
   type CloudRuntimeAuthorityClearOptions,
   type CloudRuntimeAuthorityClearResult,
+  type CloudRuntimeAuthorityLease,
+  captureCloudRuntimeAuthorityLeaseDurably,
   clearCloudRuntimeAuthorityDurably,
   removeManagedSharedCloudAgentProfiles,
 } from "./agent-profiles";
@@ -105,6 +107,7 @@ async function clearSharedCloudAccountBindingDurablyWithDependencies(
   if (!validate()) return false;
   const result = await clearAuthority({
     ...options,
+    requireStewardTokenAbsent: true,
     scope: "shared",
     validate,
     finalize: () => {
@@ -121,14 +124,22 @@ export const sharedCloudAccountBindingInternals = {
   clearSharedCloudAccountBindingDurablyWithDependencies,
 };
 
+/** Capture the exact host authority before an explicit account sign-out. */
+export async function captureManagedCloudAccountBindingAuthority(): Promise<CloudRuntimeAuthorityLease> {
+  return captureCloudRuntimeAuthorityLeaseDurably();
+}
+
 /**
  * Releases every browser mirror whose authority comes from the ending Eliza
  * Cloud account while preserving unrelated local and self-hosted profiles.
  */
-export async function clearManagedCloudAccountBinding(): Promise<void> {
+export async function clearManagedCloudAccountBinding(
+  expectedAuthority: CloudRuntimeAuthorityLease,
+): Promise<void> {
   const credentialSnapshot = captureCloudBindingCredentialSnapshot();
   const validate = () => sameCloudBindingCredentialSnapshot(credentialSnapshot);
   const result = await clearCloudRuntimeAuthorityDurably({
+    expectedAuthority,
     scope: "managed",
     validate,
     finalize: () => {
