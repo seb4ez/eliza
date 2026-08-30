@@ -3,12 +3,13 @@
  * The fixture proxies the local renderer behind the canonical app hostname so
  * production hostname gates run unchanged while all application bytes remain
  * exact-head and local; network-bound auth provider discovery is deterministic.
- * Authenticated Shared/agentless shells also prove unsupported standalone-agent
- * notification routes stay capability-disabled instead of painting an error.
+ * The authenticated `/join` handoff uses a ready Dedicated identity so this
+ * navigation test reaches the complete app shell without also exercising the
+ * separate paid upgrade/cutover workflow.
  */
 
 import { writeFile } from "node:fs/promises";
-import { expect, type Page, test } from "@playwright/test";
+import { expect, type Page, type Route, test } from "@playwright/test";
 import { installDefaultAppRoutes } from "./helpers";
 import { seedStewardSession } from "./helpers/test-auth";
 
@@ -30,6 +31,8 @@ const TEST_AUTH_ENABLED =
   process.env.VITE_PLAYWRIGHT_TEST_AUTH === "true" ||
   process.env.NEXT_PUBLIC_PLAYWRIGHT_TEST_AUTH === "true";
 const PERSONAL_ID = "personal:11111111-1111-5111-8111-111111111111";
+const ACTIVE_AGENT_ID = "22222222-2222-4222-8222-222222222222";
+const DEDICATED_ORIGIN = `https://${ACTIVE_AGENT_ID}.cloud.eliza.app`;
 const ONBOARDING_TOKEN = "aaaaaaaa-test-test-test-tokentoken01";
 const SURFACES = [
   { name: "desktop", viewport: { width: 1440, height: 900 } },
@@ -66,8 +69,13 @@ async function installManagedOriginProxy(
 async function installAuthenticatedPersonalRoutes(
   page: Page,
   managedOrigin: string,
-  personalGate?: Promise<void>,
+  options: {
+    apiBase?: string;
+    personalGate?: Promise<void>;
+    runtime?: "shared" | "dedicated";
+  } = {},
 ): Promise<() => number> {
+  const { apiBase = managedOrigin, personalGate, runtime = "shared" } = options;
   await installDefaultAppRoutes(page);
   await page.context().addCookies([
     {
@@ -92,12 +100,22 @@ async function installAuthenticatedPersonalRoutes(
       body: JSON.stringify({ success: true, data: [] }),
     });
   });
-  // Once the personal Shared runtime mounts, current develop boots a bounded
+  // Once the personal runtime mounts, current develop boots a bounded
   // set of agent-scoped home resources. Keep this navigation-ownership test
   // deterministic instead of letting those unrelated reads escape to the
   // hosted API and register as request failures.
-  await page.route("**/api/v1/eliza/agents/*/**", async (route) => {
+  const fulfillActiveAgentRoute = async (route: Route) => {
     const pathname = new URL(route.request().url()).pathname;
+    if (
+      pathname.endsWith("/api/auth/me") ||
+      pathname.endsWith("/api/auth/status") ||
+      pathname.endsWith("/api/status") ||
+      pathname.endsWith("/api/lifeops/activity-signals") ||
+      pathname.includes("/api/notifications")
+    ) {
+      await route.fallback();
+      return;
+    }
     const conversation = {
       id: "managed-handoff-conversation",
       roomId: "managed-handoff-room",
@@ -125,6 +143,46 @@ async function installAuthenticatedPersonalRoutes(
       contentType: "application/json",
       body: JSON.stringify(body),
     });
+  };
+  await page.route("**/api/v1/eliza/agents/*/**", fulfillActiveAgentRoute);
+  await page.route(`${DEDICATED_ORIGIN}/api/**`, fulfillActiveAgentRoute);
+  await page.route(
+    `**/api/v1/eliza/agents/${ACTIVE_AGENT_ID}`,
+    async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          success: true,
+          data: {
+            id: ACTIVE_AGENT_ID,
+            agent_id: ACTIVE_AGENT_ID,
+            executionTier: "dedicated-always",
+            status: "running",
+          },
+        }),
+      });
+    },
+  );
+  await page.route("**/api/v1/user", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        success: true,
+        data: {
+          id: "22222222-2222-4222-8222-222222222222",
+          organization_id: "managed-handoff-org",
+        },
+      }),
+    });
+  });
+  await page.route("**/api/v1/credits/balance", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ balance: 42 }),
+    });
   });
   await page.route("**/api/v1/eliza/personal", async (route) => {
     personalRequests += 1;
@@ -138,9 +196,9 @@ async function installAuthenticatedPersonalRoutes(
           identity: {
             id: PERSONAL_ID,
             displayName: "Eliza",
-            runtime: "shared",
-            activeAgentId: "22222222-2222-4222-8222-222222222222",
-            apiBase: managedOrigin,
+            runtime,
+            activeAgentId: ACTIVE_AGENT_ID,
+            apiBase,
           },
         },
       }),
@@ -173,11 +231,15 @@ for (const surface of SURFACES) {
     const personalRequests = await installAuthenticatedPersonalRoutes(
       page,
       managedOrigin,
-      personalGate,
+      {
+        apiBase: DEDICATED_ORIGIN,
+        personalGate,
+        runtime: "dedicated",
+      },
     );
 
     page.on("request", (request) => {
-      if (new URL(request.url()).pathname.startsWith("/api/notifications")) {
+      if (new URL(request.url()).pathname.includes("/api/notifications")) {
         notificationRequests += 1;
       }
       if (
@@ -208,8 +270,8 @@ for (const surface of SURFACES) {
       "data-login-document",
       "survived",
     );
-    await expect(page).toHaveURL(`${managedOrigin}/`);
-    await expect(page.getByTestId("home-screen")).toBeVisible({
+    await expect(page).toHaveURL(`${managedOrigin}/chat`);
+    await expect(page.getByTestId("chat-composer-textarea")).toBeVisible({
       timeout: 15_000,
     });
     await page.waitForTimeout(1_000);
@@ -217,7 +279,7 @@ for (const surface of SURFACES) {
     expect(documentRequests).toHaveLength(1);
     expect(personalRequests()).toBe(1);
     expect(new URL(documentRequests[0]).pathname).toBe("/join");
-    expect(notificationRequests).toBe(0);
+    expect(notificationRequests).toBeGreaterThan(0);
     await expect(page.getByText("Notifications unavailable")).toHaveCount(0);
     expect(pageErrors).toEqual([]);
     expect(requestFailures).toEqual([]);
