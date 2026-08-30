@@ -7,6 +7,8 @@
 
 import { logger } from "@elizaos/logger";
 import {
+  getStorageValue,
+  removeStorageValueIfCurrent,
   type StorageWriteCompensation,
   type StorageWriteValidationOptions,
   setStorageValue,
@@ -17,6 +19,7 @@ import { shellLocalStorage } from "../surface-realm-channel";
 import { isManagedCloudSharedAgentBase } from "../utils/cloud-agent-base";
 import type { AgentProfile, AgentProfileRegistry } from "./agent-profile-types";
 import {
+  hasBuildPinnedActiveServerTarget,
   isPersistedActiveServerAllowedByBuildTarget,
   type PersistedActiveServer,
   savePersistedActiveServer,
@@ -32,6 +35,74 @@ export interface AgentProfileConnectionPersistenceOptions
   compensateFinalization?: () => Promise<void>;
   /** Capture the exact composite compensator after the transaction commits. */
   captureCompensation?: (compensate: () => Promise<void>) => void;
+}
+
+export interface AgentProfileSelectionPersistenceOptions
+  extends Omit<AgentProfileConnectionPersistenceOptions, "finalize"> {
+  createServer: (profile: AgentProfile) => PersistedActiveServer | null;
+  finalize?: (
+    profile: AgentProfile,
+    server: PersistedActiveServer,
+  ) => Promise<boolean>;
+}
+
+export type AgentProfileSelectionPersistenceResult =
+  | { ok: true; profile: AgentProfile }
+  | {
+      ok: false;
+      reason: "not-found" | "invalid-profile" | "persistence-failed";
+    };
+
+export interface AgentProfileRemovalPersistenceOptions {
+  createServer: (profile: AgentProfile) => PersistedActiveServer | null;
+  finalize: (
+    profile: AgentProfile | null,
+    server: PersistedActiveServer | null,
+  ) => Promise<boolean>;
+}
+
+export type AgentProfileRemovalPersistenceResult =
+  | { ok: true; activeProfile: AgentProfile | null }
+  | {
+      ok: false;
+      reason:
+        | "not-found"
+        | "invalid-fallback"
+        | "persistence-failed"
+        | "build-pinned";
+    };
+
+export interface CloudRuntimeAuthorityClearOptions
+  extends StorageWriteValidationOptions {
+  scope: "shared" | "managed";
+  /** Publish the terminal live-client state while the runtime lock is held. */
+  finalize?: (server: PersistedActiveServer) => void | Promise<void>;
+}
+
+export type CloudRuntimeAuthorityClearResult =
+  | {
+      ok: true;
+      clearedActiveServer: boolean;
+      registryMutation: "missing" | "unchanged" | "applied";
+    }
+  | {
+      ok: false;
+      reason: "not-target" | "authority-lost" | "invalid-state" | "conflict";
+    };
+
+function samePersistedActiveServer(
+  left: PersistedActiveServer,
+  right: PersistedActiveServer,
+): boolean {
+  return (
+    left.id === right.id &&
+    left.kind === right.kind &&
+    left.label === right.label &&
+    left.apiBase === right.apiBase &&
+    left.accessToken === right.accessToken &&
+    left.cloudRuntimeAgentId === right.cloudRuntimeAgentId &&
+    left.cloudRuntime === right.cloudRuntime
+  );
 }
 
 /* ── Helpers ─────────────────────────────────────────────────────────── */
@@ -133,8 +204,9 @@ function emptyRegistry(): AgentProfileRegistry {
  * Attempt to migrate a single-agent `PersistedActiveServer` entry into a
  * profile registry.  Returns null if no prior server is found.
  */
-function migrateFromPersistedActiveServer(): AgentProfileRegistry | null {
-  const raw = localStorage.getItem(ACTIVE_SERVER_KEY);
+function migrateFromPersistedActiveServer(
+  raw: string | null,
+): AgentProfileRegistry | null {
   if (!raw) return null;
 
   let parsed: PersistedActiveServer;
@@ -149,7 +221,10 @@ function migrateFromPersistedActiveServer(): AgentProfileRegistry | null {
   if (!parsed.kind || !parsed.id || !parsed.label) return null;
 
   const profile: AgentProfile = {
-    id: generateId(),
+    // The migration is intentionally pure. A deterministic id/timestamp keeps
+    // repeated sync reads stable until the next awaited durable mutation
+    // persists the final registry under the transaction lock.
+    id: parsed.id,
     label: parsed.label,
     kind: parsed.kind,
     ...(parsed.kind === "cloud" && parsed.id.startsWith("cloud:")
@@ -163,7 +238,7 @@ function migrateFromPersistedActiveServer(): AgentProfileRegistry | null {
       : {}),
     apiBase: parsed.apiBase,
     accessToken: parsed.accessToken,
-    createdAt: new Date().toISOString(),
+    createdAt: "1970-01-01T00:00:00.000Z",
   };
 
   const registry: AgentProfileRegistry = {
@@ -172,25 +247,95 @@ function migrateFromPersistedActiveServer(): AgentProfileRegistry | null {
     profiles: [profile],
   };
 
-  // Persist immediately so migration only runs once.
-  shellLocalStorage.setItem(STORAGE_KEY, JSON.stringify(registry));
-  // Leave elizaos:active-server intact for rollback.
   return registry;
+}
+
+function parseAgentProfileRegistry(
+  raw: string | null,
+): AgentProfileRegistry | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as AgentProfileRegistry;
+    return parsed?.version === 1 && Array.isArray(parsed.profiles)
+      ? parsed
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function parsePersistedActiveServer(
+  raw: string | null,
+): PersistedActiveServer | null | undefined {
+  if (raw === null) return null;
+  try {
+    const parsed = JSON.parse(raw) as PersistedActiveServer;
+    return parsed?.id && parsed.kind && parsed.label ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isManagedCloudServer(server: PersistedActiveServer): boolean {
+  return (
+    server.kind === "cloud" || isManagedCloudSharedAgentBase(server.apiBase)
+  );
+}
+
+function transformCloudRuntimeRegistry(
+  registry: AgentProfileRegistry,
+  scope: CloudRuntimeAuthorityClearOptions["scope"],
+): AgentProfileRegistry | null {
+  let changed = false;
+  const profiles = registry.profiles.flatMap((profile) => {
+    const remove =
+      scope === "shared"
+        ? isManagedCloudSharedAgentBase(profile.apiBase)
+        : profile.kind === "cloud" ||
+          isManagedCloudSharedAgentBase(profile.apiBase);
+    if (remove) {
+      changed = true;
+      return [];
+    }
+    if (scope !== "shared" || !profile.accessToken) return [profile];
+    changed = true;
+    const { accessToken: _accessToken, ...scrubbed } = profile;
+    return [scrubbed];
+  });
+  if (!changed) return null;
+  const activeStillPresent = profiles.some(
+    (profile) => profile.id === registry.activeProfileId,
+  );
+  return {
+    ...registry,
+    activeProfileId: activeStillPresent ? registry.activeProfileId : null,
+    profiles,
+  };
+}
+
+/** Read both migration inputs from the host authority while holding the lock. */
+async function loadAgentProfileRegistryDurably(): Promise<AgentProfileRegistry> {
+  const stored = parseAgentProfileRegistry(await getStorageValue(STORAGE_KEY));
+  if (stored) return stored;
+  return (
+    migrateFromPersistedActiveServer(
+      await getStorageValue(ACTIVE_SERVER_KEY),
+    ) ?? emptyRegistry()
+  );
 }
 
 /* ── Public API ──────────────────────────────────────────────────────── */
 
 export function loadAgentProfileRegistry(): AgentProfileRegistry {
   return tryLocalStorage(() => {
-    const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored) {
-      const parsed = JSON.parse(stored) as AgentProfileRegistry;
-      if (parsed?.version === 1 && Array.isArray(parsed.profiles)) {
-        return parsed;
-      }
-    }
+    const stored = parseAgentProfileRegistry(localStorage.getItem(STORAGE_KEY));
+    if (stored) return stored;
     // No registry yet — try migrating from legacy single-server entry.
-    return migrateFromPersistedActiveServer() ?? emptyRegistry();
+    return (
+      migrateFromPersistedActiveServer(
+        localStorage.getItem(ACTIVE_SERVER_KEY),
+      ) ?? emptyRegistry()
+    );
   }, emptyRegistry());
 }
 
@@ -322,25 +467,51 @@ export function persistAgentProfileSelection(
  */
 export async function persistAgentProfileSelectionDurably(
   profileId: string,
-  server: PersistedActiveServer,
-  options: AgentProfileConnectionPersistenceOptions = {},
-): Promise<boolean> {
+  options: AgentProfileSelectionPersistenceOptions,
+): Promise<AgentProfileSelectionPersistenceResult> {
   try {
     return await serializeRuntimeConnectionPersistence(async () => {
-      const registry = loadAgentProfileRegistry();
-      if (!registry.profiles.some((profile) => profile.id === profileId)) {
-        return false;
-      }
+      const registry = await loadAgentProfileRegistryDurably();
+      const profile = registry.profiles.find(
+        (candidate) => candidate.id === profileId,
+      );
+      if (!profile) return { ok: false, reason: "not-found" };
+      const server = options.createServer(profile);
+      if (!server) return { ok: false, reason: "invalid-profile" };
       const nextRegistry: AgentProfileRegistry = {
         ...registry,
         activeProfileId: profileId,
       };
-      return persistRegistryAndServerDurably(nextRegistry, server, options);
+      const finalize = options.finalize;
+      const transactionOptions: AgentProfileConnectionPersistenceOptions = {
+        ...(options.validate ? { validate: options.validate } : {}),
+        ...(options.compensateOnValidationFailure !== undefined
+          ? {
+              compensateOnValidationFailure:
+                options.compensateOnValidationFailure,
+            }
+          : {}),
+        ...(options.compensateFinalization
+          ? { compensateFinalization: options.compensateFinalization }
+          : {}),
+        ...(options.captureCompensation
+          ? { captureCompensation: options.captureCompensation }
+          : {}),
+        ...(finalize ? { finalize: () => finalize(profile, server) } : {}),
+      };
+      const persisted = await persistRegistryAndServerDurably(
+        nextRegistry,
+        server,
+        transactionOptions,
+      );
+      return persisted
+        ? { ok: true, profile }
+        : { ok: false, reason: "persistence-failed" };
     });
   } catch (cause) {
     if (cause instanceof RuntimeConnectionPersistenceBoundaryError) {
       warnRuntimePersistenceBoundaryUnavailable(cause.cause);
-      return false;
+      return { ok: false, reason: "persistence-failed" };
     }
     throw cause;
   }
@@ -438,7 +609,11 @@ async function compensateStorageWrites(
     writes.map((write) => write.compensate()),
   );
   const failures = outcomes.flatMap((outcome) =>
-    outcome.status === "rejected" ? [outcome.reason] : [],
+    outcome.status === "rejected"
+      ? [outcome.reason]
+      : outcome.value
+        ? []
+        : [new Error("A protected connection rollback was superseded")],
   );
   if (failures.length > 0) {
     throw new AggregateError(
@@ -467,7 +642,11 @@ async function compensateConnectionWrites(
   );
   failures.push(
     ...outcomes.flatMap((outcome) =>
-      outcome.status === "rejected" ? [outcome.reason] : [],
+      outcome.status === "rejected"
+        ? [outcome.reason]
+        : outcome.value
+          ? []
+          : [new Error("A protected connection rollback was superseded")],
     ),
   );
   if (failures.length > 0) {
@@ -501,7 +680,7 @@ export async function addAgentProfileDurably(
 ): Promise<AgentProfile | null> {
   try {
     return await serializeRuntimeConnectionPersistence(async () => {
-      const registry = loadAgentProfileRegistry();
+      const registry = await loadAgentProfileRegistryDurably();
       const full: AgentProfile = {
         ...profile,
         id: options.id ?? generateId(),
@@ -614,7 +793,7 @@ export async function upsertAndActivateAgentProfileDurably(
 ): Promise<AgentProfile | null> {
   try {
     return await serializeRuntimeConnectionPersistence(async () => {
-      const registry = loadAgentProfileRegistry();
+      const registry = await loadAgentProfileRegistryDurably();
       const upserted = upsertAgentProfileRegistry(registry, profile);
       return (await saveAgentProfileRegistryDurably(upserted.registry))
         ? upserted.profile
@@ -646,7 +825,7 @@ export async function persistAgentProfileConnectionDurably(
       // Re-read and upsert only after the transaction owns the cross-key
       // boundary. A queued B connection must include A's committed registry
       // row instead of publishing a stale pre-lock snapshot over it.
-      const registry = loadAgentProfileRegistry();
+      const registry = await loadAgentProfileRegistryDurably();
       const upserted = upsertAgentProfileRegistry(registry, profile);
       return (await persistRegistryAndServerDurably(
         upserted.registry,
@@ -690,38 +869,128 @@ export function removeManagedSharedCloudAgentProfiles(): void {
 }
 
 /**
+ * Clear account-scoped Cloud runtime records from one pair of host-authority
+ * snapshots. Registry mutation, exact active-server deletion, and live-client
+ * publication all remain inside the runtime Web Lock, so a queued login B can
+ * only publish after terminal account A has fully settled.
+ */
+export async function clearCloudRuntimeAuthorityDurably(
+  options: CloudRuntimeAuthorityClearOptions,
+): Promise<CloudRuntimeAuthorityClearResult> {
+  if (options.validate?.() === false) {
+    return { ok: false, reason: "authority-lost" };
+  }
+  try {
+    return await serializeRuntimeConnectionPersistence(async () => {
+      if (options.validate?.() === false) {
+        return { ok: false, reason: "authority-lost" };
+      }
+
+      const activeServerRaw = await getStorageValue(ACTIVE_SERVER_KEY);
+      const activeServer = parsePersistedActiveServer(activeServerRaw);
+      if (activeServer === undefined) {
+        return { ok: false, reason: "invalid-state" };
+      }
+      const activeServerMatches =
+        activeServer !== null &&
+        (options.scope === "shared"
+          ? isManagedCloudSharedAgentBase(activeServer.apiBase)
+          : isManagedCloudServer(activeServer));
+      if (options.scope === "shared" && !activeServerMatches) {
+        return { ok: false, reason: "not-target" };
+      }
+
+      const registryRaw = await getStorageValue(STORAGE_KEY);
+      const registry = parseAgentProfileRegistry(registryRaw);
+      if (registryRaw !== null && !registry) {
+        return { ok: false, reason: "invalid-state" };
+      }
+      const nextRegistry = registry
+        ? transformCloudRuntimeRegistry(registry, options.scope)
+        : null;
+      let registryMutation: Extract<
+        CloudRuntimeAuthorityClearResult,
+        { ok: true }
+      >["registryMutation"] = registryRaw === null ? "missing" : "unchanged";
+      if (registryRaw !== null && nextRegistry) {
+        const applied = await setStorageValueIfCurrent(
+          STORAGE_KEY,
+          registryRaw,
+          JSON.stringify(nextRegistry),
+          { ...options, compensateOnValidationFailure: false },
+        );
+        if (!applied) return { ok: false, reason: "conflict" };
+        registryMutation = "applied";
+      }
+
+      if (options.validate?.() === false) {
+        return { ok: false, reason: "authority-lost" };
+      }
+      if (activeServerMatches && activeServerRaw !== null) {
+        const cleared = await removeStorageValueIfCurrent(
+          ACTIVE_SERVER_KEY,
+          activeServerRaw,
+          options,
+        );
+        if (!cleared) return { ok: false, reason: "conflict" };
+      }
+      if (options.validate?.() === false) {
+        return { ok: false, reason: "authority-lost" };
+      }
+
+      if (activeServerMatches && activeServer && options.finalize) {
+        await options.finalize(activeServer);
+      }
+      return {
+        ok: true,
+        clearedActiveServer: activeServerMatches,
+        registryMutation,
+      };
+    });
+  } catch (cause) {
+    if (cause instanceof RuntimeConnectionPersistenceBoundaryError) {
+      warnRuntimePersistenceBoundaryUnavailable(cause.cause);
+      return { ok: false, reason: "conflict" };
+    }
+    throw cause;
+  }
+}
+
+/**
  * Removes managed Cloud profiles only after the protected native rewrite has
  * committed, so account sign-out cannot resolve over stale profile authority.
  */
 export async function removeManagedCloudAgentProfilesDurably(): Promise<void> {
-  const registry = loadAgentProfileRegistry();
-  const profiles = registry.profiles.filter(
-    (profile) =>
-      profile.kind !== "cloud" &&
-      !isManagedCloudSharedAgentBase(profile.apiBase),
-  );
-  if (profiles.length === registry.profiles.length) return;
-  const activeStillPresent = profiles.some(
-    (profile) => profile.id === registry.activeProfileId,
-  );
-  await setStorageValue(
-    STORAGE_KEY,
-    JSON.stringify({
-      version: 1,
-      activeProfileId: activeStillPresent ? registry.activeProfileId : null,
-      profiles,
-    } satisfies AgentProfileRegistry),
-  );
+  await serializeRuntimeConnectionPersistence(async () => {
+    const registry = await loadAgentProfileRegistryDurably();
+    const profiles = registry.profiles.filter(
+      (profile) =>
+        profile.kind !== "cloud" &&
+        !isManagedCloudSharedAgentBase(profile.apiBase),
+    );
+    if (profiles.length === registry.profiles.length) return;
+    const activeStillPresent = profiles.some(
+      (profile) => profile.id === registry.activeProfileId,
+    );
+    await setStorageValue(
+      STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        activeProfileId: activeStillPresent ? registry.activeProfileId : null,
+        profiles,
+      } satisfies AgentProfileRegistry),
+    );
+  });
 }
 
 /** Remove only shared, account-owned Cloud rows; keep Dedicated/self-hosted rows. */
 export async function removeManagedSharedCloudAgentProfilesDurably(
   options: StorageWriteValidationOptions = {},
 ): Promise<boolean> {
-  if (options.validate?.() === false || typeof localStorage === "undefined") {
+  if (options.validate?.() === false || typeof window === "undefined") {
     return false;
   }
-  const raw = localStorage.getItem(STORAGE_KEY);
+  const raw = await getStorageValue(STORAGE_KEY);
   if (!raw) return false;
   let registry: AgentProfileRegistry;
   try {
@@ -759,10 +1028,10 @@ export async function removeManagedSharedCloudAgentProfilesDurably(
 export async function clearManagedSharedCloudProfilesAndTokensDurably(
   options: StorageWriteValidationOptions = {},
 ): Promise<boolean> {
-  if (options.validate?.() === false || typeof localStorage === "undefined") {
+  if (options.validate?.() === false || typeof window === "undefined") {
     return false;
   }
-  const raw = localStorage.getItem(STORAGE_KEY);
+  const raw = await getStorageValue(STORAGE_KEY);
   if (!raw) return false;
   let registry: AgentProfileRegistry;
   try {
@@ -816,15 +1085,15 @@ export async function removeAgentProfileDurably(
 ): Promise<boolean> {
   try {
     return await serializeRuntimeConnectionPersistence(async () => {
-      const registry = loadAgentProfileRegistry();
+      const registry = await loadAgentProfileRegistryDurably();
       if (!registry.profiles.some((profile) => profile.id === id)) return true;
+      // Removing the active row without changing the boot/live authority in the
+      // same transaction would create an unresolvable selection. Active
+      // removal must use removeAgentProfileWithFallbackDurably below.
+      if (registry.activeProfileId === id) return false;
       const profiles = registry.profiles.filter((profile) => profile.id !== id);
-      const activeProfileId =
-        registry.activeProfileId === id
-          ? (profiles[0]?.id ?? null)
-          : registry.activeProfileId;
       return saveAgentProfileRegistryDurably(
-        { ...registry, activeProfileId, profiles },
+        { ...registry, profiles },
         options,
       );
     });
@@ -832,6 +1101,129 @@ export async function removeAgentProfileDurably(
     if (cause instanceof RuntimeConnectionPersistenceBoundaryError) {
       warnRuntimePersistenceBoundaryUnavailable(cause.cause);
       return false;
+    }
+    throw cause;
+  }
+}
+
+/**
+ * Remove a runtime and, when it is active, publish its fallback (or complete
+ * clear) inside the same origin-wide transaction as the registry rewrite.
+ */
+export async function removeAgentProfileWithFallbackDurably(
+  id: string,
+  options: AgentProfileRemovalPersistenceOptions,
+): Promise<AgentProfileRemovalPersistenceResult> {
+  try {
+    return await serializeRuntimeConnectionPersistence(async () => {
+      const registry = await loadAgentProfileRegistryDurably();
+      const target = registry.profiles.find((profile) => profile.id === id);
+      if (!target) return { ok: false, reason: "not-found" };
+
+      const profiles = registry.profiles.filter((profile) => profile.id !== id);
+      if (registry.activeProfileId !== id) {
+        return (await saveAgentProfileRegistryDurably({
+          ...registry,
+          profiles,
+        }))
+          ? { ok: true, activeProfile: null }
+          : { ok: false, reason: "persistence-failed" };
+      }
+
+      const fallback =
+        profiles.find((profile) => profile.kind === "local") ?? profiles[0];
+      if (fallback) {
+        const server = options.createServer(fallback);
+        if (!server) return { ok: false, reason: "invalid-fallback" };
+        if (!isPersistedActiveServerAllowedByBuildTarget(server)) {
+          return { ok: false, reason: "build-pinned" };
+        }
+        const persisted = await persistRegistryAndServerDurably(
+          { ...registry, activeProfileId: fallback.id, profiles },
+          server,
+          {
+            finalize: () => options.finalize(fallback, server),
+          },
+        );
+        return persisted
+          ? { ok: true, activeProfile: fallback }
+          : { ok: false, reason: "persistence-failed" };
+      }
+
+      // A pinned build must always retain its sole configured boot authority;
+      // reject the last-profile removal before either protected record changes.
+      if (hasBuildPinnedActiveServerTarget()) {
+        return { ok: false, reason: "build-pinned" };
+      }
+
+      const expectedServer = options.createServer(target);
+      if (!expectedServer) {
+        return { ok: false, reason: "persistence-failed" };
+      }
+      const activeServerRaw = await getStorageValue(ACTIVE_SERVER_KEY);
+      if (activeServerRaw) {
+        try {
+          const activeServer = JSON.parse(
+            activeServerRaw,
+          ) as PersistedActiveServer;
+          if (!samePersistedActiveServer(activeServer, expectedServer)) {
+            return { ok: false, reason: "persistence-failed" };
+          }
+        } catch {
+          // error-policy:J3 malformed boot authority cannot be safely deleted.
+          return { ok: false, reason: "persistence-failed" };
+        }
+      }
+
+      const registryWrite = await setStorageValueWithCompensation(
+        STORAGE_KEY,
+        JSON.stringify({
+          ...registry,
+          activeProfileId: null,
+          profiles,
+        } satisfies AgentProfileRegistry),
+      );
+      if (!registryWrite) {
+        return { ok: false, reason: "persistence-failed" };
+      }
+
+      let serverCleared = activeServerRaw === null;
+      try {
+        if (activeServerRaw !== null) {
+          serverCleared = await removeStorageValueIfCurrent(
+            ACTIVE_SERVER_KEY,
+            activeServerRaw,
+          );
+        }
+      } catch (cause) {
+        try {
+          await compensateStorageWrites(registryWrite);
+        } catch (rollbackError) {
+          throw new AggregateError(
+            [cause, rollbackError],
+            "Active-server deletion and registry compensation failed",
+          );
+        }
+        throw cause;
+      }
+      if (!serverCleared) {
+        await compensateStorageWrites(registryWrite);
+        return { ok: false, reason: "persistence-failed" };
+      }
+
+      // Persistent state is already coherently empty. The UI boundary surfaces
+      // a live-client publication failure rather than resurrecting a deleted
+      // boot authority with an unfenced write.
+      const finalized = await options.finalize(null, null);
+      if (!finalized) {
+        return { ok: false, reason: "persistence-failed" };
+      }
+      return { ok: true, activeProfile: null };
+    });
+  } catch (cause) {
+    if (cause instanceof RuntimeConnectionPersistenceBoundaryError) {
+      warnRuntimePersistenceBoundaryUnavailable(cause.cause);
+      return { ok: false, reason: "persistence-failed" };
     }
     throw cause;
   }
@@ -861,8 +1253,8 @@ export async function scrubPersistedAgentProfileTokensDurably(
   options: StorageWriteValidationOptions = {},
 ): Promise<boolean> {
   if (options.validate?.() === false) return false;
-  if (typeof localStorage === "undefined") return false;
-  const raw = localStorage.getItem(STORAGE_KEY);
+  if (typeof window === "undefined") return false;
+  const raw = await getStorageValue(STORAGE_KEY);
   if (!raw) return false;
   let registry: AgentProfileRegistry;
   try {

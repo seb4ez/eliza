@@ -54,7 +54,6 @@ import { applyAgentProfileConnection } from "./agent-profile-connection";
 import {
   activeServerIdForAgentProfile,
   getActiveProfile,
-  loadAgentProfileRegistry,
   persistAgentProfileSelectionDurably,
 } from "./agent-profiles";
 import { publishAppValue, seedAppValue } from "./app-store";
@@ -1548,49 +1547,36 @@ function AppProviderInner({
   );
 
   const switchAgentProfile = useCallback(
-    async (profileId: string) => {
-      const profile = loadAgentProfileRegistry().profiles.find(
-        (p) => p.id === profileId,
-      );
-      if (!profile) return;
-
-      // The profile registry is persisted in localStorage, so a tampered/
-      // attacker-written profile could point a "remote" agent at an untrusted
-      // host. Refuse to switch to (and dial / send the bearer token to) such a
-      // profile — same trust gate the boot-restore path uses.
-      if (
-        profile.kind === "remote" &&
-        !isTrustedRestoreApiBaseUrl(profile.apiBase)
-      ) {
-        return;
-      }
-      if (
-        profile.kind === "cloud" &&
-        !isTrustedCloudApiBaseUrl(
-          profile.apiBase,
-          profile.cloudRuntimeAgentId ?? profile.cloudAgentId,
-        )
-      ) {
-        return;
-      }
-
-      const server = createPersistedActiveServer({
-        kind: profile.kind,
-        id: activeServerIdForAgentProfile(profile),
-        apiBase: profile.apiBase,
-        accessToken: profile.accessToken,
-        label: profile.label,
-        cloudRuntimeAgentId: profile.cloudRuntimeAgentId,
-        cloudRuntime: profile.cloudRuntime,
-      });
-      const persisted = await persistAgentProfileSelectionDurably(
-        profileId,
-        server,
-        {
+    (profileId: string) => {
+      void (async () => {
+        let trustRefused = false;
+        const persisted = await persistAgentProfileSelectionDurably(profileId, {
+          createServer: (profile) => {
+            // Derive trust and credentials from the host-authoritative profile
+            // read under the transaction lock, never from a pre-lock snapshot.
+            trustRefused =
+              (profile.kind === "remote" &&
+                !isTrustedRestoreApiBaseUrl(profile.apiBase)) ||
+              (profile.kind === "cloud" &&
+                !isTrustedCloudApiBaseUrl(
+                  profile.apiBase,
+                  profile.cloudRuntimeAgentId ?? profile.cloudAgentId,
+                ));
+            if (trustRefused) return null;
+            return createPersistedActiveServer({
+              kind: profile.kind,
+              id: activeServerIdForAgentProfile(profile),
+              apiBase: profile.apiBase,
+              accessToken: profile.accessToken,
+              label: profile.label,
+              cloudRuntimeAgentId: profile.cloudRuntimeAgentId,
+              cloudRuntime: profile.cloudRuntime,
+            });
+          },
           // The finalizer runs while the registry + active-server transaction
           // still owns the runtime boundary, so a queued B selection cannot
           // commit before A finishes repointing the live app authority.
-          finalize: async () => {
+          finalize: async (profile, server) => {
             // Conversation ids are authority-local. Purge both canonical
             // snapshots and optimistic overlays before the live client moves.
             discardConversationMessageState();
@@ -1620,15 +1606,19 @@ function AppProviderInner({
             });
             return true;
           },
-        },
-      );
-      if (!persisted) {
-        setActionNotice(
-          "Couldn't switch agents because browser storage is unavailable.",
-          "error",
-        );
-        return;
-      }
+        });
+        if (!persisted.ok && !trustRefused) {
+          setActionNotice(
+            "Couldn't switch agents because browser storage is unavailable.",
+            "error",
+          );
+        }
+      })().catch((cause) => {
+        // error-policy:J4 context callbacks are void; rejected durable work is
+        // surfaced through the shell notice instead of escaping unobserved.
+        const detail = cause instanceof Error ? ` ${cause.message}` : "";
+        setActionNotice(`Couldn't switch agents.${detail}`, "error");
+      });
     },
     [
       discardConversationMessageState,

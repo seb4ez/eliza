@@ -1,5 +1,5 @@
 /** Restart-safe setup and removal coordinator for verified SSH runtimes. */
-import type { AgentProfile, AgentProfileRegistry } from "../state";
+import type { AgentProfile } from "../state";
 import { shellLocalStorage } from "../surface-realm-channel";
 import type { SshRuntimeEnrollment } from "./ssh-runtime";
 
@@ -52,9 +52,8 @@ export interface SshRuntimeLifecycleDependencies {
   addProfile(
     profile: Omit<AgentProfile, "id" | "createdAt">,
     options: { activate: false; id: string },
-  ): AgentProfile;
-  removeProfile(profileId: string): void | Promise<void>;
-  loadRegistry(): AgentProfileRegistry;
+  ): Promise<AgentProfile | null>;
+  removeProfile(profileId: string): Promise<void>;
 }
 
 export interface SetupSshRuntimeInput extends SshRuntimeEnrollment {
@@ -217,30 +216,20 @@ async function cleanupReceipt(
     }
   };
 
-  await runStep("tunnel-stop", "stopTunnel", () =>
-    dependencies.stopTunnel(receipt.runtimeId),
+  // Claim the profile deletion against host-authoritative registry state before
+  // stopping a tunnel or deleting credentials. A concurrent activation then
+  // refuses this first step and leaves the still-selected runtime operational.
+  await runStep("profile-remove", "removeProfile", () =>
+    dependencies.removeProfile(receipt.profileId),
   );
-  await runStep("credential-delete", "deleteCredential", () =>
-    dependencies.deleteCredentialRecord(receipt.runtimeId),
-  );
-  await runStep("profile-remove", "removeProfile", async () => {
-    const registry = dependencies.loadRegistry();
-    const profile = registry.profiles.find(
-      (candidate) => candidate.id === receipt.profileId,
+  if (!receipt.pending.removeProfile) {
+    await runStep("tunnel-stop", "stopTunnel", () =>
+      dependencies.stopTunnel(receipt.runtimeId),
     );
-    if (!profile) return;
-    if (registry.activeProfileId === profile.id) {
-      throw new Error("Switch away from the SSH runtime before removing it.");
-    }
-    await dependencies.removeProfile(profile.id);
-    if (
-      dependencies
-        .loadRegistry()
-        .profiles.some((candidate) => candidate.id === profile.id)
-    ) {
-      throw new Error("The SSH runtime profile could not be removed.");
-    }
-  });
+    await runStep("credential-delete", "deleteCredential", () =>
+      dependencies.deleteCredentialRecord(receipt.runtimeId),
+    );
+  }
 
   const pending = pendingStepNames(receipt);
   if (pending.length === 0) {
@@ -331,7 +320,7 @@ export function setupSshRuntime(
         await dependencies.storeCredential(input.runtimeId, input.accessToken);
       }
       await dependencies.startTunnel(input);
-      profile = dependencies.addProfile(
+      profile = await dependencies.addProfile(
         {
           kind: "remote",
           label: input.label,
@@ -348,6 +337,9 @@ export function setupSshRuntime(
         },
         { activate: false, id: input.runtimeId },
       );
+      if (!profile) {
+        throw new Error("The SSH runtime profile could not be saved.");
+      }
       receipt.state = "committed";
       store.put(receipt);
     } catch (cause) {
@@ -382,10 +374,6 @@ export function removeSshRuntime(
 ): Promise<void> {
   return serializeLifecycle(async () => {
     if (profile.connectionMode !== "ssh" || !profile.ssh) return;
-    const registry = dependencies.loadRegistry();
-    if (registry.activeProfileId === profile.id) {
-      throw new Error("Switch away from the SSH runtime before removing it.");
-    }
     const existing = store
       .list()
       .find((receipt) => receipt.profileId === profile.id);
@@ -405,8 +393,9 @@ export function removeSshRuntime(
     store.put(receipt);
     const cleanup = await cleanupReceipt(receipt, dependencies, store);
     if (!cleanup.complete) {
+      const detail = cleanup.failures[0]?.message;
       throw new SshRuntimeLifecycleError(
-        "SSH cleanup is incomplete; retry the remaining steps.",
+        `${detail ? `${detail} ` : ""}SSH cleanup is incomplete; retry the remaining steps.`,
         pendingStepNames(cleanup.receipt),
       );
     }
@@ -425,8 +414,9 @@ export function retrySshRuntimeCleanup(
     if (!receipt) return false;
     const cleanup = await cleanupReceipt(receipt, dependencies, store);
     if (!cleanup.complete) {
+      const detail = cleanup.failures[0]?.message;
       throw new SshRuntimeLifecycleError(
-        "SSH cleanup is incomplete; retry the remaining steps.",
+        `${detail ? `${detail} ` : ""}SSH cleanup is incomplete; retry the remaining steps.`,
         pendingStepNames(cleanup.receipt),
       );
     }

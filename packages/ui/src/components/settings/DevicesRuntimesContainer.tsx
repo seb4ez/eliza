@@ -35,7 +35,7 @@ import {
 import {
   type AgentProfile,
   type AgentProfileRegistry,
-  addAgentProfile,
+  addAgentProfileDurably,
   loadAgentProfileRegistry,
   switchRuntimeNonDestructive,
 } from "../../state";
@@ -550,9 +550,15 @@ export function DevicesRuntimesContainer({
             (profile) => profile.remoteRelay?.sessionId === session.id,
           );
           if (existing) continue;
-          addAgentProfile(restoredRelayProfile(host, session, nextController), {
-            activate: false,
-          });
+          const restored = await addAgentProfileDurably(
+            restoredRelayProfile(host, session, nextController),
+            { activate: false },
+          );
+          if (!restored) {
+            throw new Error(
+              "A paired runtime could not be restored to protected storage.",
+            );
+          }
         }
       }
       setRegistry(loadAgentProfileRegistry());

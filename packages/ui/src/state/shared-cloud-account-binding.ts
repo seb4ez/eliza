@@ -3,24 +3,48 @@
  * Cloud agent when its Steward account session ends.
  */
 
+import { readStoredStewardToken } from "@elizaos/shared/steward-session-client";
 import { client } from "../api";
 import type { StorageWriteValidationOptions } from "../bridge/storage-bridge";
-import { isManagedCloudSharedAgentBase } from "../utils/cloud-agent-base";
-import { clearElizaApiBase } from "../utils/eliza-globals";
+import { getBootConfig } from "../config/boot-config";
+import { clearElizaApiBase, getElizaApiToken } from "../utils/eliza-globals";
 import {
-  clearManagedSharedCloudProfilesAndTokensDurably,
-  removeManagedCloudAgentProfilesDurably,
+  type CloudRuntimeAuthorityClearOptions,
+  type CloudRuntimeAuthorityClearResult,
+  clearCloudRuntimeAuthorityDurably,
   removeManagedSharedCloudAgentProfiles,
 } from "./agent-profiles";
-import { isManagedCloudAgentServer } from "./agent-session-recovery";
 import {
-  clearPersistedActiveServerDurably,
   clearPersistedSharedCloudActiveServer,
-  clearPersistedSharedCloudActiveServerDurably,
   loadPersistedActiveServer,
 } from "./persistence";
 
 const STORED_API_BASE_KEY = "elizaos_api_base";
+
+interface CloudBindingCredentialSnapshot {
+  bootToken: string | null;
+  stewardToken: string | null;
+  windowToken: string | null;
+}
+
+function captureCloudBindingCredentialSnapshot(): CloudBindingCredentialSnapshot {
+  return {
+    bootToken: getBootConfig().apiToken?.trim() || null,
+    stewardToken: readStoredStewardToken()?.trim() || null,
+    windowToken: getElizaApiToken()?.trim() || null,
+  };
+}
+
+function sameCloudBindingCredentialSnapshot(
+  expected: CloudBindingCredentialSnapshot,
+): boolean {
+  const current = captureCloudBindingCredentialSnapshot();
+  return (
+    current.bootToken === expected.bootToken &&
+    current.stewardToken === expected.stewardToken &&
+    current.windowToken === expected.windowToken
+  );
+}
 
 function clearLiveSharedCloudBindingMirrors(): void {
   client.setToken(null);
@@ -59,43 +83,64 @@ export function clearSharedCloudAccountBinding(): boolean {
 export async function clearSharedCloudAccountBindingDurably(
   options: StorageWriteValidationOptions = {},
 ): Promise<boolean> {
-  if (options.validate?.() === false) return false;
-  const activeServer = loadPersistedActiveServer();
-  if (!isManagedCloudSharedAgentBase(activeServer?.apiBase)) return false;
-  await clearManagedSharedCloudProfilesAndTokensDurably(options);
-  if (options.validate?.() === false) return false;
-
-  if (!(await clearPersistedSharedCloudActiveServerDurably(options))) {
-    // A lost terminal authority never resurrects A. The exact profile scrub
-    // remains safe, while a newer B registry/selection is host-CAS protected.
-    return false;
-  }
-
-  if (options.validate?.() === false) return false;
-  clearLiveSharedCloudBindingMirrors();
-  return true;
+  return clearSharedCloudAccountBindingDurablyWithDependencies(
+    options,
+    clearCloudRuntimeAuthorityDurably,
+  );
 }
+
+async function clearSharedCloudAccountBindingDurablyWithDependencies(
+  options: StorageWriteValidationOptions,
+  clearAuthority: (
+    options: CloudRuntimeAuthorityClearOptions,
+  ) => Promise<CloudRuntimeAuthorityClearResult>,
+): Promise<boolean> {
+  const credentialSnapshot = captureCloudBindingCredentialSnapshot();
+  // This path is entered only after the caller proved there is no Cloud
+  // account session. A token already present here belongs to a newer login B.
+  if (credentialSnapshot.stewardToken !== null) return false;
+  const validate = () =>
+    options.validate?.() !== false &&
+    sameCloudBindingCredentialSnapshot(credentialSnapshot);
+  if (!validate()) return false;
+  const result = await clearAuthority({
+    ...options,
+    scope: "shared",
+    validate,
+    finalize: () => {
+      if (!validate()) {
+        throw new Error("Cloud account authority changed during teardown");
+      }
+      clearLiveSharedCloudBindingMirrors();
+    },
+  });
+  return result.ok && result.clearedActiveServer;
+}
+
+export const sharedCloudAccountBindingInternals = {
+  clearSharedCloudAccountBindingDurablyWithDependencies,
+};
 
 /**
  * Releases every browser mirror whose authority comes from the ending Eliza
  * Cloud account while preserving unrelated local and self-hosted profiles.
  */
 export async function clearManagedCloudAccountBinding(): Promise<void> {
-  const activeServer = loadPersistedActiveServer();
-  if (isManagedCloudAgentServer(activeServer)) {
-    await clearPersistedActiveServerDurably();
-    client.setToken(null);
-    client.setBaseUrl(null);
-    clearElizaApiBase();
-    if (typeof window !== "undefined") {
-      try {
-        window.localStorage.removeItem(STORED_API_BASE_KEY);
-        window.sessionStorage.removeItem(STORED_API_BASE_KEY);
-      } catch {
-        // error-policy:J6 account sign-out already cleared canonical managed
-        // selection state; inaccessible compatibility mirrors cannot be reused.
+  const credentialSnapshot = captureCloudBindingCredentialSnapshot();
+  const validate = () => sameCloudBindingCredentialSnapshot(credentialSnapshot);
+  const result = await clearCloudRuntimeAuthorityDurably({
+    scope: "managed",
+    validate,
+    finalize: () => {
+      if (!validate()) {
+        throw new Error("Cloud account authority changed during teardown");
       }
-    }
+      clearLiveSharedCloudBindingMirrors();
+    },
+  });
+  if (!result.ok) {
+    throw new Error(
+      `Cloud runtime teardown could not prove authority (${result.reason}).`,
+    );
   }
-  await removeManagedCloudAgentProfilesDurably();
 }

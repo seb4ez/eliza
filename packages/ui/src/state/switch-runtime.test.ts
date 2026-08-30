@@ -9,16 +9,12 @@ import type { AgentProfile } from "./agent-profile-types";
 
 const mocks = vi.hoisted(() => ({
   setBaseUrl: vi.fn(),
-  repointBaseUrl: vi.fn(),
+  repointBaseUrl: vi.fn(
+    (_baseUrl?: string, _accessToken?: string | null) => true,
+  ),
   setToken: vi.fn(),
   loadAgentProfileRegistry: vi.fn(),
-  persistAgentProfileSelectionDurably: vi.fn(
-    async (
-      _profileId: string,
-      _server: unknown,
-      options?: { finalize?: () => Promise<boolean> },
-    ) => options?.finalize?.() ?? true,
-  ),
+  persistAgentProfileSelectionDurably: vi.fn(),
   activeServerIdForAgentProfile: vi.fn((profile: AgentProfile) =>
     profile.kind === "cloud" && profile.cloudAgentId
       ? `cloud:${profile.cloudAgentId}`
@@ -149,8 +145,31 @@ describe("switchRuntimeNonDestructive", () => {
     for (const fn of Object.values(mocks)) fn.mockClear();
     mocks.isTrustedRestoreApiBaseUrl.mockReturnValue(true);
     mocks.isTrustedCloudApiBaseUrl.mockReturnValue(true);
+    mocks.repointBaseUrl.mockReturnValue(true);
     mocks.persistAgentProfileSelectionDurably.mockImplementation(
-      async (_profileId, _server, options) => options?.finalize?.() ?? true,
+      async (
+        profileId: string,
+        options: {
+          createServer: (profile: AgentProfile) => unknown | null;
+          finalize?: (
+            profile: AgentProfile,
+            server: unknown,
+          ) => Promise<boolean>;
+        },
+      ) => {
+        const profile = mocks
+          .loadAgentProfileRegistry()
+          .profiles.find(
+            (candidate: AgentProfile) => candidate.id === profileId,
+          );
+        if (!profile) return { ok: false, reason: "not-found" };
+        const server = options.createServer(profile);
+        if (!server) return { ok: false, reason: "invalid-profile" };
+        if (options.finalize && !(await options.finalize(profile, server))) {
+          return { ok: false, reason: "persistence-failed" };
+        }
+        return { ok: true, profile };
+      },
     );
     mocks.createPersistedActiveServer.mockImplementation((a) => ({ ...a }));
     mocks.getFrontendPlatform.mockReturnValue("web");
@@ -167,7 +186,10 @@ describe("switchRuntimeNonDestructive", () => {
       ok: false,
       reason: "not-found",
     });
-    expect(mocks.persistAgentProfileSelectionDurably).not.toHaveBeenCalled();
+    expect(mocks.persistAgentProfileSelectionDurably).toHaveBeenCalledWith(
+      "nope",
+      expect.objectContaining({ createServer: expect.any(Function) }),
+    );
     expect(mocks.repointBaseUrl).not.toHaveBeenCalled();
   });
 
@@ -180,8 +202,10 @@ describe("switchRuntimeNonDestructive", () => {
     expect(res).toEqual({ ok: true, profile: CLOUD });
     expect(mocks.persistAgentProfileSelectionDurably).toHaveBeenCalledWith(
       "cloud-1",
-      expect.objectContaining({ kind: "cloud" }),
-      expect.objectContaining({ finalize: expect.any(Function) }),
+      expect.objectContaining({
+        createServer: expect.any(Function),
+        finalize: expect.any(Function),
+      }),
     );
     expect(mocks.repointBaseUrl).toHaveBeenCalledWith(
       "https://11111111-1111-4111-8111-111111111111.elizacloud.ai",
@@ -209,7 +233,10 @@ describe("switchRuntimeNonDestructive", () => {
   });
 
   it("does not move the live client or clear drafts when durable selection fails", async () => {
-    mocks.persistAgentProfileSelectionDurably.mockResolvedValue(false);
+    mocks.persistAgentProfileSelectionDurably.mockResolvedValue({
+      ok: false,
+      reason: "persistence-failed",
+    });
     withRegistry([LOCAL, CLOUD]);
     const authorityPhase = vi.fn();
     const unsubscribe = subscribeRuntimeAuthoritySwitch(authorityPhase);
@@ -226,6 +253,22 @@ describe("switchRuntimeNonDestructive", () => {
     expect(
       mocks.persistMobileRuntimeModeForServerTarget,
     ).not.toHaveBeenCalled();
+  });
+
+  it("fails the durable transaction when the live client refuses publication", async () => {
+    mocks.repointBaseUrl.mockReturnValue(false);
+    withRegistry([LOCAL, CLOUD]);
+    const authorityPhase = vi.fn();
+    const unsubscribe = subscribeRuntimeAuthoritySwitch(authorityPhase);
+
+    await expect(switchRuntimeNonDestructive("cloud-1")).resolves.toEqual({
+      ok: false,
+      reason: "persistence-failed",
+    });
+
+    unsubscribe();
+    expect(mocks.clearAllChatDrafts).not.toHaveBeenCalled();
+    expect(authorityPhase.mock.calls).toEqual([["before"], ["after"]]);
   });
 
   it("rejects a Cloud profile whose persisted base is outside the Cloud trust boundary", async () => {
@@ -248,7 +291,8 @@ describe("switchRuntimeNonDestructive", () => {
     expect(authorityPhase).not.toHaveBeenCalled();
     expect(mocks.setToken).not.toHaveBeenCalled();
     expect(mocks.repointBaseUrl).not.toHaveBeenCalled();
-    expect(mocks.persistAgentProfileSelectionDurably).not.toHaveBeenCalled();
+    expect(mocks.persistAgentProfileSelectionDurably).toHaveBeenCalledOnce();
+    expect(mocks.createPersistedActiveServer).not.toHaveBeenCalled();
   });
 
   it("switching to a tokenless Cloud profile clears the previous runtime bearer", async () => {
@@ -292,8 +336,10 @@ describe("switchRuntimeNonDestructive", () => {
     expect(res.ok).toBe(true);
     expect(mocks.persistAgentProfileSelectionDurably).toHaveBeenCalledWith(
       "local-1",
-      expect.objectContaining({ kind: "local" }),
-      expect.objectContaining({ finalize: expect.any(Function) }),
+      expect.objectContaining({
+        createServer: expect.any(Function),
+        finalize: expect.any(Function),
+      }),
     );
     // local is same-origin: re-point to the app host + drop any prior
     // remote/cloud bearer (regression guard for the stale-base/token bug).
@@ -309,7 +355,8 @@ describe("switchRuntimeNonDestructive", () => {
       ok: false,
       reason: "untrusted-remote",
     });
-    expect(mocks.persistAgentProfileSelectionDurably).not.toHaveBeenCalled();
+    expect(mocks.persistAgentProfileSelectionDurably).toHaveBeenCalledOnce();
+    expect(mocks.createPersistedActiveServer).not.toHaveBeenCalled();
     expect(mocks.repointBaseUrl).not.toHaveBeenCalled();
   });
 

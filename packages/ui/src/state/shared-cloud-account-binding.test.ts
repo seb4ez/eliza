@@ -1,9 +1,10 @@
 /** Verifies complete browser teardown of an account-scoped shared Cloud binding under jsdom. */
 // @vitest-environment jsdom
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { getBootConfig, setBootConfig } from "../config/boot-config";
 import {
+  clearManagedSharedCloudProfilesAndTokensDurably,
   loadAgentProfileRegistry,
   saveAgentProfileRegistry,
 } from "./agent-profiles";
@@ -15,6 +16,7 @@ import {
   clearManagedCloudAccountBinding,
   clearSharedCloudAccountBinding,
   clearSharedCloudAccountBindingDurably,
+  sharedCloudAccountBindingInternals,
 } from "./shared-cloud-account-binding";
 
 const SHARED_BASE =
@@ -165,26 +167,13 @@ describe("clearSharedCloudAccountBinding", () => {
       ],
     });
     localStorage.setItem("elizaos_api_base", SHARED_BASE);
-    let authorityLive = true;
-    const originalSetItem = window.localStorage.setItem.bind(
-      window.localStorage,
-    );
-    const setItem = vi
-      .spyOn(window.localStorage, "setItem")
-      .mockImplementation((key, value) => {
-        originalSetItem(key, value);
-        if (key === "elizaos:agent-profiles") authorityLive = false;
-      });
-
-    try {
-      await expect(
-        clearSharedCloudAccountBindingDurably({
-          validate: () => authorityLive,
-        }),
-      ).resolves.toBe(false);
-    } finally {
-      setItem.mockRestore();
-    }
+    await expect(
+      clearSharedCloudAccountBindingDurably({
+        // The exact terminal profile transform is authority A's last allowed
+        // write; its resulting empty registry deterministically represents B.
+        validate: () => loadAgentProfileRegistry().profiles.length > 0,
+      }),
+    ).resolves.toBe(false);
 
     expect(loadAgentProfileRegistry().profiles).toEqual([]);
     expect(loadPersistedActiveServer()?.apiBase).toBe(SHARED_BASE);
@@ -214,25 +203,15 @@ describe("clearSharedCloudAccountBinding", () => {
       ],
     });
     localStorage.setItem("elizaos_api_base", SHARED_BASE);
-    const originalRemoveItem = window.localStorage.removeItem.bind(
-      window.localStorage,
-    );
-    const removeItem = vi
-      .spyOn(window.localStorage, "removeItem")
-      .mockImplementation((key) => {
-        if (key === "elizaos:active-server") {
+    await expect(
+      sharedCloudAccountBindingInternals.clearSharedCloudAccountBindingDurablyWithDependencies(
+        { validate: () => true },
+        async (options) => {
+          await clearManagedSharedCloudProfilesAndTokensDurably(options);
           throw new DOMException("blocked", "SecurityError");
-        }
-        originalRemoveItem(key);
-      });
-
-    try {
-      await expect(
-        clearSharedCloudAccountBindingDurably({ validate: () => true }),
-      ).rejects.toThrow("blocked");
-    } finally {
-      removeItem.mockRestore();
-    }
+        },
+      ),
+    ).rejects.toThrow("blocked");
 
     expect(loadAgentProfileRegistry().profiles).toEqual([]);
     expect(loadPersistedActiveServer()?.apiBase).toBe(SHARED_BASE);

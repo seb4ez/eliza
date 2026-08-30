@@ -32,11 +32,17 @@ function switchFailureMessage(reason: string | undefined): string {
   return "That runtime is no longer available.";
 }
 
+function runtimeOperationFailureMessage(cause: unknown): string {
+  return cause instanceof Error && cause.message.trim()
+    ? cause.message
+    : "The runtime operation failed. Check protected storage and try again.";
+}
+
 /**
  * Live container for {@link MyRuntimesSection}: reads the agent-profile registry,
  * switches the active runtime in place via {@link switchRuntimeNonDestructive}
  * (with the public-URL trust gate), and adds a VPS/remote runtime via
- * `addAgentProfile`. Mount this in Settings (or the cockpit) to manage
+ * `addAgentProfileDurably`. Mount this in Settings (or the cockpit) to manage
  * local / cloud-dedicated / VPS-remote runtimes from one place.
  */
 export function MyRuntimesContainer({ className }: MyRuntimesContainerProps) {
@@ -81,6 +87,9 @@ export function MyRuntimesContainer({ className }: MyRuntimesContainerProps) {
         if (!res.ok) {
           setError(switchFailureMessage(res.reason));
         }
+      } catch (cause) {
+        // error-policy:J4 rejected durable switches become a visible alert.
+        setError(runtimeOperationFailureMessage(cause));
       } finally {
         refresh();
         setBusy(false);
@@ -118,6 +127,9 @@ export function MyRuntimesContainer({ className }: MyRuntimesContainerProps) {
         }
         const result = await switchRuntimeNonDestructive(profile.id);
         if (!result.ok) setError(switchFailureMessage(result.reason));
+      } catch (cause) {
+        // error-policy:J4 rejected durable additions become a visible alert.
+        setError(runtimeOperationFailureMessage(cause));
       } finally {
         refresh();
         setBusy(false);

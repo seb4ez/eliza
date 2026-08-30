@@ -72,15 +72,6 @@ const PROFILE: AgentProfile = {
   },
 };
 
-const LOCAL_PROFILE: AgentProfile = {
-  id: "local-profile",
-  label: "This device",
-  kind: "local",
-  apiBase: "http://127.0.0.1:3000",
-  connectionMode: "direct",
-  createdAt: "2026-08-21T00:00:00.000Z",
-};
-
 const SSH_PROFILE: AgentProfile = {
   id: "ssh-profile",
   label: "Production VPS",
@@ -318,114 +309,51 @@ describe("Devices & Runtimes reconciliation", () => {
     expect(targets.map((target) => target.id)).toEqual([PROFILE.id]);
   });
 
-  it("switches away from an active profile before removing it", async () => {
-    const events: string[] = [];
+  it("delegates active fallback and profile deletion to one atomic operation", async () => {
+    const removeRuntimeProfile = vi.fn(async () => ({ ok: true }));
+
     await devicesRuntimesInternals.removeProfileWithoutStaleSelection(
       PROFILE.id,
-      {
-        loadRegistry: () => ({
-          version: 1,
-          activeProfileId: PROFILE.id,
-          profiles: [PROFILE, LOCAL_PROFILE],
-        }),
-        switchRuntime: vi.fn(async (profileId) => {
-          events.push(`switch:${profileId}`);
-          return { ok: true };
-        }),
-        clearRuntimeSelection: vi.fn(async () => undefined),
-        removeProfile: vi.fn(async (profileId) => {
-          events.push(`remove:${profileId}`);
-          return undefined;
-        }),
-      },
+      { removeRuntimeProfile },
     );
-    expect(events).toEqual([
-      `switch:${LOCAL_PROFILE.id}`,
-      `remove:${PROFILE.id}`,
-    ]);
+
+    expect(removeRuntimeProfile).toHaveBeenCalledOnce();
+    expect(removeRuntimeProfile).toHaveBeenCalledWith(PROFILE.id);
   });
 
-  it("does not remove the active profile when no fallback can be persisted", async () => {
-    const removeProfile = vi.fn(async () => undefined);
+  it("reports an atomic fallback/deletion persistence failure", async () => {
     await expect(
       devicesRuntimesInternals.removeProfileWithoutStaleSelection(PROFILE.id, {
-        loadRegistry: () => ({
-          version: 1,
-          activeProfileId: PROFILE.id,
-          profiles: [PROFILE, LOCAL_PROFILE],
-        }),
-        switchRuntime: vi.fn(async () => ({ ok: false })),
-        clearRuntimeSelection: vi.fn(async () => undefined),
-        removeProfile,
+        removeRuntimeProfile: vi.fn(async () => ({
+          ok: false,
+          reason: "persistence-failed",
+        })),
       }),
-    ).rejects.toThrow("fallback runtime was not saved");
-    expect(removeProfile).not.toHaveBeenCalled();
+    ).rejects.toThrow("fallback or cleared selection could not be saved");
   });
 
-  it("clears an only active runtime selection before removing its profile", async () => {
-    const events: string[] = [];
-    await devicesRuntimesInternals.removeProfileWithoutStaleSelection(
-      PROFILE.id,
-      {
-        loadRegistry: () => ({
-          version: 1,
-          activeProfileId: PROFILE.id,
-          profiles: [PROFILE],
-        }),
-        switchRuntime: vi.fn(async () => ({ ok: true })),
-        clearRuntimeSelection: vi.fn(async () => {
-          events.push("clear");
-          return undefined;
-        }),
-        removeProfile: vi.fn(async () => {
-          events.push("remove");
-          return undefined;
-        }),
-      },
-    );
-    expect(events).toEqual(["clear", "remove"]);
-  });
+  it("reports a protected clear rejection without issuing another removal", async () => {
+    const removeRuntimeProfile = vi.fn(async () => {
+      throw new Error("protected delete rejected");
+    });
 
-  it("does not remove an only runtime when durable selection clear rejects", async () => {
-    const removeProfile = vi.fn(async () => undefined);
     await expect(
       devicesRuntimesInternals.removeProfileWithoutStaleSelection(PROFILE.id, {
-        loadRegistry: () => ({
-          version: 1,
-          activeProfileId: PROFILE.id,
-          profiles: [PROFILE],
-        }),
-        switchRuntime: vi.fn(async () => ({ ok: true })),
-        clearRuntimeSelection: vi.fn(async () => {
-          throw new Error("protected delete rejected");
-        }),
-        removeProfile,
+        removeRuntimeProfile,
       }),
     ).rejects.toThrow("protected delete rejected");
-    expect(removeProfile).not.toHaveBeenCalled();
+    expect(removeRuntimeProfile).toHaveBeenCalledOnce();
   });
 
-  it("reports durable profile deletion failure after switching to a fallback", async () => {
-    const events: string[] = [];
+  it("refuses removal of the build-pinned runtime", async () => {
     await expect(
       devicesRuntimesInternals.removeProfileWithoutStaleSelection(PROFILE.id, {
-        loadRegistry: () => ({
-          version: 1,
-          activeProfileId: PROFILE.id,
-          profiles: [PROFILE, LOCAL_PROFILE],
-        }),
-        switchRuntime: vi.fn(async () => {
-          events.push("switch");
-          return { ok: true };
-        }),
-        clearRuntimeSelection: vi.fn(async () => undefined),
-        removeProfile: vi.fn(async () => {
-          events.push("remove");
-          return false;
-        }),
+        removeRuntimeProfile: vi.fn(async () => ({
+          ok: false,
+          reason: "build-pinned",
+        })),
       }),
-    ).rejects.toThrow("old profile could not be removed");
-    expect(events).toEqual(["switch", "remove"]);
+    ).rejects.toThrow("requires its configured remote runtime");
   });
 
   it("revokes a Linux host in Cloud before native credential cleanup", async () => {

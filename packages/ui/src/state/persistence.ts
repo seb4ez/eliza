@@ -11,6 +11,7 @@ import { getShaderPreset } from "../backgrounds/shader-presets";
 import { normalizeUniforms } from "../backgrounds/shader-schema";
 import { isElectrobunRuntime } from "../bridge/electrobun-runtime";
 import {
+  getStorageValue,
   removeStorageValue,
   removeStorageValueIfCurrent,
   type StorageWriteValidationOptions,
@@ -1243,6 +1244,11 @@ export function isPersistedActiveServerAllowedByBuildTarget(
   );
 }
 
+/** Whether this build forbids clearing or selecting another runtime target. */
+export function hasBuildPinnedActiveServerTarget(): boolean {
+  return getBuildConfiguredRemoteApiBaseUrl() !== null;
+}
+
 function warnRejectedBuildPinnedActiveServer(): void {
   logger.warn(
     "[persistence] rejected active-server change outside the build-pinned remote target",
@@ -1430,6 +1436,18 @@ export function loadPersistedActiveServer(): PersistedActiveServer | null {
   }, null);
 }
 
+/** Read the active runtime directly from the host authority without repair writes. */
+export async function loadPersistedActiveServerDurably(): Promise<PersistedActiveServer | null> {
+  const stored = await getStorageValue(ACTIVE_SERVER_STORAGE_KEY);
+  if (!stored) return null;
+  try {
+    return normalizePersistedActiveServer(JSON.parse(stored));
+  } catch {
+    // error-policy:J3 corrupt protected state is an invalid runtime selection.
+    return null;
+  }
+}
+
 export function savePersistedActiveServer(
   server: PersistedActiveServer,
 ): boolean {
@@ -1518,7 +1536,7 @@ export function clearPersistedActiveServer(): void {
 export async function clearPersistedActiveServerDurably(): Promise<void> {
   const pinnedRemoteApiBase = getBuildConfiguredRemoteApiBaseUrl();
   if (pinnedRemoteApiBase) {
-    const current = loadPersistedActiveServer();
+    const current = await loadPersistedActiveServerDurably();
     const preserved =
       current?.kind === "remote" &&
       current.apiBase?.replace(/\/+$/, "") === pinnedRemoteApiBase
@@ -1552,10 +1570,8 @@ export function clearPersistedSharedCloudActiveServer(): boolean {
 export async function clearPersistedSharedCloudActiveServerDurably(
   options: StorageWriteValidationOptions = {},
 ): Promise<boolean> {
-  const raw =
-    typeof localStorage === "undefined"
-      ? null
-      : localStorage.getItem(ACTIVE_SERVER_STORAGE_KEY);
+  if (typeof window === "undefined") return false;
+  const raw = await getStorageValue(ACTIVE_SERVER_STORAGE_KEY);
   if (!raw) return false;
   let current: PersistedActiveServer | null = null;
   try {
@@ -1586,10 +1602,10 @@ export function scrubPersistedActiveServerToken(): void {
 export async function scrubPersistedActiveServerTokenDurably(
   options: StorageWriteValidationOptions = {},
 ): Promise<boolean> {
-  if (options.validate?.() === false || typeof localStorage === "undefined") {
+  if (options.validate?.() === false || typeof window === "undefined") {
     return false;
   }
-  const raw = localStorage.getItem(ACTIVE_SERVER_STORAGE_KEY);
+  const raw = await getStorageValue(ACTIVE_SERVER_STORAGE_KEY);
   if (!raw) return false;
   let current: PersistedActiveServer | null;
   try {
@@ -1615,10 +1631,10 @@ export async function scrubPersistedActiveServerTokenDurably(
 export async function clearSharedOrScrubActiveServerTokenDurably(
   options: StorageWriteValidationOptions = {},
 ): Promise<boolean> {
-  if (options.validate?.() === false || typeof localStorage === "undefined") {
+  if (options.validate?.() === false || typeof window === "undefined") {
     return false;
   }
-  const raw = localStorage.getItem(ACTIVE_SERVER_STORAGE_KEY);
+  const raw = await getStorageValue(ACTIVE_SERVER_STORAGE_KEY);
   if (!raw) return false;
   let current: PersistedActiveServer | null;
   try {

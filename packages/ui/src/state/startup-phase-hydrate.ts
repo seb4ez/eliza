@@ -609,7 +609,7 @@ export function bindReadyPhase(
   // repoints the live client to a different backend.
   const unbindSwitchAgent = client.onWsEvent(
     "shell:switch-agent",
-    async (data: Record<string, unknown>) => {
+    (data: Record<string, unknown>) => {
       const requestId =
         typeof data.requestId === "string" ? data.requestId : null;
       const query = typeof data.profile === "string" ? data.profile : "";
@@ -633,45 +633,56 @@ export function bindReadyPhase(
         });
       };
 
-      const profile = resolveAgentProfileByQuery(
-        query,
-        loadAgentProfileRegistry(),
-      );
-      if (!profile) {
-        reportResult({ ok: false, reason: "not-found" });
-        return;
-      }
-
-      const result = await switchRuntimeNonDestructive(profile.id);
-      if (!result.ok) {
-        reportResult({ ok: false, reason: result.reason });
-        if (result.reason === "untrusted-remote") {
-          depsRef.current?.setActionNotice(
-            `Refused to switch to "${profile.label}" — untrusted remote address.`,
-            "error",
-          );
-        } else if (result.reason === "untrusted-cloud") {
-          depsRef.current?.setActionNotice(
-            `Refused to switch to "${profile.label}" — invalid Cloud agent address.`,
-            "error",
-          );
-        } else if (result.reason === "persistence-failed") {
-          depsRef.current?.setActionNotice(
-            `Couldn't switch to "${profile.label}" because browser storage is unavailable.`,
-            "error",
-          );
+      void (async () => {
+        const profile = resolveAgentProfileByQuery(
+          query,
+          loadAgentProfileRegistry(),
+        );
+        if (!profile) {
+          reportResult({ ok: false, reason: "not-found" });
+          return;
         }
-        return;
-      }
-      reportResult({
-        ok: true,
-        profileId: result.profile.id,
-        profileLabel: result.profile.label,
+
+        const result = await switchRuntimeNonDestructive(profile.id);
+        if (!result.ok) {
+          reportResult({ ok: false, reason: result.reason });
+          if (result.reason === "untrusted-remote") {
+            depsRef.current?.setActionNotice(
+              `Refused to switch to "${profile.label}" — untrusted remote address.`,
+              "error",
+            );
+          } else if (result.reason === "untrusted-cloud") {
+            depsRef.current?.setActionNotice(
+              `Refused to switch to "${profile.label}" — invalid Cloud agent address.`,
+              "error",
+            );
+          } else if (result.reason === "persistence-failed") {
+            depsRef.current?.setActionNotice(
+              `Couldn't switch to "${profile.label}" because browser storage is unavailable.`,
+              "error",
+            );
+          }
+          return;
+        }
+        reportResult({
+          ok: true,
+          profileId: result.profile.id,
+          profileLabel: result.profile.label,
+        });
+        depsRef.current?.setActionNotice(
+          `Switched the app to "${result.profile.label}".`,
+          "success",
+        );
+      })().catch((cause) => {
+        // error-policy:J1 the WS callback contract is void, so every rejected
+        // switch is translated into the originating agent's result protocol.
+        reportResult({ ok: false, reason: "persistence-failed" });
+        const detail = cause instanceof Error ? `: ${cause.message}` : "";
+        depsRef.current?.setActionNotice(
+          `Couldn't switch runtimes${detail}`,
+          "error",
+        );
       });
-      depsRef.current?.setActionNotice(
-        `Switched the app to "${result.profile.label}".`,
-        "success",
-      );
     },
   );
 

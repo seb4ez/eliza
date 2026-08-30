@@ -88,27 +88,22 @@ describe("bindDirectCloudLoginToPersonalAgent", () => {
         clearIfCurrent: vi.fn(() => true),
       })),
     };
-    let authorityLive = true;
-    const originalSetItem = localStorage.setItem.bind(localStorage);
-    const setItem = vi
-      .spyOn(localStorage, "setItem")
-      .mockImplementation((key, value) => {
-        originalSetItem(key, value);
-        if (key === "elizaos:active-server") authorityLive = false;
-      });
-
-    try {
-      await expect(
-        bindDirectCloudLoginToPersonalAgent({
-          client,
-          cloudApiBase: "https://api.eliza.app",
-          token: "stale-a-token",
-          validate: () => authorityLive,
-        }),
-      ).resolves.toBeNull();
-    } finally {
-      setItem.mockRestore();
-    }
+    let replacementObserved = false;
+    await expect(
+      bindDirectCloudLoginToPersonalAgent({
+        client,
+        cloudApiBase: "https://api.eliza.app",
+        token: "stale-a-token",
+        // Authority B is modeled by the first committed active-server value.
+        // This remains deterministic when the secure-store proxy is already
+        // installed by another test in the aggregate worker.
+        validate: () => {
+          if (replacementObserved) return false;
+          replacementObserved = loadPersistedActiveServer() !== null;
+          return !replacementObserved;
+        },
+      }),
+    ).resolves.toBeNull();
 
     expect(loadPersistedActiveServer()).toBeNull();
     expect(getActiveProfile()).toBeNull();

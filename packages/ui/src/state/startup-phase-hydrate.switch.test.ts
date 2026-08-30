@@ -15,20 +15,14 @@ import { loadPersistedActiveServer } from "./persistence";
 import { bindReadyPhase, type ReadyPhaseDeps } from "./startup-phase-hydrate";
 
 const clientMock = vi.hoisted(() => {
-  const handlers = new Map<
-    string,
-    (data: Record<string, unknown>) => void | Promise<void>
-  >();
+  const handlers = new Map<string, (data: Record<string, unknown>) => void>();
   return {
     connectWs: vi.fn(),
     disconnectWs: vi.fn(),
     getCodingAgentStatus: vi.fn(async () => ({ tasks: [] })),
     handlers,
     onWsEvent: vi.fn(
-      (
-        event: string,
-        handler: (data: Record<string, unknown>) => void | Promise<void>,
-      ) => {
+      (event: string, handler: (data: Record<string, unknown>) => void) => {
         handlers.set(event, handler);
         return () => {
           handlers.delete(event);
@@ -37,7 +31,7 @@ const clientMock = vi.hoisted(() => {
     ),
     sendWsMessage: vi.fn(),
     getBaseUrl: vi.fn(() => "http://127.0.0.1:31337"),
-    repointBaseUrl: vi.fn(),
+    repointBaseUrl: vi.fn(() => true),
     setToken: vi.fn(),
   };
 });
@@ -93,6 +87,13 @@ function lastResultBody(): Record<string, unknown> {
   return JSON.parse(String(init.body)) as Record<string, unknown>;
 }
 
+async function dispatchSwitch(data: Record<string, unknown>): Promise<void> {
+  const handler = clientMock.handlers.get("shell:switch-agent");
+  if (!handler) throw new Error("switch handler was not bound");
+  handler(data);
+  await vi.waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
+}
+
 describe("bindReadyPhase shell:switch-agent handler", () => {
   beforeEach(() => {
     localStorage.clear();
@@ -114,7 +115,7 @@ describe("bindReadyPhase shell:switch-agent handler", () => {
     });
     const cleanup = bindReadyPhase({ current: makeDeps() });
 
-    await clientMock.handlers.get("shell:switch-agent")?.({
+    await dispatchSwitch({
       requestId: "req-untrusted",
       profile: "My VPS",
     });
@@ -146,7 +147,7 @@ describe("bindReadyPhase shell:switch-agent handler", () => {
     });
     const cleanup = bindReadyPhase({ current: makeDeps() });
 
-    await clientMock.handlers.get("shell:switch-agent")?.({
+    await dispatchSwitch({
       requestId: "req-untrusted-cloud",
       profile: "Tampered Cloud agent",
     });
@@ -174,7 +175,7 @@ describe("bindReadyPhase shell:switch-agent handler", () => {
     });
     const cleanup = bindReadyPhase({ current: makeDeps() });
 
-    await clientMock.handlers.get("shell:switch-agent")?.({
+    await dispatchSwitch({
       requestId: "req-local",
       profile: "Laptop",
     });
@@ -203,19 +204,19 @@ describe("bindReadyPhase shell:switch-agent handler", () => {
       kind: "local",
       apiBase: "",
     });
-    const setItem = window.localStorage.setItem.bind(window.localStorage);
-    const writeSpy = vi
-      .spyOn(window.localStorage, "setItem")
-      .mockImplementation((key, value) => {
-        if (key === "elizaos:agent-profiles") {
-          throw new DOMException("blocked", "SecurityError");
-        }
-        setItem(key, value);
-      });
+    const originalLocks = Object.getOwnPropertyDescriptor(navigator, "locks");
+    Object.defineProperty(navigator, "locks", {
+      configurable: true,
+      value: {
+        request: vi.fn(async () => {
+          throw new Error("origin lock unavailable");
+        }),
+      },
+    });
     const cleanup = bindReadyPhase({ current: makeDeps() });
 
     try {
-      await clientMock.handlers.get("shell:switch-agent")?.({
+      await dispatchSwitch({
         requestId: "req-storage-failed",
         profile: "Laptop",
       });
@@ -237,14 +238,18 @@ describe("bindReadyPhase shell:switch-agent handler", () => {
       );
     } finally {
       cleanup();
-      writeSpy.mockRestore();
+      if (originalLocks) {
+        Object.defineProperty(navigator, "locks", originalLocks);
+      } else {
+        Reflect.deleteProperty(navigator, "locks");
+      }
     }
   });
 
   it("reports not-found for an unknown profile query", async () => {
     const cleanup = bindReadyPhase({ current: makeDeps() });
 
-    await clientMock.handlers.get("shell:switch-agent")?.({
+    await dispatchSwitch({
       requestId: "req-ghost",
       profile: "does-not-exist",
     });
@@ -262,7 +267,7 @@ describe("bindReadyPhase shell:switch-agent handler", () => {
   it("ignores a switch-agent event with no requestId", async () => {
     const cleanup = bindReadyPhase({ current: makeDeps() });
 
-    await clientMock.handlers.get("shell:switch-agent")?.({
+    clientMock.handlers.get("shell:switch-agent")?.({
       profile: "Laptop",
     });
 
@@ -287,10 +292,13 @@ describe("bindReadyPhase shell:switch-agent handler", () => {
     const handler = clientMock.handlers.get("shell:switch-agent");
     if (!handler) throw new Error("switch handler was not bound");
 
-    const pendingA = handler({ requestId: "req-a", profile: runtimeA.id });
-    const pendingB = handler({ requestId: "req-b", profile: runtimeB.id });
+    handler({ requestId: "req-a", profile: runtimeA.id });
+    handler({ requestId: "req-b", profile: runtimeB.id });
 
-    await Promise.all([pendingA, pendingB]);
+    await vi.waitFor(() =>
+      expect(clientMock.repointBaseUrl).toHaveBeenCalledTimes(2),
+    );
+    await vi.waitFor(() => expect(globalThis.fetch).toHaveBeenCalledTimes(2));
     expect(clientMock.repointBaseUrl).toHaveBeenCalledTimes(2);
     expect(loadAgentProfileRegistry().activeProfileId).toBe(runtimeB.id);
     expect(loadPersistedActiveServer()?.id).toBe(`remote:${runtimeB.apiBase}`);
@@ -298,6 +306,36 @@ describe("bindReadyPhase shell:switch-agent handler", () => {
       runtimeB.apiBase,
       null,
     ]);
+
+    cleanup();
+  });
+
+  it("reports a rejected switch from the void WS callback", async () => {
+    addAgentProfile({
+      label: "Trusted VPS",
+      kind: "remote",
+      apiBase: "http://100.72.1.9:3000",
+    });
+    clientMock.repointBaseUrl.mockImplementationOnce(() => {
+      throw new Error("live repoint rejected");
+    });
+    const cleanup = bindReadyPhase({ current: makeDeps() });
+
+    await dispatchSwitch({
+      requestId: "req-rejected",
+      profile: "Trusted VPS",
+    });
+
+    expect(lastResultBody()).toEqual({
+      requestId: "req-rejected",
+      ok: false,
+      reason: "persistence-failed",
+    });
+    expect(setActionNotice).toHaveBeenCalledWith(
+      expect.stringContaining("live repoint rejected"),
+      "error",
+    );
+    expect(loadPersistedActiveServer()).toBeNull();
 
     cleanup();
   });

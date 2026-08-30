@@ -4,21 +4,18 @@ import type {
   RuntimeManagementRequest,
   RuntimeManagementResult,
 } from "@elizaos/shared/contracts";
-import { client } from "../api";
 import {
   createDefaultRemoteControlCloudClient,
   getDefaultRemoteControlCloudConnection,
 } from "../api/remote-control-cloud-default";
 import { isElectrobunRuntime } from "../bridge/electrobun-runtime";
 import {
-  type AgentProfileRegistry,
-  addAgentProfile,
-  clearPersistedActiveServerDurably,
+  addAgentProfileDurably,
   loadAgentProfileRegistry,
   removeAgentProfileDurably,
-  switchRuntimeNonDestructive,
 } from "../state";
 import { isTrustedRestoreApiBaseUrl } from "../state/runtime-url-trust";
+import { removeRuntimeProfileNonDestructive } from "../state/switch-runtime";
 import {
   clearRemoteControllerSessionState,
   getOrCreateRemoteControllerIdentity,
@@ -60,65 +57,37 @@ const SSH_DEPENDENCIES: SshRuntimeLifecycleDependencies = {
   stopTunnel: stopSshRuntime,
   storeCredential: storeRuntimeCredential,
   deleteCredentialRecord: deleteRuntimeCredentialRecord,
-  addProfile: addAgentProfile,
-  removeProfile: removeProfileWithoutStaleSelection,
-  loadRegistry: loadAgentProfileRegistry,
-};
-
-export function removeProfileWithoutStaleSelection(
-  profileId: string,
-  dependencies: {
-    loadRegistry: () => AgentProfileRegistry;
-    switchRuntime: (profileId: string) => Promise<{ ok: boolean }>;
-    clearRuntimeSelection: () => Promise<boolean | undefined>;
-    removeProfile: (profileId: string) => Promise<boolean | undefined>;
-  } = {
-    loadRegistry: loadAgentProfileRegistry,
-    switchRuntime: switchRuntimeNonDestructive,
-    clearRuntimeSelection: async () => {
-      await clearPersistedActiveServerDurably();
-      client.setToken(null);
-      client.setBaseUrl(null);
-      return undefined;
-    },
-    removeProfile: removeAgentProfileDurably,
-  },
-): Promise<void> {
-  return removeProfileWithoutStaleSelectionAsync(profileId, dependencies);
-}
-
-async function removeProfileWithoutStaleSelectionAsync(
-  profileId: string,
-  dependencies: {
-    loadRegistry: () => AgentProfileRegistry;
-    switchRuntime: (profileId: string) => Promise<{ ok: boolean }>;
-    clearRuntimeSelection: () => Promise<boolean | undefined>;
-    removeProfile: (profileId: string) => Promise<boolean | undefined>;
-  },
-): Promise<void> {
-  const registry = dependencies.loadRegistry();
-  if (registry.activeProfileId === profileId) {
-    const fallback =
-      registry.profiles.find(
-        (profile) => profile.id !== profileId && profile.kind === "local",
-      ) ?? registry.profiles.find((profile) => profile.id !== profileId);
-    if (!fallback) {
-      if ((await dependencies.clearRuntimeSelection()) === false) {
-        throw new Error(
-          "The runtime could not be removed because its active selection was not cleared. Try again.",
-        );
-      }
-    } else if (!(await dependencies.switchRuntime(fallback.id)).ok) {
+  addProfile: addAgentProfileDurably,
+  removeProfile: async (profileId) => {
+    if (!(await removeAgentProfileDurably(profileId))) {
       throw new Error(
-        "The runtime could not be removed because the fallback runtime was not saved. Try again.",
+        "Switch away from the SSH runtime before removing it, then try again.",
       );
     }
-  }
-  if ((await dependencies.removeProfile(profileId)) === false) {
-    throw new Error(
-      "The runtime selection changed, but the old profile could not be removed. Try again.",
-    );
-  }
+  },
+};
+
+export async function removeProfileWithoutStaleSelection(
+  profileId: string,
+  dependencies: {
+    removeRuntimeProfile: (
+      profileId: string,
+    ) => Promise<{ ok: boolean; reason?: string }>;
+  } = {
+    removeRuntimeProfile: removeRuntimeProfileNonDestructive,
+  },
+): Promise<void> {
+  const result = await dependencies.removeRuntimeProfile(profileId);
+  if (result.ok) return;
+  const explanation =
+    result.reason === "build-pinned"
+      ? "This build requires its configured remote runtime."
+      : result.reason === "not-found"
+        ? "That runtime is no longer available."
+        : "Its fallback or cleared selection could not be saved.";
+  throw new Error(
+    `The runtime could not be removed. ${explanation} Try again.`,
+  );
 }
 
 function requiredString(value: string | undefined, field: string): string {
@@ -377,7 +346,7 @@ async function execute(
     if (!isTrustedRestoreApiBaseUrl(apiBase)) {
       throw new Error("Use a private, local, or Tailscale runtime URL.");
     }
-    const profile = addAgentProfile(
+    const profile = await addAgentProfileDurably(
       {
         kind: "remote",
         label: requiredString(request.label, "label"),
@@ -388,6 +357,11 @@ async function execute(
       },
       { activate: false },
     );
+    if (!profile) {
+      throw new Error(
+        "The runtime profile could not be saved. Check protected storage and try again.",
+      );
+    }
     return { runtimeId: profile.id, label: profile.label };
   }
 

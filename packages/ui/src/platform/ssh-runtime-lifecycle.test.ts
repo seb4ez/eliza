@@ -45,7 +45,7 @@ function harness() {
     stopTunnel: vi.fn(async () => events.push("stop")),
     storeCredential: vi.fn(async () => events.push("store-credential")),
     deleteCredentialRecord: vi.fn(async () => events.push("delete-credential")),
-    addProfile: vi.fn((profile, options) => {
+    addProfile: vi.fn(async (profile, options) => {
       const created: AgentProfile = {
         ...profile,
         id: options.id,
@@ -55,14 +55,16 @@ function harness() {
       events.push("add-profile");
       return created;
     }),
-    removeProfile: vi.fn((id) => {
+    removeProfile: vi.fn(async (id) => {
+      if (registry.activeProfileId === id) {
+        throw new Error("Switch away from the SSH runtime before removing it.");
+      }
       registry = {
         ...registry,
         profiles: registry.profiles.filter((profile) => profile.id !== id),
       };
       events.push("remove-profile");
     }),
-    loadRegistry: () => registry,
   };
   return { dependencies, events, registry: () => registry };
 }
@@ -116,6 +118,26 @@ describe("SSH runtime lifecycle", () => {
     });
   });
 
+  it("rolls back the tunnel and credential when protected profile persistence fails", async () => {
+    const state = store();
+    const { dependencies, events, registry } = harness();
+    dependencies.addProfile = vi.fn(async () => null);
+
+    await expect(
+      setupSshRuntime(input, dependencies, state.value),
+    ).rejects.toThrow(/profile could not be saved/i);
+
+    expect(events).toEqual([
+      "store-credential",
+      "start",
+      "remove-profile",
+      "stop",
+      "delete-credential",
+    ]);
+    expect(registry().profiles.map((profile) => profile.id)).toEqual(["local"]);
+    expect(state.receipts.size).toBe(0);
+  });
+
   it("refuses removal of the active SSH runtime before any destructive step", async () => {
     const state = store();
     const { dependencies, registry } = harness();
@@ -126,5 +148,41 @@ describe("SSH runtime lifecycle", () => {
       removeSshRuntime(profile, dependencies, state.value),
     ).rejects.toThrow(/switch away/i);
     expect(dependencies.stopTunnel).toHaveBeenCalledTimes(0);
+    expect(dependencies.deleteCredentialRecord).toHaveBeenCalledTimes(0);
+    expect(state.receipts.size).toBe(1);
+  });
+
+  it("claims host-authoritative profile deletion before destructive cleanup", async () => {
+    const state = store();
+    const { dependencies, events } = harness();
+    const profile = await setupSshRuntime(input, dependencies, state.value);
+    events.length = 0;
+
+    await removeSshRuntime(profile, dependencies, state.value);
+
+    expect(events).toEqual(["remove-profile", "stop", "delete-credential"]);
+    expect(state.receipts.size).toBe(0);
+  });
+
+  it("keeps tunnel and credential intact when durable profile removal loses an activation race", async () => {
+    const state = store();
+    const { dependencies } = harness();
+    const profile = await setupSshRuntime(input, dependencies, state.value);
+    dependencies.removeProfile = vi.fn(async () => {
+      throw new Error("runtime became active");
+    });
+
+    await expect(
+      removeSshRuntime(profile, dependencies, state.value),
+    ).rejects.toThrow(/cleanup is incomplete/i);
+
+    expect(dependencies.removeProfile).toHaveBeenCalledWith(profile.id);
+    expect(dependencies.stopTunnel).not.toHaveBeenCalled();
+    expect(dependencies.deleteCredentialRecord).not.toHaveBeenCalled();
+    expect([...state.receipts.values()][0]?.pending).toEqual({
+      removeProfile: true,
+      stopTunnel: true,
+      deleteCredential: true,
+    });
   });
 });

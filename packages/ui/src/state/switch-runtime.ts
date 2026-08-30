@@ -15,11 +15,14 @@ import { getFrontendPlatform } from "../platform/platform-guards";
 import type { AgentProfile } from "./agent-profile-types";
 import {
   activeServerIdForAgentProfile,
-  loadAgentProfileRegistry,
   persistAgentProfileSelectionDurably,
+  removeAgentProfileWithFallbackDurably,
 } from "./agent-profiles";
 import { clearAllChatDrafts } from "./ChatComposerContext.hooks";
-import { createPersistedActiveServer } from "./persistence";
+import {
+  createPersistedActiveServer,
+  type PersistedActiveServer,
+} from "./persistence";
 import {
   isTrustedCloudApiBaseUrl,
   isTrustedRestoreApiBaseUrl,
@@ -34,6 +37,18 @@ export type SwitchRuntimeResult =
         | "persistence-failed"
         | "untrusted-cloud"
         | "untrusted-remote";
+    };
+
+export type RemoveRuntimeProfileResult =
+  | { ok: true; activeProfile: AgentProfile | null }
+  | {
+      ok: false;
+      reason:
+        | "not-found"
+        | "persistence-failed"
+        | "untrusted-cloud"
+        | "untrusted-remote"
+        | "build-pinned";
     };
 
 export type RuntimeAuthoritySwitchPhase = "before" | "after";
@@ -88,6 +103,89 @@ function hasValidNativeRemoteBinding(profile: AgentProfile): boolean {
   return false;
 }
 
+type RuntimeProfileTrustFailure = "untrusted-cloud" | "untrusted-remote" | null;
+
+function runtimeProfileTrustFailure(
+  profile: AgentProfile,
+): RuntimeProfileTrustFailure {
+  if (
+    profile.kind === "remote" &&
+    !(
+      hasValidNativeRemoteBinding(profile) ||
+      (profile.connectionMode !== "relay" &&
+        profile.connectionMode !== "ssh" &&
+        isTrustedRestoreApiBaseUrl(profile.apiBase))
+    )
+  ) {
+    return "untrusted-remote";
+  }
+  if (
+    profile.kind === "cloud" &&
+    !isTrustedCloudApiBaseUrl(
+      profile.apiBase,
+      profile.cloudRuntimeAgentId ?? profile.cloudAgentId,
+    )
+  ) {
+    return "untrusted-cloud";
+  }
+  return null;
+}
+
+function persistedServerForRuntimeProfile(
+  profile: AgentProfile,
+): PersistedActiveServer {
+  return createPersistedActiveServer({
+    kind: profile.kind,
+    id: activeServerIdForAgentProfile(profile),
+    apiBase: profile.apiBase,
+    accessToken: profile.accessToken,
+    label: profile.label,
+    cloudRuntimeAgentId: profile.cloudRuntimeAgentId,
+    cloudRuntime: profile.cloudRuntime,
+  });
+}
+
+async function publishRuntimeProfile(
+  profile: AgentProfile | null,
+): Promise<boolean> {
+  notifyRuntimeAuthoritySwitch("before");
+  try {
+    let published = true;
+    if (profile?.apiBase) {
+      published = client.repointBaseUrl(
+        profile.apiBase,
+        profile.accessToken ?? null,
+      );
+    } else if (profile && typeof window !== "undefined") {
+      client.setToken(null);
+      published = client.repointBaseUrl(window.location.origin);
+    } else {
+      client.setToken(null);
+      client.setBaseUrl(null);
+    }
+    if (!published) return false;
+
+    clearAllChatDrafts();
+
+    if (profile) {
+      const platform = getFrontendPlatform();
+      if (platform === "android" || platform === "ios") {
+        const target =
+          profile.kind === "local" || isMobileLocalAgentIpcBase(profile.apiBase)
+            ? "local"
+            : activeServerKindToFirstRunRuntimeTarget(profile.kind);
+        persistMobileRuntimeModeForServerTarget(target);
+      }
+    }
+
+    return true;
+  } finally {
+    // Always close the authority phase, including a rejected client publish;
+    // subscribers can then rehydrate the still-current compensated selection.
+    notifyRuntimeAuthoritySwitch("after");
+  }
+}
+
 /**
  * Switch the active runtime IN PLACE — the "My Runtimes" non-destructive switch.
  *
@@ -107,74 +205,51 @@ function hasValidNativeRemoteBinding(profile: AgentProfile): boolean {
 export async function switchRuntimeNonDestructive(
   profileId: string,
 ): Promise<SwitchRuntimeResult> {
-  const registry = loadAgentProfileRegistry();
-  const profile = registry.profiles.find((p) => p.id === profileId);
-  if (!profile) return { ok: false, reason: "not-found" };
-
-  if (
-    profile.kind === "remote" &&
-    !(
-      hasValidNativeRemoteBinding(profile) ||
-      (profile.connectionMode !== "relay" &&
-        profile.connectionMode !== "ssh" &&
-        isTrustedRestoreApiBaseUrl(profile.apiBase))
-    )
-  ) {
-    return { ok: false, reason: "untrusted-remote" };
-  }
-  if (
-    profile.kind === "cloud" &&
-    !isTrustedCloudApiBaseUrl(
-      profile.apiBase,
-      profile.cloudRuntimeAgentId ?? profile.cloudAgentId,
-    )
-  ) {
-    return { ok: false, reason: "untrusted-cloud" };
-  }
-
-  const server = createPersistedActiveServer({
-    kind: profile.kind,
-    id: activeServerIdForAgentProfile(profile),
-    apiBase: profile.apiBase,
-    accessToken: profile.accessToken,
-    label: profile.label,
-    cloudRuntimeAgentId: profile.cloudRuntimeAgentId,
-    cloudRuntime: profile.cloudRuntime,
-  });
-  const persisted = await persistAgentProfileSelectionDurably(
-    profile.id,
-    server,
-    {
-      // Keep durable selection and live publication inside the same serialized
-      // transaction. This also orders fire-and-forget WebSocket switches.
-      finalize: async () => {
-        notifyRuntimeAuthoritySwitch("before");
-
-        if (profile.apiBase) {
-          client.repointBaseUrl(profile.apiBase, profile.accessToken ?? null);
-        } else if (typeof window !== "undefined") {
-          client.setToken(null);
-          client.repointBaseUrl(window.location.origin);
-        }
-
-        clearAllChatDrafts();
-
-        const platform = getFrontendPlatform();
-        if (platform === "android" || platform === "ios") {
-          const target =
-            profile.kind === "local" ||
-            isMobileLocalAgentIpcBase(profile.apiBase)
-              ? "local"
-              : activeServerKindToFirstRunRuntimeTarget(profile.kind);
-          persistMobileRuntimeModeForServerTarget(target);
-        }
-
-        notifyRuntimeAuthoritySwitch("after");
-        return true;
-      },
+  let invalidProfileReason: RuntimeProfileTrustFailure = null;
+  const persisted = await persistAgentProfileSelectionDurably(profileId, {
+    createServer: (profile) => {
+      invalidProfileReason = runtimeProfileTrustFailure(profile);
+      return invalidProfileReason
+        ? null
+        : persistedServerForRuntimeProfile(profile);
     },
-  );
-  if (!persisted) return { ok: false, reason: "persistence-failed" };
+    // Keep durable selection and live publication inside the same serialized
+    // transaction. This also orders fire-and-forget WebSocket switches.
+    finalize: (profile) => publishRuntimeProfile(profile),
+  });
+  if (!persisted.ok) {
+    if (persisted.reason === "not-found") {
+      return { ok: false, reason: "not-found" };
+    }
+    return {
+      ok: false,
+      reason: invalidProfileReason ?? "persistence-failed",
+    };
+  }
 
-  return { ok: true, profile };
+  return { ok: true, profile: persisted.profile };
+}
+
+/** Remove a profile without exposing a split switch/delete authority window. */
+export async function removeRuntimeProfileNonDestructive(
+  profileId: string,
+): Promise<RemoveRuntimeProfileResult> {
+  let invalidFallbackReason: RuntimeProfileTrustFailure = null;
+  const removed = await removeAgentProfileWithFallbackDurably(profileId, {
+    createServer: (profile) => {
+      invalidFallbackReason = runtimeProfileTrustFailure(profile);
+      return invalidFallbackReason
+        ? null
+        : persistedServerForRuntimeProfile(profile);
+    },
+    finalize: (profile) => publishRuntimeProfile(profile),
+  });
+  if (removed.ok) return removed;
+  if (removed.reason === "invalid-fallback") {
+    return {
+      ok: false,
+      reason: invalidFallbackReason ?? "persistence-failed",
+    };
+  }
+  return { ok: false, reason: removed.reason };
 }

@@ -161,6 +161,20 @@ describe("MyRuntimesContainer", () => {
     );
   });
 
+  it("observes a rejected switch promise and surfaces it", async () => {
+    const user = userEvent.setup();
+    mocks.switchRuntimeNonDestructive.mockRejectedValue(
+      new Error("protected runtime transaction rejected"),
+    );
+    render(<MyRuntimesContainer />);
+
+    await user.click(screen.getByTestId("runtime-vps-1-use"));
+
+    expect(screen.getByTestId("my-runtimes-error").textContent).toContain(
+      "protected runtime transaction rejected",
+    );
+  });
+
   it("adding a TRUSTED remote: adds it AND switches to it (badge reflects reality)", async () => {
     const user = userEvent.setup();
     render(<MyRuntimesContainer />);
@@ -203,6 +217,26 @@ describe("MyRuntimesContainer", () => {
     expect(screen.getByTestId("my-runtimes-error").textContent).toMatch(
       /couldn't be saved/i,
     );
+  });
+
+  it("observes a rejected durable profile addition", async () => {
+    const user = userEvent.setup();
+    mocks.addAgentProfileDurably.mockRejectedValue(
+      new Error("protected profile write rejected"),
+    );
+    render(<MyRuntimesContainer />);
+    await user.type(screen.getByTestId("add-remote-label"), "Laptop");
+    await user.type(
+      screen.getByTestId("add-remote-url"),
+      "http://100.72.1.9:3000",
+    );
+
+    await user.click(screen.getByTestId("add-remote-submit"));
+
+    expect(screen.getByTestId("my-runtimes-error").textContent).toContain(
+      "protected profile write rejected",
+    );
+    expect(mocks.switchRuntimeNonDestructive).not.toHaveBeenCalled();
   });
 
   it("rejecting an UNTRUSTED (public) remote at add time — no add, no switch", async () => {
