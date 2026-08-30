@@ -10,6 +10,7 @@
 // intact for the round trip. A live popup handle keeps the device-code popup
 // flow. jsdom pinned to a hosted elizacloud origin with the API client mocked.
 
+import { registerStewardTokenPersistence } from "@elizaos/shared/steward-session-client";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { client } from "../api";
@@ -34,10 +35,44 @@ import {
 } from "./cloud-login-launch";
 import { registerStewardLoginLauncher } from "./cloud-steward-login";
 import { savePersistedActiveServer } from "./persistence";
+
+const directBindBoundary = vi.hoisted(() => ({
+  calls: [] as Array<{
+    validate?: () => boolean;
+    finalize?: () => undefined | (() => void);
+    commitBeforePublish?: () => boolean;
+  }>,
+  override: null as
+    | null
+    | ((options: {
+        validate?: () => boolean;
+        finalize?: () => undefined | (() => void);
+        commitBeforePublish?: () => boolean;
+      }) => Promise<{ restoreIfCurrent(): Promise<void> } | null>),
+}));
+
+vi.mock("./bind-direct-cloud-login", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("./bind-direct-cloud-login")>();
+  return {
+    ...actual,
+    bindDirectCloudLoginToPersonalAgent: async (
+      options: Parameters<typeof actual.bindDirectCloudLoginToPersonalAgent>[0],
+    ) => {
+      directBindBoundary.calls.push(options);
+      return directBindBoundary.override
+        ? directBindBoundary.override(options)
+        : actual.bindDirectCloudLoginToPersonalAgent(options);
+    },
+  };
+});
+
 import { useCloudState } from "./useCloudState";
 
 const DEVICE_CODE_SENTINEL = "device-code-flow-reached";
 const originalBootConfig = structuredClone(getBootConfig());
+const originalClientBase = client.getBaseUrl();
+const originalClientToken = client.getRestAuthToken();
 const originalLocationDescriptor = Object.getOwnPropertyDescriptor(
   window,
   "location",
@@ -148,12 +183,14 @@ describe("useCloudState — handleCloudLogin same-tab fallback on hosted web", (
     cloudLoginPollDirectSpy = vi
       .spyOn(client, "cloudLoginPollDirect")
       .mockResolvedValue({ status: "pending" });
+    const setBaseUrl = client.setBaseUrl.bind(client);
+    const setToken = client.setToken.bind(client);
     setBaseUrlSpy = vi
       .spyOn(client, "setBaseUrl")
-      .mockImplementation(() => undefined);
+      .mockImplementation((...args) => setBaseUrl(...args));
     setTokenSpy = vi
       .spyOn(client, "setToken")
-      .mockImplementation(() => undefined);
+      .mockImplementation((...args) => setToken(...args));
   });
 
   afterEach(() => {
@@ -164,9 +201,14 @@ describe("useCloudState — handleCloudLogin same-tab fallback on hosted web", (
     delete windowWithElectrobun.__ELIZA_DESKTOP_RUNTIME_MODE__;
     delete windowWithElectrobun.__ELIZA_ELECTROBUN_RPC__;
     restorePinnedRemote();
+    directBindBoundary.calls.length = 0;
+    directBindBoundary.override = null;
     __resetPreparedDesktopCloudLoginSessionForTests();
     vi.unstubAllEnvs();
     vi.restoreAllMocks();
+    client.setToken(null);
+    client.setBaseUrl(originalClientBase, { persist: false });
+    client.setToken(originalClientToken);
     if (originalLocationDescriptor) {
       Object.defineProperty(window, "location", originalLocationDescriptor);
     }
@@ -582,6 +624,7 @@ describe("useCloudState — handleCloudLogin same-tab fallback on hosted web", (
     const { result } = renderHook(() => useCloudState(params));
 
     await waitFor(() => {
+      expect(result.current.elizaCloudLoginError).toBeNull();
       expect(localStorage.getItem("steward_session_token")).toBe(
         "session-token",
       );
@@ -639,6 +682,97 @@ describe("useCloudState — handleCloudLogin same-tab fallback on hosted web", (
     expect(setTokenSpy).not.toHaveBeenCalledWith("account-a-token");
     expect(result.current.elizaCloudConnected).toBe(false);
     expect(recoverySnapshot().receipts).toEqual([]);
+  });
+
+  it("keeps login B authoritative when it lands during the same-tab token write", async () => {
+    const search =
+      "?elizaCloudLogin=complete&elizaCloudLoginSession=sess-writing-a";
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: {
+        ...window.location,
+        href: `https://cloud.eliza.app/chat${search}`,
+        pathname: "/chat",
+        search,
+        assign: assignSpy,
+      },
+    });
+    setBootConfig({ branding: {}, cloudApiBase: "https://eliza.app" });
+    cloudLoginPollDirectSpy.mockResolvedValue({
+      status: "authenticated",
+      token: "account-a-token",
+      userId: "account-a-user",
+    });
+    const unregisterPersistence = registerStewardTokenPersistence(
+      async (token) => {
+        localStorage.setItem("steward_session_token", token);
+        completeNewerLogin("account-b-token");
+      },
+    );
+
+    try {
+      const { result } = renderHook(() => useCloudState(makeParams()));
+      await waitFor(() => {
+        expect(cloudLoginPollDirectSpy).toHaveBeenCalledWith(
+          "https://api.eliza.app",
+          "sess-writing-a",
+        );
+        expect(result.current.elizaCloudLoginBusy).toBe(false);
+      });
+
+      expect(localStorage.getItem("steward_session_token")).toBe(
+        "account-b-token",
+      );
+      expect(setTokenSpy).not.toHaveBeenCalledWith("account-a-token");
+      expect(result.current.elizaCloudConnected).toBe(false);
+      expect(getBootConfig().cloudApiBase).toBe("https://eliza.app");
+      expect(recoverySnapshot().receipts).toEqual([]);
+    } finally {
+      unregisterPersistence();
+    }
+  });
+
+  it("restores the exact same-tab token and boot predecessors when client publication throws", async () => {
+    const search =
+      "?elizaCloudLogin=complete&elizaCloudLoginSession=sess-throwing-a";
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: {
+        ...window.location,
+        href: `https://cloud.eliza.app/chat${search}`,
+        pathname: "/chat",
+        search,
+        assign: assignSpy,
+      },
+    });
+    const previousBootConfig = {
+      branding: {},
+      cloudApiBase: "https://eliza.app",
+    };
+    setBootConfig(previousBootConfig);
+    localStorage.setItem("steward_session_token", "predecessor-token");
+    cloudLoginPollDirectSpy.mockResolvedValue({
+      status: "authenticated",
+      token: "account-a-token",
+      userId: "account-a-user",
+    });
+    vi.spyOn(client, "stageSessionTarget").mockImplementation(() => {
+      throw new Error("client publish failed");
+    });
+
+    const { result } = renderHook(() => useCloudState(makeParams()));
+    await waitFor(() => {
+      expect(result.current.elizaCloudLoginBusy).toBe(false);
+      expect(result.current.elizaCloudLoginError).toBe("client publish failed");
+    });
+
+    // Exercise the real browser fallback authority: a failed publication must
+    // compare-and-restore the exact token that preceded A.
+    expect(localStorage.getItem("steward_session_token")).toBe(
+      "predecessor-token",
+    );
+    expect(getBootConfig()).toBe(previousBootConfig);
+    expect(result.current.elizaCloudConnected).toBe(false);
   });
 
   it("claims a hosted staging return without replacing the localhost backend", async () => {
@@ -863,6 +997,166 @@ describe("useCloudState — handleCloudLogin same-tab fallback on hosted web", (
         "account-b-token",
       );
       expect(setTokenSpy).not.toHaveBeenCalledWith("account-a-token");
+      expect(result.current.elizaCloudConnected).toBe(false);
+      expect(recoverySnapshot().receipts).toEqual([]);
+      unmount();
+      vi.clearAllTimers();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps login B authoritative when it lands during the Electrobun personal-bind token write", async () => {
+    vi.useFakeTimers();
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: {
+        ...window.location,
+        href: "http://127.0.0.1:5174/?shellMode=chat-overlay",
+        origin: "http://127.0.0.1:5174",
+        protocol: "http:",
+        hostname: "127.0.0.1",
+        port: "5174",
+        pathname: "/",
+        search: "?shellMode=chat-overlay",
+        assign: assignSpy,
+      },
+    });
+    setBootConfig({ branding: {}, cloudApiBase: "https://eliza.app" });
+    windowWithElectrobun.__electrobunWindowId = 1;
+    windowWithElectrobun.__ELIZA_DESKTOP_RUNTIME_MODE__ = "cloud";
+    windowWithElectrobun.__ELIZA_ELECTROBUN_RPC__ = {
+      request: {
+        openExternal: vi.fn(async () => ({ opened: true })),
+      },
+      onMessage: vi.fn(),
+      offMessage: vi.fn(),
+    };
+    cloudLoginDirectSpy.mockResolvedValue({
+      ok: true,
+      apiBase: "https://api.eliza.app",
+      browserUrl: "https://eliza.app/auth/cli-login?session=electrobun-a",
+      sessionId: "electrobun-a",
+    });
+    cloudLoginPollDirectSpy.mockResolvedValue({
+      status: "authenticated",
+      token: "account-a-token",
+      userId: "account-a-user",
+    });
+    directBindBoundary.override = async (options) => {
+      expect(options.validate?.()).toBe(true);
+      completeNewerLogin("account-b-token");
+      await Promise.resolve();
+      expect(options.validate?.()).toBe(false);
+      return null;
+    };
+    const persistenceSpy = vi.fn(async () => undefined);
+    const unregisterPersistence =
+      registerStewardTokenPersistence(persistenceSpy);
+
+    try {
+      const { result, unmount } = renderHook(() => useCloudState(makeParams()));
+      let login: Promise<void> = Promise.resolve();
+      await act(async () => {
+        login = result.current.handleCloudLogin(null);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_000);
+        await login;
+      });
+
+      expect(localStorage.getItem("steward_session_token")).toBe(
+        "account-b-token",
+      );
+      expect(directBindBoundary.calls).toHaveLength(1);
+      // Electrobun delegates the only token write to the transactional bind.
+      expect(persistenceSpy).not.toHaveBeenCalled();
+      expect(setTokenSpy).not.toHaveBeenCalledWith("account-a-token");
+      expect(result.current.elizaCloudConnected).toBe(false);
+      expect(getBootConfig().cloudApiBase).toBe("https://eliza.app");
+      expect(recoverySnapshot().receipts).toEqual([]);
+      unmount();
+      vi.clearAllTimers();
+    } finally {
+      unregisterPersistence();
+      vi.useRealTimers();
+    }
+  });
+
+  it("compensates a completed Electrobun bind when B lands before the caller resumes", async () => {
+    vi.useFakeTimers();
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: {
+        ...window.location,
+        href: "http://127.0.0.1:5174/?shellMode=chat-overlay",
+        origin: "http://127.0.0.1:5174",
+        protocol: "http:",
+        hostname: "127.0.0.1",
+        port: "5174",
+        pathname: "/",
+        search: "?shellMode=chat-overlay",
+        assign: assignSpy,
+      },
+    });
+    const previousBootConfig = {
+      branding: {},
+      cloudApiBase: "https://eliza.app",
+    };
+    setBootConfig(previousBootConfig);
+    windowWithElectrobun.__electrobunWindowId = 1;
+    windowWithElectrobun.__ELIZA_DESKTOP_RUNTIME_MODE__ = "cloud";
+    windowWithElectrobun.__ELIZA_ELECTROBUN_RPC__ = {
+      request: {
+        openExternal: vi.fn(async () => ({ opened: true })),
+      },
+      onMessage: vi.fn(),
+      offMessage: vi.fn(),
+    };
+    cloudLoginDirectSpy.mockResolvedValue({
+      ok: true,
+      apiBase: "https://api.eliza.app",
+      browserUrl: "https://eliza.app/auth/cli-login?session=electrobun-gap-a",
+      sessionId: "electrobun-gap-a",
+    });
+    cloudLoginPollDirectSpy.mockResolvedValue({
+      status: "authenticated",
+      token: "account-a-token",
+      userId: "account-a-user",
+    });
+    const bindingRestore = vi.fn(async () => undefined);
+    directBindBoundary.override = async (options) => {
+      const restoreBoot = options.finalize?.();
+      expect(options.commitBeforePublish?.()).toBe(true);
+      queueMicrotask(() => completeNewerLogin("account-b-token"));
+      return {
+        restoreIfCurrent: async () => {
+          restoreBoot?.();
+          await bindingRestore();
+        },
+      };
+    };
+
+    try {
+      const { result, unmount } = renderHook(() => useCloudState(makeParams()));
+      let login: Promise<void> = Promise.resolve();
+      await act(async () => {
+        login = result.current.handleCloudLogin(null);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_000);
+        await login;
+      });
+
+      expect(bindingRestore).toHaveBeenCalledTimes(1);
+      expect(localStorage.getItem("steward_session_token")).toBe(
+        "account-b-token",
+      );
+      expect(getBootConfig()).toBe(previousBootConfig);
       expect(result.current.elizaCloudConnected).toBe(false);
       expect(recoverySnapshot().receipts).toEqual([]);
       unmount();

@@ -21,6 +21,7 @@ import {
   clearStoredStewardToken,
   readStoredStewardToken,
   replaceStoredStewardTokenIfCurrent,
+  type StewardTokenWriteAuthority,
   writeStoredStewardToken,
 } from "@elizaos/shared/steward-session-client";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -39,6 +40,7 @@ import {
 } from "../android-cloud/android-cloud-auth";
 import { type CloudCredits, type CloudStatus, client } from "../api";
 import { supportsFullAppShellRoutes } from "../api/app-shell-capabilities";
+import type { SessionTargetAuthority } from "../api/client-base";
 import {
   cloudTokenSecsRemaining,
   getCloudAuthToken,
@@ -56,8 +58,9 @@ import { publishCloudAuthComplete } from "../cloud/auth/cloud-auth-complete-sign
 import { enqueueStewardSessionMutation } from "../cloud/lib/steward-session-mutation-queue";
 import {
   beginStewardSessionRecovery,
-  completeStewardSessionRecovery,
+  commitStewardSessionRecoveryForPublication,
   isStewardSessionRecoveryReceiptLive,
+  readStewardSessionRecovery,
   rejectStewardSessionRecovery,
   type StewardSessionRecoveryReceipt,
 } from "../cloud/lib/steward-session-recovery-marker";
@@ -85,7 +88,10 @@ import {
   yieldHttpAfterNativeMessageBox,
 } from "../utils";
 import { scrubPersistedAgentProfileTokens } from "./agent-profiles";
-import { bindDirectCloudLoginToPersonalAgent } from "./bind-direct-cloud-login";
+import {
+  bindDirectCloudLoginToPersonalAgent,
+  type DirectCloudBindingAuthority,
+} from "./bind-direct-cloud-login";
 import {
   CLOUD_LOGIN_POPUP_NAME,
   isLoopbackStagingStewardDevelopment,
@@ -150,17 +156,106 @@ function rejectCloudLoginAuthorityRecovery(
  * the old poll is in flight; in that case the old response never reaches
  * protected storage, boot config, or the active client.
  */
+interface CloudLoginPublicationAuthority {
+  restoreIfCurrent(): Promise<void>;
+}
+
+function isCommittedCloudLoginAuthorityLive(
+  recovery: StewardSessionRecoveryReceipt,
+): boolean {
+  const snapshot = readStewardSessionRecovery(recovery.tenantId);
+  return (
+    snapshot.storageAvailable &&
+    snapshot.generation === recovery.receipt &&
+    !snapshot.receipts.includes(recovery.receipt)
+  );
+}
+
 async function commitCloudLoginAuthority(
   recovery: StewardSessionRecoveryReceipt,
-  publish: () => Promise<void>,
+  publish: (
+    validate: () => boolean,
+    commitReceipt: () => boolean,
+  ) => Promise<CloudLoginPublicationAuthority | false>,
 ): Promise<boolean> {
   return enqueueStewardSessionMutation(async () => {
-    if (!isStewardSessionRecoveryReceiptLive(recovery)) return false;
-    await publish();
-    if (!isStewardSessionRecoveryReceiptLive(recovery)) return false;
-    completeStewardSessionRecovery(recovery);
+    let receiptCommitted = false;
+    const validate = () =>
+      receiptCommitted
+        ? isCommittedCloudLoginAuthorityLive(recovery)
+        : isStewardSessionRecoveryReceiptLive(recovery);
+    const commitReceipt = (): boolean => {
+      if (receiptCommitted) return validate();
+      if (!validate()) return false;
+      receiptCommitted = commitStewardSessionRecoveryForPublication(recovery);
+      return receiptCommitted;
+    };
+    if (!validate()) return false;
+    const publication = await publish(validate, commitReceipt);
+    if (publication === false) return false;
+    if (!receiptCommitted || !validate()) {
+      await publication.restoreIfCurrent();
+      return false;
+    }
     return true;
   });
+}
+
+async function rollbackCloudLoginPublication(options: {
+  bindingAuthority: DirectCloudBindingAuthority | null;
+  tokenAuthority: StewardTokenWriteAuthority | null;
+  clientTargetAuthority: SessionTargetAuthority | null;
+  previousBootConfig: ReturnType<typeof getBootConfig>;
+  publishedBootConfig: ReturnType<typeof getBootConfig> | null;
+}): Promise<void> {
+  const failures: unknown[] = [];
+  try {
+    await options.bindingAuthority?.restoreIfCurrent();
+  } catch (error) {
+    failures.push(error);
+  }
+  let tokenRestored = false;
+  try {
+    tokenRestored =
+      (await options.tokenAuthority?.restorePredecessor({
+        deferPublication: true,
+      })) === true;
+  } catch (error) {
+    failures.push(error);
+  }
+  if (options.clientTargetAuthority && !tokenRestored) {
+    const bootOwned =
+      options.publishedBootConfig !== null &&
+      getBootConfig() === options.publishedBootConfig;
+    try {
+      const cleared = options.clientTargetAuthority.clearIfCurrent();
+      if (bootOwned && cleared) setBootConfig(options.previousBootConfig);
+    } catch (error) {
+      failures.push(error);
+    }
+  } else if (
+    !options.tokenAuthority &&
+    !options.bindingAuthority &&
+    options.publishedBootConfig !== null &&
+    getBootConfig() === options.publishedBootConfig
+  ) {
+    try {
+      setBootConfig(options.previousBootConfig);
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (tokenRestored && options.tokenAuthority?.publish?.() !== true) {
+    failures.push(
+      new Error("Restored Steward authority could not be published."),
+    );
+  }
+  if (failures.length > 0) {
+    throw new AggregateError(
+      failures,
+      "Could not fully restore the superseded Cloud login publication.",
+    );
+  }
 }
 
 /** A stale clear must not erase a login that won before queue admission. */
@@ -169,7 +264,7 @@ async function clearStoredStewardTokenIfUnchanged(
 ): Promise<void> {
   await enqueueStewardSessionMutation(async () => {
     if (readStoredStewardToken()?.trim() !== expectedToken) return;
-    await clearStoredStewardToken();
+    await clearStoredStewardToken({ expectedToken });
   });
 }
 
@@ -583,6 +678,16 @@ export function useCloudState({
   const [elizaCloudLoginError, setElizaCloudLoginError] = useState<
     string | null
   >(null);
+  const cloudLoginUiStateRef = useRef({
+    connected: elizaCloudConnected,
+    error: elizaCloudLoginError,
+    userId: elizaCloudUserId,
+  });
+  cloudLoginUiStateRef.current = {
+    connected: elizaCloudConnected,
+    error: elizaCloudLoginError,
+    userId: elizaCloudUserId,
+  };
   /**
    * Verification URL returned by `POST /api/cloud/login`, shown to the user
    * as a manual fallback while the device-code flow is awaiting completion.
@@ -1530,34 +1635,164 @@ export function useCloudState({
 
               const committed = await commitCloudLoginAuthority(
                 deviceCodeRecovery,
-                async () => {
-                  if (poll.token && typeof window !== "undefined") {
-                    // Protected token, its API authority, and every dependent
-                    // client target publish before this exact receipt retires.
-                    await writeStoredStewardToken(poll.token);
-                    setBootConfig({
-                      ...getBootConfig(),
-                      cloudApiBase: authenticatedCloudApiBase,
-                    });
-                  }
-
-                  if (useDirectAuth && poll.token) {
-                    if (isElectrobunRuntime()) {
-                      await bindDirectCloudLoginToPersonalAgent({
-                        client,
-                        cloudApiBase: authenticatedCloudApiBase,
-                        token: poll.token,
-                      });
-                    } else if (shouldBindClientToDirectCloud) {
-                      client.setBaseUrl(authenticatedCloudApiBase, {
-                        persist: false,
-                      });
-                      client.setToken(poll.token);
+                async (validate, commitReceipt) => {
+                  const bindsElectrobunPersonalAgent =
+                    useDirectAuth &&
+                    Boolean(poll.token) &&
+                    isElectrobunRuntime();
+                  const previousBootConfig = getBootConfig();
+                  let tokenAuthority: StewardTokenWriteAuthority | null = null;
+                  let bindingAuthority: DirectCloudBindingAuthority | null =
+                    null;
+                  let clientTargetAuthority: SessionTargetAuthority | null =
+                    null;
+                  let publishedBootConfig: ReturnType<
+                    typeof getBootConfig
+                  > | null = null;
+                  let uiPublished = false;
+                  const previousUiState = cloudLoginUiStateRef.current;
+                  const rollbackStagedPublication = (
+                    durableRestored: boolean,
+                  ) => {
+                    const bootOwned =
+                      publishedBootConfig !== null &&
+                      getBootConfig() === publishedBootConfig;
+                    let clientRolledBack = true;
+                    if (clientTargetAuthority) {
+                      clientRolledBack = durableRestored
+                        ? clientTargetAuthority.restoreIfCurrent()
+                        : clientTargetAuthority.clearIfCurrent();
                     }
+                    if (bootOwned && clientRolledBack) {
+                      setBootConfig(previousBootConfig);
+                    }
+                  };
+                  const rollback = () => {
+                    if (uiPublished) {
+                      cloudLoginUiStateRef.current = previousUiState;
+                      setElizaCloudConnected(previousUiState.connected);
+                      setElizaCloudLoginError(previousUiState.error);
+                      setElizaCloudUserId(previousUiState.userId);
+                      uiPublished = false;
+                    }
+                    return rollbackCloudLoginPublication({
+                      bindingAuthority,
+                      tokenAuthority,
+                      clientTargetAuthority,
+                      previousBootConfig,
+                      publishedBootConfig,
+                    });
+                  };
+                  try {
+                    if (
+                      poll.token &&
+                      typeof window !== "undefined" &&
+                      !bindsElectrobunPersonalAgent
+                    ) {
+                      const sessionToken = poll.token;
+                      // Protected token, its API authority, and every dependent
+                      // client target publish before this exact receipt retires.
+                      tokenAuthority = await writeStoredStewardToken(
+                        sessionToken,
+                        {
+                          validate,
+                          finalizeBeforePublish: () => {
+                            if (shouldBindClientToDirectCloud) {
+                              clientTargetAuthority = client.stageSessionTarget(
+                                {
+                                  baseUrl: authenticatedCloudApiBase,
+                                  token: sessionToken,
+                                },
+                                { persist: false },
+                              );
+                              if (!clientTargetAuthority) {
+                                throw new Error(
+                                  "The Cloud login token was rejected by the active client authority.",
+                                );
+                              }
+                            }
+                            publishedBootConfig = {
+                              ...getBootConfig(),
+                              cloudApiBase: authenticatedCloudApiBase,
+                            };
+                            setBootConfig(publishedBootConfig);
+                            return rollbackStagedPublication;
+                          },
+                          commitBeforePublish: () => {
+                            if (!commitReceipt()) return false;
+                            if (
+                              clientTargetAuthority &&
+                              !clientTargetAuthority.publish()
+                            ) {
+                              return false;
+                            }
+                            return validate();
+                          },
+                        },
+                      );
+                      if (!tokenAuthority || !validate()) {
+                        await rollback();
+                        return false;
+                      }
+                    }
+
+                    if (useDirectAuth && poll.token) {
+                      if (bindsElectrobunPersonalAgent) {
+                        bindingAuthority =
+                          await bindDirectCloudLoginToPersonalAgent({
+                            client,
+                            cloudApiBase: authenticatedCloudApiBase,
+                            token: poll.token,
+                            validate,
+                            commitBeforePublish: commitReceipt,
+                            finalize: () => {
+                              publishedBootConfig = {
+                                ...getBootConfig(),
+                                cloudApiBase: authenticatedCloudApiBase,
+                              };
+                              setBootConfig(publishedBootConfig);
+                              return () => {
+                                if (getBootConfig() === publishedBootConfig) {
+                                  setBootConfig(previousBootConfig);
+                                }
+                              };
+                            },
+                          });
+                        if (!bindingAuthority || !validate()) {
+                          await rollback();
+                          return false;
+                        }
+                      }
+                    }
+                    if (!commitReceipt() || !validate()) {
+                      await rollback();
+                      return false;
+                    }
+                    uiPublished = true;
+                    cloudLoginUiStateRef.current = {
+                      connected: true,
+                      error: null,
+                      userId: poll.userId ?? previousUiState.userId,
+                    };
+                    setElizaCloudConnected(true);
+                    setElizaCloudLoginError(null);
+                    if (poll.userId) setElizaCloudUserId(poll.userId);
+                    if (!validate()) {
+                      await rollback();
+                      return false;
+                    }
+                    return { restoreIfCurrent: rollback };
+                  } catch (error) {
+                    try {
+                      await rollback();
+                    } catch (rollbackError) {
+                      throw new AggregateError(
+                        [error, rollbackError],
+                        "Cloud login publication and rollback both failed.",
+                      );
+                    }
+                    throw error;
                   }
-                  setElizaCloudConnected(true);
-                  setElizaCloudLoginError(null);
-                  if (poll.userId) setElizaCloudUserId(poll.userId);
                 },
               );
               if (!committed) {
@@ -1688,36 +1923,117 @@ export function useCloudState({
             const sessionToken = poll.token;
             const committed = await commitCloudLoginAuthority(
               returnRecovery,
-              async () => {
-                if (cancelled) {
-                  throw new DOMException(
-                    "Cloud login return was cancelled",
-                    "AbortError",
-                  );
-                }
-                await writeStoredStewardToken(sessionToken);
-                if (cancelled) {
-                  throw new DOMException(
-                    "Cloud login return was cancelled",
-                    "AbortError",
-                  );
-                }
-                setBootConfig({
-                  ...getBootConfig(),
-                  cloudApiBase: authenticatedCloudApiBase,
-                });
+              async (validateReceipt, commitReceipt) => {
+                const validate = () => !cancelled && validateReceipt();
+                if (!validate()) return false;
+                const previousBootConfig = getBootConfig();
                 const preservesLocalBackend =
                   isLoopbackStagingStewardDevelopment() &&
                   hasCloudLoginBackend();
-                if (!preservesLocalBackend) {
-                  client.setBaseUrl(authenticatedCloudApiBase, {
-                    persist: false,
+                let tokenAuthority: StewardTokenWriteAuthority | null = null;
+                let clientTargetAuthority: SessionTargetAuthority | null = null;
+                let publishedBootConfig: ReturnType<
+                  typeof getBootConfig
+                > | null = null;
+                let uiPublished = false;
+                const previousUiState = cloudLoginUiStateRef.current;
+                const rollbackStagedPublication = (
+                  durableRestored: boolean,
+                ) => {
+                  const bootOwned =
+                    publishedBootConfig !== null &&
+                    getBootConfig() === publishedBootConfig;
+                  let clientRolledBack = true;
+                  if (clientTargetAuthority) {
+                    clientRolledBack = durableRestored
+                      ? clientTargetAuthority.restoreIfCurrent()
+                      : clientTargetAuthority.clearIfCurrent();
+                  }
+                  if (bootOwned && clientRolledBack) {
+                    setBootConfig(previousBootConfig);
+                  }
+                };
+                const rollback = () => {
+                  if (uiPublished) {
+                    cloudLoginUiStateRef.current = previousUiState;
+                    setElizaCloudConnected(previousUiState.connected);
+                    setElizaCloudLoginError(previousUiState.error);
+                    setElizaCloudUserId(previousUiState.userId);
+                    uiPublished = false;
+                  }
+                  return rollbackCloudLoginPublication({
+                    bindingAuthority: null,
+                    tokenAuthority,
+                    clientTargetAuthority,
+                    previousBootConfig,
+                    publishedBootConfig,
                   });
-                  client.setToken(sessionToken);
+                };
+                try {
+                  tokenAuthority = await writeStoredStewardToken(sessionToken, {
+                    validate,
+                    finalizeBeforePublish: () => {
+                      if (!preservesLocalBackend) {
+                        clientTargetAuthority = client.stageSessionTarget(
+                          {
+                            baseUrl: authenticatedCloudApiBase,
+                            token: sessionToken,
+                          },
+                          { persist: false },
+                        );
+                        if (!clientTargetAuthority) {
+                          throw new Error(
+                            "The Cloud login token was rejected by the active client authority.",
+                          );
+                        }
+                      }
+                      publishedBootConfig = {
+                        ...getBootConfig(),
+                        cloudApiBase: authenticatedCloudApiBase,
+                      };
+                      setBootConfig(publishedBootConfig);
+                      return rollbackStagedPublication;
+                    },
+                    commitBeforePublish: () => {
+                      if (!commitReceipt()) return false;
+                      if (
+                        clientTargetAuthority &&
+                        !clientTargetAuthority.publish()
+                      ) {
+                        return false;
+                      }
+                      return validate();
+                    },
+                  });
+                  if (!tokenAuthority || !commitReceipt() || !validate()) {
+                    await rollback();
+                    return false;
+                  }
+                  uiPublished = true;
+                  cloudLoginUiStateRef.current = {
+                    connected: true,
+                    error: null,
+                    userId: poll.userId ?? previousUiState.userId,
+                  };
+                  setElizaCloudConnected(true);
+                  setElizaCloudLoginError(null);
+                  if (poll.userId) setElizaCloudUserId(poll.userId);
+                  if (!validate()) {
+                    await rollback();
+                    return false;
+                  }
+                  return { restoreIfCurrent: rollback };
+                } catch (error) {
+                  try {
+                    await rollback();
+                  } catch (rollbackError) {
+                    throw new AggregateError(
+                      [error, rollbackError],
+                      "Cloud login return publication and rollback both failed.",
+                    );
+                  }
+                  throw error;
                 }
-                setElizaCloudConnected(true);
-                setElizaCloudLoginError(null);
-                if (poll.userId) setElizaCloudUserId(poll.userId);
               },
             );
             if (!committed || cancelled) return;
@@ -2117,15 +2433,20 @@ export function useCloudState({
       // No `exp` (opaque token / device-code session) → nothing to refresh.
       if (secs === null) return;
       if (secs >= STEWARD_REFRESH_AHEAD_SECS) return;
-      let result: Awaited<ReturnType<typeof refreshCloudStewardSession>>;
       try {
-        result = await refreshCloudStewardSession({
+        await refreshCloudStewardSession({
           endpoint: resolveStewardRefreshEndpoint(),
+          commitRefreshedSession: async (session, authority) => {
+            if (session.token && authority.validate()) {
+              await replaceStoredStewardTokenIfCurrent(
+                storedToken,
+                session.token,
+                { validate: authority.validate },
+              );
+            }
+          },
         });
         if (disposed) return;
-        if (result?.token) {
-          await replaceStoredStewardTokenIfCurrent(storedToken, result.token);
-        }
       } catch (err: unknown) {
         // error-policy:J4 a pre-emptive refresh or protected persistence
         // failure keeps the prior durable token until an auth boundary exposes

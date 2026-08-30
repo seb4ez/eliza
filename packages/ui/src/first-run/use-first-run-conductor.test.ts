@@ -74,7 +74,14 @@ const mocks = vi.hoisted(() => ({
   // boundary like the client, mocked so the silent cookie-recovery entry
   // (#15133) is drivable without a real .elizacloud.ai session.
   refreshCloudStewardSession: vi.fn(
-    async (): Promise<{ token?: string } | null> => null,
+    async (_options?: {
+      commitRefreshedSession?: (
+        session: {
+          token?: string;
+        },
+        authority: { validate: () => boolean },
+      ) => Promise<void> | void;
+    }): Promise<{ token?: string } | null> => null,
   ),
   preOpenCloudLoginWindow: vi.fn((): Window | null => null),
   // The device RAM probe is a native boundary like the client: tests inject a
@@ -1908,8 +1915,12 @@ describe("cloud-only onboarding (runtime chooser off — the production default)
     // present and the bounded refresh returns a token.
     localStorage.removeItem("steward_session_token");
     writeTestCookie("steward-authed=1");
-    mocks.refreshCloudStewardSession.mockResolvedValue({
-      token: "cookie-token",
+    mocks.refreshCloudStewardSession.mockImplementation(async (options) => {
+      const session = { token: "cookie-token" };
+      await options?.commitRefreshedSession?.(session, {
+        validate: () => true,
+      });
+      return session;
     });
     mocks.client.getCloudCompatAgents.mockResolvedValue({
       success: true,
@@ -1948,8 +1959,12 @@ describe("cloud-only onboarding (runtime chooser off — the production default)
     localStorage.removeItem("steward_session_token");
     markCloudAuthFirstScreenGreeting();
     writeTestCookie("steward-authed=1");
-    mocks.refreshCloudStewardSession.mockResolvedValue({
-      token: "cookie-token",
+    mocks.refreshCloudStewardSession.mockImplementation(async (options) => {
+      const session = { token: "cookie-token" };
+      await options?.commitRefreshedSession?.(session, {
+        validate: () => true,
+      });
+      return session;
     });
     const spies = seedAppStore({ elizaCloudConnected: false });
     const { transcript, turn, unmount } = renderConductor();

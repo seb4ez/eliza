@@ -71,6 +71,58 @@ describe("ensureCloudSessionForRepair", () => {
     expect(deps.writeToken).toHaveBeenCalledWith("fresh.jwt");
   });
 
+  it("persists and publishes only while the refresh authority remains live", async () => {
+    const validate = vi.fn(() => true);
+    const writeToken = vi.fn();
+    const refreshFn: NonNullable<EnsureCloudSessionForRepairDeps["refreshFn"]> =
+      vi.fn(async (options) => {
+        const session = { token: "fresh.jwt" };
+        await options?.commitRefreshedSession?.(session, { validate });
+        return session;
+      });
+    const syncListener = vi.fn();
+    window.addEventListener("steward-token-sync", syncListener);
+
+    try {
+      await expect(
+        ensureCloudSessionForRepair(makeDeps({ refreshFn, writeToken })),
+      ).resolves.toBe("fresh.jwt");
+    } finally {
+      window.removeEventListener("steward-token-sync", syncListener);
+    }
+
+    expect(writeToken).toHaveBeenCalledWith("fresh.jwt", { validate });
+    expect(syncListener).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not publish or fall back to an unfenced write when authority expires during persistence", async () => {
+    let authorityLive = true;
+    const validate = vi.fn(() => authorityLive);
+    const writeToken = vi.fn(async () => {
+      authorityLive = false;
+    });
+    const refreshFn: NonNullable<EnsureCloudSessionForRepairDeps["refreshFn"]> =
+      vi.fn(async (options) => {
+        const session = { token: "superseded.jwt" };
+        await options?.commitRefreshedSession?.(session, { validate });
+        return session;
+      });
+    const syncListener = vi.fn();
+    window.addEventListener("steward-token-sync", syncListener);
+
+    try {
+      await expect(
+        ensureCloudSessionForRepair(makeDeps({ refreshFn, writeToken })),
+      ).resolves.toBeNull();
+    } finally {
+      window.removeEventListener("steward-token-sync", syncListener);
+    }
+
+    expect(writeToken).toHaveBeenCalledTimes(1);
+    expect(writeToken).toHaveBeenCalledWith("superseded.jwt", { validate });
+    expect(syncListener).not.toHaveBeenCalled();
+  });
+
   it("returns null (keeps the wall) when there is no host cookie", async () => {
     const deps = makeDeps({ hasCookie: vi.fn(() => false) });
     const token = await ensureCloudSessionForRepair(deps);

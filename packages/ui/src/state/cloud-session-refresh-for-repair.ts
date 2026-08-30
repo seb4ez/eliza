@@ -48,7 +48,10 @@ export interface EnsureCloudSessionForRepairDeps {
   /** Injected (tests). Defaults to the canonical Steward refresh. */
   refreshFn?: typeof refreshCloudStewardSession;
   /** Injected (tests). Defaults to the localStorage Steward mirror write. */
-  writeToken?: (token: string) => Promise<void> | void;
+  writeToken?: (
+    token: string,
+    options?: { validate?: () => boolean },
+  ) => Promise<unknown> | unknown;
   /** Injected (tests). Defaults to the real refresh timeout. */
   timeoutMs?: number;
   /** Injected (tests). Defaults to real setTimeout-based race. */
@@ -107,11 +110,30 @@ export async function ensureCloudSessionForRepair(
   if (!hasCookie()) return null;
 
   let recovered: Awaited<ReturnType<typeof refreshCloudStewardSession>> = null;
+  const refreshCommit = {
+    committed: false,
+    finalizerInvoked: false,
+    authority: null as { validate: () => boolean } | null,
+  };
   try {
     // error-policy:J4 a failed/absent cookie refresh yields null → the caller
     // keeps the wall; it NEVER fabricates a session.
     recovered = await raceTimeout(
-      refreshFn({ endpoint: resolveRepairRefreshEndpoint() }).catch(() => null),
+      refreshFn({
+        endpoint: resolveRepairRefreshEndpoint(),
+        commitRefreshedSession: async (session, authority) => {
+          refreshCommit.finalizerInvoked = true;
+          refreshCommit.authority = authority;
+          const token = session.token?.trim();
+          if (!token || !authority.validate()) return;
+          await writeToken(token, { validate: authority.validate });
+          if (!authority.validate()) return;
+          refreshCommit.committed = true;
+          if (typeof CustomEvent === "function") {
+            window.dispatchEvent(new CustomEvent("steward-token-sync"));
+          }
+        },
+      }).catch(() => null),
       timeoutMs,
     );
   } catch {
@@ -120,13 +142,18 @@ export async function ensureCloudSessionForRepair(
 
   const token = recovered?.token?.trim();
   if (!token) return null;
+  if (refreshCommit.authority?.validate() === false) return null;
+  if (refreshCommit.finalizerInvoked && !refreshCommit.committed) return null;
 
-  await writeToken(token);
+  // Injected test/alternate refresh functions may predate the transactional
+  // finalizer contract. Preserve compatibility, while the production helper
+  // always commits under its origin-wide mutation lease above.
+  if (!refreshCommit.committed) await writeToken(token);
   // error-policy:J6 best-effort nudge — token consumers re-read next tick.
   // dispatchEvent reports listener errors instead of rethrowing, so no
   // try/catch is needed; the guard only skips environments without
   // CustomEvent (never a real browser).
-  if (typeof CustomEvent === "function") {
+  if (!refreshCommit.committed && typeof CustomEvent === "function") {
     window.dispatchEvent(new CustomEvent("steward-token-sync"));
   }
   return token;

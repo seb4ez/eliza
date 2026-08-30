@@ -272,25 +272,29 @@ export default function NativeAppsStudio(): React.JSX.Element {
     const boot = async () => {
       const token = readStoredStewardToken()?.trim() ?? null;
       if (shouldRefreshBeforeRender(token)) {
-        const refreshed = await Promise.race([
+        await Promise.race([
           // error-policy:J4 a failed pre-render refresh keeps the stored
           // token; expiry surfaces through the studio's own auth error path.
           refreshCloudStewardSession({
             endpoint: resolveNativeStewardRefreshEndpoint(),
+            commitRefreshedSession: async (session, authority) => {
+              if (!session.token || !authority.validate()) return;
+              await writeStoredStewardToken(session.token, {
+                validate: authority.validate,
+              });
+              if (!authority.validate()) return;
+              // Let the auth context + any storage listeners pick up the fresh JWT.
+              try {
+                window.dispatchEvent(new CustomEvent("steward-token-sync"));
+              } catch {
+                // error-policy:J6 listeners also re-read on their next lifecycle tick.
+              }
+            },
           }).catch(() => null),
           new Promise<null>((resolve) =>
             setTimeout(() => resolve(null), PRE_RENDER_REFRESH_TIMEOUT_MS),
           ),
         ]);
-        if (!cancelled && refreshed?.token) {
-          await writeStoredStewardToken(refreshed.token);
-          // Let the auth context + any storage listeners pick up the fresh JWT.
-          try {
-            window.dispatchEvent(new CustomEvent("steward-token-sync"));
-          } catch {
-            // best-effort
-          }
-        }
       }
       if (!cancelled) setBooted(true);
     };

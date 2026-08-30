@@ -113,6 +113,14 @@ const CLOUD_AGENT_TIER_PROBE_TIMEOUT_MS =
 const STEWARD_REFRESH_PATH = "/api/auth/steward-refresh";
 /** Default direct Cloud site base used to derive the native refresh endpoint. */
 const RESTORE_DEFAULT_DIRECT_CLOUD_BASE_URL = "https://eliza.app";
+/** A newer account mutation superseded this restore while its write awaited. */
+const STEWARD_REFRESH_AUTHORITY_SUPERSEDED = Symbol(
+  "steward-refresh-authority-superseded",
+);
+type RestoredStewardToken =
+  | string
+  | null
+  | typeof STEWARD_REFRESH_AUTHORITY_SUPERSEDED;
 
 function recoverCloudAgentId(active: PersistedActiveServer): string | null {
   const runtimeId = active.cloudRuntimeAgentId?.trim() ?? "";
@@ -432,7 +440,7 @@ function resolveRestoreStewardRefreshEndpoint(): string | undefined {
  *
  * The refresh runs at most once per restore, so there is no refresh loop.
  */
-async function resolveRestoredStewardToken(): Promise<string | null> {
+async function resolveRestoredStewardToken(): Promise<RestoredStewardToken> {
   const stored = readStoredStewardToken()?.trim();
   if (!stored) {
     // No app-origin token, but the host-only Eliza session
@@ -441,13 +449,32 @@ async function resolveRestoredStewardToken(): Promise<string | null> {
     // the /login page) instead of forcing a redundant re-sign-in; on success
     // the top-level LoginView gate and the first-run conductor both skip.
     if (typeof window !== "undefined" && hasStewardAuthedCookie()) {
+      const refreshCommit = {
+        authority: null as { validate: () => boolean } | null,
+      };
       const refreshProbe = await runStartupProbeWithTimeout(
         () =>
           refreshCloudStewardSession({
             endpoint: resolveRestoreStewardRefreshEndpoint(),
+            commitRefreshedSession: async (session, authority) => {
+              refreshCommit.authority = authority;
+              if (!session.token || !authority.validate()) return;
+              await writeStoredStewardToken(session.token, {
+                validate: authority.validate,
+              });
+              if (!authority.validate()) return;
+              try {
+                window.dispatchEvent(new CustomEvent("steward-token-sync"));
+              } catch {
+                // error-policy:J6 best-effort nudge — listeners re-read next tick.
+              }
+            },
           }),
         STEWARD_RESTORE_REFRESH_TIMEOUT_MS,
       );
+      if (refreshCommit.authority?.validate() === false) {
+        return STEWARD_REFRESH_AUTHORITY_SUPERSEDED;
+      }
       const recovered = refreshProbe.kind === "ok" ? refreshProbe.value : null;
       if (refreshProbe.kind !== "ok") {
         logger.warn(
@@ -456,12 +483,6 @@ async function resolveRestoredStewardToken(): Promise<string | null> {
         );
       }
       if (recovered?.token) {
-        await writeStoredStewardToken(recovered.token);
-        try {
-          window.dispatchEvent(new CustomEvent("steward-token-sync"));
-        } catch {
-          // error-policy:J6 best-effort nudge — listeners re-read next tick.
-        }
         return recovered.token;
       }
     }
@@ -473,13 +494,34 @@ async function resolveRestoredStewardToken(): Promise<string | null> {
   // Comfortably valid → restore instantly.
   if (secs >= STEWARD_RESTORE_REFRESH_AHEAD_SECS) return stored;
 
+  const refreshCommit = {
+    authority: null as { validate: () => boolean } | null,
+  };
   const refreshProbe = await runStartupProbeWithTimeout(
     () =>
       refreshCloudStewardSession({
         endpoint: resolveRestoreStewardRefreshEndpoint(),
+        commitRefreshedSession: async (session, authority) => {
+          refreshCommit.authority = authority;
+          if (!session.token || !authority.validate()) return;
+          await writeStoredStewardToken(session.token, {
+            validate: authority.validate,
+          });
+          if (!authority.validate()) return;
+          try {
+            if (typeof window !== "undefined") {
+              window.dispatchEvent(new CustomEvent("steward-token-sync"));
+            }
+          } catch {
+            // error-policy:J6 best-effort nudge — listeners re-read next tick.
+          }
+        },
       }),
     STEWARD_RESTORE_REFRESH_TIMEOUT_MS,
   );
+  if (refreshCommit.authority?.validate() === false) {
+    return STEWARD_REFRESH_AUTHORITY_SUPERSEDED;
+  }
   const refreshed = refreshProbe.kind === "ok" ? refreshProbe.value : null;
   if (refreshProbe.kind !== "ok") {
     logger.warn(
@@ -489,24 +531,13 @@ async function resolveRestoredStewardToken(): Promise<string | null> {
   }
 
   if (refreshed?.token) {
-    await writeStoredStewardToken(refreshed.token);
-    // Let the native Steward auth context + any storage listeners pick up the
-    // fresh JWT without waiting for the next read.
-    try {
-      if (typeof window !== "undefined") {
-        window.dispatchEvent(new CustomEvent("steward-token-sync"));
-      }
-    } catch {
-      // error-policy:J6 best-effort nudge — listeners re-read on their next
-      // tick regardless
-    }
     return refreshed.token;
   }
 
   // Refresh failed / timed out. A truly-expired token is a dead credential —
   // drop it so we restore unauthenticated instead of a guaranteed-401 dial.
   if (secs <= 0) {
-    await clearStoredStewardToken();
+    await clearStoredStewardToken({ expectedToken: stored });
     clearSharedCloudAccountBinding();
     return null;
   }
@@ -521,9 +552,13 @@ async function resolveRestoredStewardToken(): Promise<string | null> {
  * protected host that denies the delete; this awaits the real result and logs
  * a denied delete instead of pretending the credential is gone.
  */
-async function dropShadowingStewardToken(reason: string): Promise<void> {
+async function dropShadowingStewardToken(
+  reason: string,
+  expectedToken: string,
+  validate?: () => boolean,
+): Promise<void> {
   try {
-    await clearStoredStewardToken();
+    await clearStoredStewardToken({ expectedToken, validate });
   } catch (error) {
     logger.error(
       { error, reason },
@@ -593,24 +628,58 @@ export async function applyRestoredConnection(args: {
     clientRef.setToken(null);
     clientRef.setBaseUrl(resolved.apiBase ?? null);
     clientRef.setToken(initialToken);
-    let stewardTokenPromise: Promise<string | null>;
+    let stewardTokenPromise: Promise<RestoredStewardToken>;
     if (nativeOwnerApiKey && restoreProbeToken) {
       const secs = cloudTokenSecsRemaining(restoreProbeToken);
       if (secs !== null && secs < STEWARD_RESTORE_REFRESH_AHEAD_SECS) {
         // A near-expiry Steward JWT would shadow the valid owner-key fallback.
         // Try rotation once; on failure remove only that JWT so native Cloud
         // requests continue with the independently valid owner key.
-        stewardTokenPromise = refreshCloudStewardSession()
+        const rotationCommit = {
+          authority: null as { validate: () => boolean } | null,
+        };
+        stewardTokenPromise = refreshCloudStewardSession({
+          commitRefreshedSession: async (session, authority) => {
+            rotationCommit.authority = authority;
+            const fresh = session.token?.trim();
+            if (!fresh || !authority.validate()) return;
+            await writeStoredStewardToken(fresh, {
+              validate: authority.validate,
+            });
+            if (!authority.validate()) return;
+          },
+        })
           .then(async (refreshed) => {
             const fresh = refreshed?.token?.trim() || null;
-            if (fresh) await writeStoredStewardToken(fresh);
-            else await dropShadowingStewardToken("rotation-returned-no-token");
+            if (!fresh) {
+              if (rotationCommit.authority?.validate() === false) {
+                return STEWARD_REFRESH_AUTHORITY_SUPERSEDED;
+              }
+              await dropShadowingStewardToken(
+                "rotation-returned-no-token",
+                restoreProbeToken,
+                rotationCommit.authority?.validate,
+              );
+              if (rotationCommit.authority?.validate() === false) {
+                return STEWARD_REFRESH_AUTHORITY_SUPERSEDED;
+              }
+            }
             return fresh;
           })
           .catch(async () => {
             // error-policy:J4 the valid native owner key remains available;
             // remove the shadowing near-expiry JWT and visibly continue with it.
-            await dropShadowingStewardToken("rotation-failed");
+            if (rotationCommit.authority?.validate() === false) {
+              return STEWARD_REFRESH_AUTHORITY_SUPERSEDED;
+            }
+            await dropShadowingStewardToken(
+              "rotation-failed",
+              restoreProbeToken,
+              rotationCommit.authority?.validate,
+            );
+            if (rotationCommit.authority?.validate() === false) {
+              return STEWARD_REFRESH_AUTHORITY_SUPERSEDED;
+            }
             return null;
           });
       } else {
@@ -627,6 +696,7 @@ export async function applyRestoredConnection(args: {
     // refresh it BEFORE handing it to the client so a returning user never
     // boots into a permanently-401ing session (see resolveRestoredStewardToken).
     const stewardToken = await stewardTokenPromise;
+    if (stewardToken === STEWARD_REFRESH_AUTHORITY_SUPERSEDED) return;
     if (isManagedSharedControlPlane && !stewardToken && !nativeOwnerApiKey) {
       // Terminal refresh failure or a missing account session makes the saved
       // shared target unsafe. Clear every account-scoped mirror before startup

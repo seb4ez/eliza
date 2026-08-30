@@ -1752,7 +1752,22 @@ export function useFirstRunConductor(): void {
           // error-policy:J4 a failed/timed-out cookie refresh degrades to the
           // normal sign-in greeting below; it never fabricates a session.
           const refreshed = await Promise.race([
-            refreshCloudStewardSession().catch(() => null),
+            refreshCloudStewardSession({
+              commitRefreshedSession: async (session, authority) => {
+                if (!session.token || !authority.validate()) return;
+                await writeStoredStewardToken(session.token, {
+                  validate: authority.validate,
+                });
+                if (!authority.validate()) return;
+                try {
+                  window.dispatchEvent(new CustomEvent("steward-token-sync"));
+                } catch (error) {
+                  void error;
+                  // error-policy:J6 best-effort nudge — consumers re-read the
+                  // stored token on their next tick regardless.
+                }
+              },
+            }).catch(() => null),
             new Promise<null>((resolve) => {
               refreshTimeout = setTimeout(
                 () => resolve(null),
@@ -1763,26 +1778,6 @@ export function useFirstRunConductor(): void {
           if (refreshTimeout) clearTimeout(refreshTimeout);
           if (cancelled) return;
           if (refreshed?.token) {
-            try {
-              await writeStoredStewardToken(refreshed.token);
-            } catch (error) {
-              // error-policy:J4 a rejected protected-store write keeps the
-              // user visibly signed out instead of claiming a volatile login.
-              logger.error(
-                { error },
-                "[first-run-conductor] could not persist recovered Steward session",
-              );
-              silentCloudEntryRef.current = false;
-              seedSignInGreetingAndPoll();
-              return;
-            }
-            try {
-              window.dispatchEvent(new CustomEvent("steward-token-sync"));
-            } catch (error) {
-              void error;
-              // error-policy:J6 best-effort nudge — consumers re-read the
-              // stored token on their next tick regardless.
-            }
             greetAfterCloudAuthRef.current =
               consumeCloudAuthFirstScreenGreeting();
             runCloudResumeRef.current("cloud");

@@ -5,7 +5,16 @@
  */
 // @vitest-environment jsdom
 
+import {
+  registerStewardTokenPersistence,
+  STEWARD_TENANT_ID,
+} from "@elizaos/shared/steward-session-client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  beginStewardSessionRecovery,
+  rejectStewardSessionRecovery,
+  type StewardSessionRecoveryReceipt,
+} from "../cloud/lib/steward-session-recovery-marker";
 import {
   loadPersistedActiveServer,
   type PersistedActiveServer,
@@ -110,6 +119,41 @@ describe("applyRestoredConnection — cloud Steward token refresh at restore", (
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(client.setToken).toHaveBeenCalledWith(fresh);
+  });
+
+  it("stops publishing restored client state when refresh authority changes during the durable write", async () => {
+    const expired = makeJwt(-60);
+    localStorage.setItem(STEWARD_TOKEN_KEY, expired);
+    const fresh = makeJwt(3600);
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ token: fresh }),
+    });
+    let newerLogin: StewardSessionRecoveryReceipt | null = null;
+    const unregisterPersistence = registerStewardTokenPersistence(
+      async (token) => {
+        localStorage.setItem(STEWARD_TOKEN_KEY, token);
+        newerLogin = beginStewardSessionRecovery(STEWARD_TENANT_ID, "provider");
+      },
+    );
+    const client = fakeClient();
+
+    try {
+      await applyRestoredConnection({
+        restoredActiveServer: cloudServer(),
+        clientRef: client,
+      });
+    } finally {
+      unregisterPersistence();
+      if (newerLogin) rejectStewardSessionRecovery(newerLogin);
+    }
+
+    // Base + provisional A were published before the refresh. Once the newer
+    // login marker invalidates the refresh, no terminal A/null client state is
+    // published and the fenced token write compensates back to its predecessor.
+    expect(client.setToken).toHaveBeenCalledTimes(2);
+    expect(client.setToken).toHaveBeenLastCalledWith(expired);
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(expired);
   });
 
   it("does NOT refresh a comfortably-valid stored JWT (instant restore)", async () => {
