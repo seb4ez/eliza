@@ -579,8 +579,6 @@ export async function performSsoExchange(
         return { ok: false, error: "SSO exchange was superseded" };
       }
 
-      await writeStoredStewardToken(token);
-
       // Same call the login flow makes: sets the HttpOnly steward cookies + the
       // authed marker for this environment. It stays best-effort for an ordinary
       // bridge because AuthTokenSync retries. Account-link authority is never
@@ -596,6 +594,21 @@ export async function performSsoExchange(
       } catch {
         // error-policy:J6 best-effort cookie sync; the localStorage session is
         // established and AuthTokenSync re-syncs on its own cadence.
+      }
+
+      if (!isStewardSessionRecoveryReceiptLive(recoveryReceipt)) {
+        return { ok: false, error: "SSO exchange was superseded" };
+      }
+
+      // Keep the local bearer quarantined until every potentially mutating
+      // cookie POST above has settled. If login B plants a durable receipt
+      // while that POST is in flight, A exits without ever becoming readable;
+      // B then acquires the same origin lease and is the final server commit.
+      await writeStoredStewardToken(token, {
+        validate: () => isStewardSessionRecoveryReceiptLive(recoveryReceipt),
+      });
+      if (!isStewardSessionRecoveryReceiptLive(recoveryReceipt)) {
+        return { ok: false, error: "SSO exchange was superseded" };
       }
 
       clearSsoBridgeAttempt();

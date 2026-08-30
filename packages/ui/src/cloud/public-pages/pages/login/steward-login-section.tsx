@@ -66,6 +66,17 @@ import {
   SelectTrigger,
 } from "../../../../components/ui/select";
 import { openExternalUrl } from "../../../../utils/openExternalUrl";
+import { enqueueStewardSessionMutation } from "../../../lib/steward-session-mutation-queue";
+import {
+  beginStewardSessionRecovery,
+  completeStewardSessionRecovery,
+  completeStewardSessionRecoverySnapshot,
+  hasStewardSessionRecovery,
+  isStewardSessionRecoveryReceiptLive,
+  isStewardSessionRecoverySnapshotLive,
+  readStewardSessionRecovery,
+  rejectStewardSessionRecovery,
+} from "../../../lib/steward-session-recovery-marker";
 import { useCloudT } from "../../../shell/CloudI18nProvider";
 import {
   configuredStewardTenantId,
@@ -184,15 +195,19 @@ type EmailCheckState =
 async function persistStewardToken(
   token: string,
   signal?: AbortSignal,
-): Promise<void> {
-  await writeStoredStewardToken(token, { signal });
+  validate?: () => boolean,
+): Promise<boolean> {
+  if (validate?.() === false) return false;
+  await writeStoredStewardToken(token, { signal, validate });
   signal?.throwIfAborted();
+  if (validate?.() === false) return false;
   if (readStoredStewardToken() !== token) {
     throw new Error(
       "Eliza Cloud sign-in needs browser storage. Enable storage for this site and try again.",
     );
   }
   clearSsoLoggedOut();
+  return true;
 }
 
 /**
@@ -342,6 +357,15 @@ function describeCodeExchangeError(error: unknown, t: LoginTranslator): string {
     });
   }
   return getErrorMessage(error, "Could not complete Eliza Cloud sign-in.");
+}
+
+function isDefiniteSessionMutationRejection(error: unknown): boolean {
+  return (
+    error instanceof StewardSessionError &&
+    error.status >= 400 &&
+    error.status < 500 &&
+    error.status !== 408
+  );
 }
 
 function getCallbackReasonMessage(
@@ -707,6 +731,8 @@ export default function StewardLoginSection() {
     PLAYWRIGHT_TEST_AUTH_ENABLED,
   );
   const [sessionRecoveryAttempt, setSessionRecoveryAttempt] = useState(0);
+  const [sessionRecoveryRetryAvailable, setSessionRecoveryRetryAvailable] =
+    useState(false);
   const [externalSuccessDestination, setExternalSuccessDestination] = useState<
     string | null
   >(null);
@@ -759,8 +785,12 @@ export default function StewardLoginSection() {
   // handleSuccess POST is in that ambiguous window, recovery must consult the
   // server cookie before any durable browser token. This covers email, SMS,
   // passkey, Telegram, EVM, and Solana through their common handleSuccess path.
-  const serverSessionRecoveryRequiredRef = useRef(false);
-  const recoverPendingOAuthReturnToRef = useRef(false);
+  const initialServerSessionRecoveryRef = useRef(
+    readStewardSessionRecovery(STEWARD_TENANT_ID),
+  );
+  const recoverPendingOAuthReturnToRef = useRef(
+    initialServerSessionRecoveryRef.current.hasOAuth,
+  );
   const [providersLoaded, setProvidersLoaded] = useState(
     () =>
       PLAYWRIGHT_TEST_AUTH_ENABLED ||
@@ -911,6 +941,7 @@ export default function StewardLoginSection() {
     const controller = new AbortController();
     const promise = recoverStewardEmailSessionViaCookie(email, {
       signal: controller.signal,
+      tenantId: STEWARD_TENANT_ID,
     })
       .then((session) => (controller.signal.aborted ? null : session))
       .finally(() => {
@@ -946,12 +977,11 @@ export default function StewardLoginSection() {
       // authorized it. Rotate the intent generation synchronously so stale SDK
       // completions cannot publish while React is still committing this reset.
       const callbackExchangeStarted = callbackExchangeStartedRef.current;
+      const durableRecovery = readStewardSessionRecovery(STEWARD_TENANT_ID);
       recoverPendingOAuthReturnToRef.current =
-        recoverPendingOAuthReturnToRef.current || callbackExchangeStarted;
-      serverSessionRecoveryRequiredRef.current =
-        serverSessionRecoveryRequiredRef.current ||
+        recoverPendingOAuthReturnToRef.current ||
         callbackExchangeStarted ||
-        sessionCommitGenerationRef.current !== null;
+        durableRecovery.hasOAuth;
       callbackExchangeStartedRef.current = false;
       callbackRecoveryBlockedRef.current = false;
       rotateProviderIntent();
@@ -1094,6 +1124,14 @@ export default function StewardLoginSection() {
     setProviderDiscoveryAttempt((attempt) => attempt + 1);
   }, [rotateProviderIntent, setLiveProviderAuthority]);
 
+  const retryServerSessionRecovery = useCallback(() => {
+    setError(null);
+    setSessionRecoveryRetryAvailable(false);
+    setSessionRecoveryComplete(false);
+    rotateProviderIntent();
+    setSessionRecoveryAttempt((attempt) => attempt + 1);
+  }, [rotateProviderIntent]);
+
   useEffect(() => {
     if (PLAYWRIGHT_TEST_AUTH_ENABLED) return;
 
@@ -1144,32 +1182,89 @@ export default function StewardLoginSection() {
         );
         return;
       }
+      let recoveryReceipt: ReturnType<typeof beginStewardSessionRecovery>;
+      try {
+        recoveryReceipt = beginStewardSessionRecovery(
+          STEWARD_TENANT_ID,
+          "oauth",
+        );
+      } catch (storageError) {
+        callbackExchangeStartedRef.current = false;
+        callbackRecoveryBlockedRef.current = false;
+        setCompletingCallback(false);
+        setCallbackError(
+          getErrorMessage(
+            storageError,
+            "Sign-in cannot start because durable recovery storage is unavailable.",
+          ),
+        );
+        return;
+      }
+      recoverPendingOAuthReturnToRef.current = true;
       callbackExchangeStartedRef.current = true;
-      exchangeStewardCodeViaApi(code, {
-        redirectUri: buildStewardOAuthRedirectUri(window.location.origin),
-        tenantId: STEWARD_TENANT_ID,
-        codeVerifier,
-        signal: callbackSignal,
+      enqueueStewardSessionMutation(async (mutationLease) => {
+        if (
+          !isProviderGenerationCurrent(callbackGeneration) ||
+          !isStewardSessionRecoveryReceiptLive(recoveryReceipt)
+        ) {
+          return false;
+        }
+        const res = await exchangeStewardCodeViaApi(code, {
+          redirectUri: buildStewardOAuthRedirectUri(window.location.origin),
+          tenantId: STEWARD_TENANT_ID,
+          codeVerifier,
+          signal: callbackSignal,
+          mutationLease,
+        });
+        if (!isProviderGenerationCurrent(callbackGeneration)) return false;
+        let token = res?.token;
+        if (!token) {
+          const refreshed = await refreshStewardSessionViaCookie({
+            signal: callbackSignal,
+            mutationLease,
+          }).catch(() => null);
+          if (!isProviderGenerationCurrent(callbackGeneration)) return false;
+          token = refreshed?.token;
+        }
+        if (!token) {
+          throw new Error(
+            "Sign-in completed, but the browser session could not be hydrated. Refresh and try again.",
+          );
+        }
+        if (
+          !isProviderGenerationCurrent(callbackGeneration) ||
+          !isStewardSessionRecoveryReceiptLive(recoveryReceipt)
+        ) {
+          return false;
+        }
+        const tokenPublished = await persistStewardToken(
+          token,
+          callbackSignal,
+          () =>
+            isProviderGenerationCurrent(callbackGeneration) &&
+            isStewardSessionRecoveryReceiptLive(recoveryReceipt),
+        );
+        if (!tokenPublished) return false;
+        if (
+          !isProviderGenerationCurrent(callbackGeneration) ||
+          !isStewardSessionRecoveryReceiptLive(recoveryReceipt)
+        ) {
+          return false;
+        }
+        window.dispatchEvent(new CustomEvent("steward-token-sync"));
+        completeStewardSessionRecovery(recoveryReceipt);
+        return true;
       })
-        .then(async (res) => {
-          if (!isProviderGenerationCurrent(callbackGeneration)) return;
-          let token = res?.token;
-          if (!token) {
-            const refreshed = await refreshStewardSessionViaCookie({
-              signal: callbackSignal,
-            }).catch(() => null);
-            if (!isProviderGenerationCurrent(callbackGeneration)) return;
-            token = refreshed?.token;
+        .then((committed) => {
+          if (!committed) {
+            if (isProviderGenerationCurrent(callbackGeneration)) {
+              callbackExchangeStartedRef.current = false;
+              callbackRecoveryBlockedRef.current = false;
+              setCompletingCallback(false);
+              setSessionRecoveryAttempt((attempt) => attempt + 1);
+            }
+            return;
           }
-          if (!token) {
-            throw new Error(
-              "Sign-in completed, but the browser session could not be hydrated. Refresh and try again.",
-            );
-          }
-          if (!isProviderGenerationCurrent(callbackGeneration)) return;
-          await persistStewardToken(token, callbackSignal);
-          if (!isProviderGenerationCurrent(callbackGeneration)) return;
-          window.dispatchEvent(new CustomEvent("steward-token-sync"));
           setRedirectTo(
             resolveLoginReturnTo(searchParams, consumePendingOAuthReturnTo()),
           );
@@ -1177,6 +1272,9 @@ export default function StewardLoginSection() {
         .catch((sessionError) => {
           if (!isProviderGenerationCurrent(callbackGeneration)) return;
           callbackExchangeStartedRef.current = false;
+          if (isDefiniteSessionMutationRejection(sessionError)) {
+            rejectStewardSessionRecovery(recoveryReceipt);
+          }
           setCompletingCallback(false);
           setCallbackError(describeCodeExchangeError(sessionError, t));
         });
@@ -1240,6 +1338,7 @@ export default function StewardLoginSection() {
     // a pre-freeze request to overtake the restored document.
     void sessionRecoveryAttempt;
     if (PLAYWRIGHT_TEST_AUTH_ENABLED) return;
+    if (redirectTo !== null) return;
     if (searchParams.get("switchAccount") === "1") return;
     if (callbackRecoveryBlockedRef.current || searchParams.get("error")) {
       setSessionRecoveryComplete(true);
@@ -1247,10 +1346,14 @@ export default function StewardLoginSection() {
     }
 
     setSessionRecoveryComplete(false);
+    setSessionRecoveryRetryAvailable(false);
     let cancelled = false;
     const recoveryGeneration = providerIntentGenerationRef.current;
     const recoverySignal = providerIntentAbortRef.current.signal;
-    const recoveringServerSession = serverSessionRecoveryRequiredRef.current;
+    const recoverySnapshot = readStewardSessionRecovery(STEWARD_TENANT_ID);
+    const recoveringServerSession = recoverySnapshot.receipts.length > 0;
+    recoverPendingOAuthReturnToRef.current =
+      recoverPendingOAuthReturnToRef.current || recoverySnapshot.hasOAuth;
     const recoveryIsCurrent = () =>
       !cancelled && isProviderGenerationCurrent(recoveryGeneration);
     const resolveRecoveredReturnTo = () => {
@@ -1263,52 +1366,195 @@ export default function StewardLoginSection() {
 
     const tryRecoverSession = async () => {
       try {
+        if (!recoverySnapshot.storageAvailable) {
+          throw new Error(
+            "Session recovery storage cannot be read. Enable site storage and retry before continuing.",
+          );
+        }
         // A dispatched OAuth exchange or provider session POST may already
-        // have committed a different account to the HttpOnly cookie before
-        // BFCache revoked its client continuation. In that case the server
-        // cookie wins; replaying a stale local token first could overwrite the
-        // newly selected account.
-        const storedToken = recoveringServerSession
-          ? null
-          : readStoredStewardToken();
-        if (storedToken) {
-          try {
-            // Session recovery establishes auth only. A pending Telegram claim
-            // remains inert until /get-started previews it and the user
-            // confirms it explicitly.
-            await syncStewardSessionCookie(storedToken, null, {
-              signal: recoverySignal,
-            });
-            if (recoveryIsCurrent()) {
-              setRedirectTo(resolveRecoveredReturnTo());
+        // have committed a different account to the HttpOnly cookie before an
+        // unmount, reload, tab close, or BFCache restore revoked its
+        // continuation. Only the durable ambiguity receipt activates this
+        // cookie-first path: `steward-authed` is also set by ordinary
+        // bearer-only passive sync and must never make recovery delete or
+        // replace that otherwise valid browser session.
+        if (recoveringServerSession) {
+          const recoveryResult = await enqueueStewardSessionMutation(
+            async (mutationLease) => {
+              const tokenAtAdmission = readStoredStewardToken();
+              if (!isStewardSessionRecoverySnapshotLive(recoverySnapshot)) {
+                return { kind: "superseded" as const };
+              }
+              const refreshed = await recoverStewardSessionViaCookie({
+                signal: recoverySignal,
+                rejectedSession: "preserve",
+                mutationLease,
+              });
+              if (!recoveryIsCurrent()) {
+                return { kind: "cancelled" as const };
+              }
+              if (refreshed && !refreshed.token) {
+                throw new Error(
+                  "The server session was restored, but its browser token could not be hydrated. Retry session recovery.",
+                );
+              }
+              if (!refreshed?.token) {
+                // Two refresh rejections cannot prove that the original
+                // mutation did not commit an access-only cookie. Keep every
+                // receipt and never replay account A.
+                throw new Error(
+                  "The previous sign-in may have completed, but its browser session could not be recovered. Retry session recovery.",
+                );
+              }
+              if (!isStewardSessionRecoverySnapshotLive(recoverySnapshot)) {
+                return { kind: "superseded" as const };
+              }
+              await writeStoredStewardToken(refreshed.token, {
+                signal: recoverySignal,
+                validate: () => {
+                  const currentToken = readStoredStewardToken();
+                  return (
+                    recoveryIsCurrent() &&
+                    isStewardSessionRecoverySnapshotLive(recoverySnapshot) &&
+                    (currentToken === tokenAtAdmission ||
+                      currentToken === refreshed.token)
+                  );
+                },
+              });
+              if (
+                !recoveryIsCurrent() ||
+                !isStewardSessionRecoverySnapshotLive(recoverySnapshot) ||
+                readStoredStewardToken() !== refreshed.token
+              ) {
+                return { kind: "cancelled" as const };
+              }
+              completeStewardSessionRecoverySnapshot(recoverySnapshot);
+              return { kind: "recovered" as const };
+            },
+          );
+          if (!recoveryIsCurrent()) return;
+          if (recoveryResult.kind === "cancelled") return;
+          if (recoveryResult.kind === "recovered") {
+            if (hasStewardSessionRecovery(STEWARD_TENANT_ID)) {
+              throw new Error(
+                "Another sign-in is still being finalized. Retry session recovery in a moment.",
+              );
             }
+            window.dispatchEvent(new CustomEvent("steward-token-sync"));
+            setRedirectTo(resolveRecoveredReturnTo());
             return;
-          } catch (storedTokenError) {
-            // error-policy:J4 A stale browser token may coexist with a valid
-            // HttpOnly refresh cookie. Retry only through the server-owned
-            // cookie boundary; never reintroduce a browser refresh token.
-            if (!hasStewardAuthedCookie()) throw storedTokenError;
           }
+          if (hasStewardSessionRecovery(STEWARD_TENANT_ID)) {
+            throw new Error(
+              "Another sign-in is still being finalized. Retry session recovery in a moment.",
+            );
+          }
+          // A newer successful transaction superseded this snapshot and
+          // published its token under the same lock. It is now safe to use the
+          // ordinary stored-token path below.
         }
 
-        if (recoveringServerSession || hasStewardAuthedCookie()) {
-          const refreshed = await recoverStewardSessionViaCookie({
-            signal: recoverySignal,
-          });
+        let storedToken = readStoredStewardToken();
+        if (!storedToken && hasStewardAuthedCookie()) {
+          const cookieRecovery = await enqueueStewardSessionMutation(
+            async (mutationLease) => {
+              // The readable marker is only an admission hint. A durable login
+              // or logout intent can appear while this returning-user refresh
+              // waits for another tab, so revalidate the exact empty snapshot
+              // and token absence under the origin lease before and after the
+              // refresh boundary.
+              if (
+                !isStewardSessionRecoverySnapshotLive(recoverySnapshot) ||
+                readStoredStewardToken() !== null
+              ) {
+                return { kind: "superseded" as const };
+              }
+              const refreshed = await recoverStewardSessionViaCookie({
+                signal: recoverySignal,
+                mutationLease,
+              });
+              if (!recoveryIsCurrent()) {
+                return { kind: "cancelled" as const };
+              }
+              if (!refreshed?.token) {
+                return { kind: "missing" as const };
+              }
+              if (
+                !isStewardSessionRecoverySnapshotLive(recoverySnapshot) ||
+                readStoredStewardToken() !== null
+              ) {
+                return { kind: "superseded" as const };
+              }
+              await writeStoredStewardToken(refreshed.token, {
+                signal: recoverySignal,
+                validate: () => {
+                  const currentToken = readStoredStewardToken();
+                  return (
+                    recoveryIsCurrent() &&
+                    isStewardSessionRecoverySnapshotLive(recoverySnapshot) &&
+                    (currentToken === null || currentToken === refreshed.token)
+                  );
+                },
+              });
+              if (!recoveryIsCurrent()) {
+                return { kind: "cancelled" as const };
+              }
+              if (
+                !isStewardSessionRecoverySnapshotLive(recoverySnapshot) ||
+                readStoredStewardToken() !== refreshed.token
+              ) {
+                return { kind: "superseded" as const };
+              }
+              return { kind: "recovered" as const };
+            },
+          );
           if (!recoveryIsCurrent()) return;
-          if (refreshed?.token) {
-            await writeStoredStewardToken(refreshed.token, {
-              signal: recoverySignal,
-            });
-            if (!recoveryIsCurrent()) return;
-            serverSessionRecoveryRequiredRef.current = false;
+          if (cookieRecovery.kind === "cancelled") return;
+          if (cookieRecovery.kind === "recovered") {
             window.dispatchEvent(new CustomEvent("steward-token-sync"));
+            setRedirectTo(resolveRecoveredReturnTo());
+            return;
+          }
+          if (cookieRecovery.kind === "superseded") {
+            if (hasStewardSessionRecovery(STEWARD_TENANT_ID)) {
+              throw new Error(
+                "Another session change is still being finalized. Retry session recovery in a moment.",
+              );
+            }
+            storedToken = readStoredStewardToken();
+          }
+        }
+        if (storedToken) {
+          // Session recovery establishes auth only. A pending Telegram claim
+          // remains inert until /get-started previews it and the user confirms
+          // it explicitly. Any readable cookie was already reconciled above,
+          // so a rejection must not trigger a second refresh rotation.
+          const storedSessionStillOwnsAuthority = () =>
+            recoveryIsCurrent() &&
+            isStewardSessionRecoverySnapshotLive(recoverySnapshot) &&
+            readStoredStewardToken() === storedToken;
+          await syncStewardSessionCookie(storedToken, null, {
+            signal: recoverySignal,
+            validate: storedSessionStillOwnsAuthority,
+          });
+          if (!storedSessionStillOwnsAuthority()) {
+            if (hasStewardSessionRecovery(STEWARD_TENANT_ID)) {
+              throw new Error(
+                "Another session change is still being finalized. Retry session recovery in a moment.",
+              );
+            }
+            return;
+          }
+          if (recoveryIsCurrent()) {
             setRedirectTo(resolveRecoveredReturnTo());
           }
           return;
         }
       } catch (sessionError) {
         if (recoveryIsCurrent()) {
+          setSessionRecoveryRetryAvailable(
+            hasStewardSessionRecovery(STEWARD_TENANT_ID),
+          );
           setError(
             getErrorMessage(
               sessionError,
@@ -1326,7 +1572,12 @@ export default function StewardLoginSection() {
     return () => {
       cancelled = true;
     };
-  }, [isProviderGenerationCurrent, searchParams, sessionRecoveryAttempt]);
+  }, [
+    isProviderGenerationCurrent,
+    redirectTo,
+    searchParams,
+    sessionRecoveryAttempt,
+  ]);
 
   useEffect(() => {
     const errorCode = searchParams.get("error");
@@ -1383,11 +1634,8 @@ export default function StewardLoginSection() {
               return;
             }
             if (recovered) {
-              if (recovered.token) {
-                await persistStewardToken(recovered.token, intentSignal);
-                if (!isProviderIntentCurrent(intentGeneration)) return;
-                window.dispatchEvent(new CustomEvent("steward-token-sync"));
-              }
+              // The recovery helper returns only after refresh response
+              // parsing and canonical publication complete under one lease.
               setExternalSuccessDestination(resolveLoginReturnTo(searchParams));
               setEmailCheckState("approved");
               setError(null);
@@ -1450,7 +1698,6 @@ export default function StewardLoginSection() {
   useEffect(() => {
     if (step !== "email-sent" || loading === "email" || !email.trim()) return;
     const intentGeneration = providerIntentRevision;
-    const intentSignal = providerIntentAbortRef.current.signal;
     let cancelled = false;
     const unsubscribe = subscribeStewardEmailLoginComplete(email, (message) => {
       void (async () => {
@@ -1464,11 +1711,7 @@ export default function StewardLoginSection() {
             );
             return;
           }
-          if (recovered.token) {
-            await persistStewardToken(recovered.token, intentSignal);
-            if (!isProviderIntentCurrent(intentGeneration)) return;
-            window.dispatchEvent(new CustomEvent("steward-token-sync"));
-          }
+          // The recovery helper has already published the token atomically.
           setExternalSuccessDestination(message.destination);
           setEmailCheckState("approved");
           setError(null);
@@ -1537,19 +1780,70 @@ export default function StewardLoginSection() {
     const intentSignal = providerIntentAbortRef.current.signal;
     sessionCommitGenerationRef.current = intentGeneration;
     setSessionCommitGeneration(intentGeneration);
+    let recoveryReceipt: ReturnType<typeof beginStewardSessionRecovery>;
+    try {
+      recoveryReceipt = beginStewardSessionRecovery(
+        STEWARD_TENANT_ID,
+        "provider",
+      );
+    } catch (storageError) {
+      sessionCommitGenerationRef.current = null;
+      setSessionCommitGeneration(null);
+      throw storageError;
+    }
     setPasskeyEmailGrant(null);
     setShowPasskeyEnrollmentRecovery(false);
     try {
-      await syncStewardSessionCookie(token, refreshToken, {
-        ...options,
-        signal: intentSignal,
-      });
-      if (!isProviderIntentCurrent(intentGeneration)) return;
-      // Publish the browser token only after the authoritative Cloud sync wins.
-      // Otherwise StewardProviderRuntime can race a second unhinted sync against
-      // phone-account promotion.
-      await persistStewardToken(token, intentSignal);
-      if (!isProviderIntentCurrent(intentGeneration)) return;
+      const committed = await enqueueStewardSessionMutation(
+        async (mutationLease) => {
+          if (
+            !isProviderIntentCurrent(intentGeneration) ||
+            !isStewardSessionRecoveryReceiptLive(recoveryReceipt)
+          ) {
+            return false;
+          }
+          await syncStewardSessionCookie(token, refreshToken, {
+            ...options,
+            signal: intentSignal,
+            mutationLease,
+            validate: () =>
+              isProviderIntentCurrent(intentGeneration) &&
+              isStewardSessionRecoveryReceiptLive(recoveryReceipt),
+          });
+          if (
+            !isProviderIntentCurrent(intentGeneration) ||
+            !isStewardSessionRecoveryReceiptLive(recoveryReceipt)
+          ) {
+            return false;
+          }
+          // Keep server commit, protected-storage publication, and exact
+          // receipt completion under one origin-wide lock. A newer provider
+          // transaction cannot interleave and then be overwritten locally.
+          const tokenPublished = await persistStewardToken(
+            token,
+            intentSignal,
+            () =>
+              isProviderIntentCurrent(intentGeneration) &&
+              isStewardSessionRecoveryReceiptLive(recoveryReceipt),
+          );
+          if (!tokenPublished) return false;
+          if (
+            !isProviderIntentCurrent(intentGeneration) ||
+            !isStewardSessionRecoveryReceiptLive(recoveryReceipt)
+          ) {
+            return false;
+          }
+          completeStewardSessionRecovery(recoveryReceipt);
+          return true;
+        },
+      );
+      if (!committed) {
+        if (isProviderGenerationCurrent(intentGeneration)) {
+          sessionCommitGenerationRef.current = null;
+          setSessionCommitGeneration(null);
+        }
+        return;
+      }
       toast.success("Signed in!");
       setRedirectTo(
         resolveLoginReturnTo(searchParams, consumePendingOAuthReturnTo()),
@@ -1559,6 +1853,9 @@ export default function StewardLoginSection() {
       if (isProviderGenerationCurrent(intentGeneration)) {
         sessionCommitGenerationRef.current = null;
         setSessionCommitGeneration(null);
+        if (isDefiniteSessionMutationRejection(commitError)) {
+          rejectStewardSessionRecovery(recoveryReceipt);
+        }
       }
       throw commitError;
     }
@@ -3497,9 +3794,23 @@ export default function StewardLoginSection() {
       )}
 
       {error && (
-        <p className="text-center text-sm text-destructive" role="alert">
-          {error}
-        </p>
+        <div className="space-y-2 text-center">
+          <p className="text-sm text-destructive" role="alert">
+            {error}
+          </p>
+          {sessionRecoveryRetryAvailable && (
+            <Button
+              variant="outlineMuted"
+              type="button"
+              className="hosted-signin-focus-emphasis min-h-touch w-full"
+              onClick={retryServerSessionRecovery}
+            >
+              {t("cloud.login.sessionRecovery.retry", {
+                defaultValue: "Retry session recovery",
+              })}
+            </Button>
+          )}
+        </div>
       )}
     </div>
   );

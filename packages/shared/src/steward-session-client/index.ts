@@ -42,15 +42,47 @@ export interface StewardSessionChangeDetail {
 
 let sessionEpoch = 0;
 let stewardTokenMutationTail: Promise<void> = Promise.resolve();
+let stewardTokenMutationAuthority = Symbol("initial-steward-token-authority");
 
-type StewardTokenRemoval = () => Promise<void>;
-type StewardTokenPersistenceCommit = () => Promise<void>;
+export type StewardTokenWriteValidator = () => boolean;
+export interface StewardTokenRemovalOptions {
+  /**
+   * Exact canonical value owned by the caller. `null` means the caller
+   * observed no token; it is distinct from omitting the options, which keeps
+   * the explicit-log-out API's unconditional removal semantics.
+   */
+  expectedToken: string | null;
+  validate?: StewardTokenWriteValidator;
+}
+type StewardTokenRemoval = (options?: StewardTokenRemovalOptions) => Promise<
+  | boolean
+  // biome-ignore lint/suspicious/noConfusingVoidType: legacy host adapters returned void before exact CAS outcomes were introduced.
+  | void
+>;
+type StewardTokenPersistenceCommit = (
+  validate?: StewardTokenWriteValidator,
+) => Promise<void>;
+export interface StewardTokenPersistenceTransaction {
+  commit(validate?: StewardTokenWriteValidator): Promise<void>;
+  /** Restore only the predecessor captured by this exact host write receipt. */
+  restorePredecessor(validate?: StewardTokenWriteValidator): Promise<boolean>;
+}
+type StewardTokenPersistenceResult =
+  // biome-ignore lint/suspicious/noConfusingVoidType: void preserves compatibility with adapters that need no host receipt.
+  void | StewardTokenPersistenceCommit | StewardTokenPersistenceTransaction;
 type StewardTokenPersistence = (
   token: string,
-) => Promise<void> | Promise<StewardTokenPersistenceCommit>;
+) => Promise<StewardTokenPersistenceResult>;
+interface PersistedStewardTokenTransaction {
+  commit: StewardTokenPersistenceCommit;
+  restorePredecessor:
+    | ((validate?: StewardTokenWriteValidator) => Promise<boolean>)
+    | null;
+}
 type StewardTokenCompareAndRestore = (
   expectedToken: string,
   restoreToken: string | null,
+  options?: Pick<StewardTokenRemovalOptions, "validate">,
 ) => Promise<boolean>;
 
 let stewardTokenRemoval: StewardTokenRemoval | null = null;
@@ -76,6 +108,23 @@ function serializeStewardTokenMutation<T>(
     () => undefined,
   );
   return result;
+}
+
+function advanceStewardTokenMutationAuthority(): symbol {
+  const authority = Symbol("steward-token-write");
+  stewardTokenMutationAuthority = authority;
+  return authority;
+}
+
+function exactStoredStewardTokenIsCurrent(
+  token: string,
+  requiredScope: string | null,
+): boolean {
+  return (
+    window.localStorage.getItem(STEWARD_TOKEN_KEY) === token &&
+    (!requiredScope ||
+      window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY) === requiredScope)
+  );
 }
 
 /** Distinguishes a failed durable token write from an ordinary auth failure. */
@@ -417,12 +466,23 @@ async function persistStoredStewardToken(
   requiredScope: string | null,
   previousToken: string | null,
   previousScope: string | null,
-): Promise<StewardTokenPersistenceCommit | null> {
+): Promise<PersistedStewardTokenTransaction | null> {
   let tokenPersisted = false;
+  let transaction: PersistedStewardTokenTransaction | null = null;
   try {
-    let commit: StewardTokenPersistenceCommit | null = null;
     if (stewardTokenPersistence) {
-      commit = (await stewardTokenPersistence(token)) ?? null;
+      const result = await stewardTokenPersistence(token);
+      if (typeof result === "function") {
+        transaction = {
+          commit: result,
+          restorePredecessor: null,
+        };
+      } else if (result) {
+        transaction = {
+          commit: result.commit.bind(result),
+          restorePredecessor: result.restorePredecessor.bind(result),
+        };
+      }
     } else {
       window.localStorage.setItem(STEWARD_TOKEN_KEY, token);
     }
@@ -439,16 +499,16 @@ async function persistStoredStewardToken(
     ) {
       window.localStorage.setItem(STEWARD_TOKEN_SCOPE_KEY, requiredScope);
     }
-    return commit;
+    return transaction;
   } catch (error) {
     if (tokenPersisted) {
       const rollbackFailures: unknown[] = [];
       let tokenRestored = false;
       try {
-        tokenRestored = await compareAndRestoreStoredStewardToken(
-          token,
-          previousToken,
-        );
+        tokenRestored = transaction?.restorePredecessor
+          ? await transaction.restorePredecessor()
+          : await compareAndRestoreStoredStewardToken(token, previousToken);
+        if (tokenRestored) advanceStewardTokenMutationAuthority();
         if (!tokenRestored) {
           rollbackFailures.push(
             new Error("Protected Steward token rollback lost authority."),
@@ -472,10 +532,7 @@ async function persistStoredStewardToken(
           if (previousScope === null) {
             window.localStorage.removeItem(STEWARD_TOKEN_SCOPE_KEY);
           } else {
-            window.localStorage.setItem(
-              STEWARD_TOKEN_SCOPE_KEY,
-              previousScope,
-            );
+            window.localStorage.setItem(STEWARD_TOKEN_SCOPE_KEY, previousScope);
           }
         } catch (scopeRollbackError) {
           rollbackFailures.push(scopeRollbackError);
@@ -499,13 +556,16 @@ async function persistStoredStewardToken(
 async function compareAndRestoreStoredStewardToken(
   expectedToken: string,
   restoreToken: string | null,
+  options?: Pick<StewardTokenRemovalOptions, "validate">,
 ): Promise<boolean> {
   if (stewardTokenCompareAndRestore) {
-    return stewardTokenCompareAndRestore(expectedToken, restoreToken);
+    return stewardTokenCompareAndRestore(expectedToken, restoreToken, options);
   }
+  if (options?.validate?.() === false) return false;
   if (window.localStorage.getItem(STEWARD_TOKEN_KEY) !== expectedToken) {
     return false;
   }
+  if (options?.validate?.() === false) return false;
   if (restoreToken === null) {
     window.localStorage.removeItem(STEWARD_TOKEN_KEY);
   } else {
@@ -514,8 +574,294 @@ async function compareAndRestoreStoredStewardToken(
   return true;
 }
 
+/** Exact, opaque rollback authority for one successfully published write. */
+export interface StewardTokenWriteAuthority {
+  /**
+   * Restore only this write's host-recorded predecessor. A stale receipt or
+   * revision returns false, so same-value ABA from a newer account wins.
+   */
+  restorePredecessor(options?: {
+    validate?: StewardTokenWriteValidator;
+    /** Delay the restored-state event until the caller invokes `publish()`. */
+    deferPublication?: boolean;
+  }): Promise<boolean>;
+  /**
+   * Publish a restored predecessor whose event was explicitly deferred.
+   * Optional for structural compatibility with authorities returned by older
+   * platform adapters; this module's authorities always provide it.
+   */
+  publish?(): boolean;
+}
+
+/**
+ * Revert the subordinate live/client state installed by a protected write.
+ * `durableRestored` is true only when the exact durable predecessor and scope
+ * are already canonical. A false value must clear the staged successor
+ * fail-closed instead of installing a predecessor beside a still-current token.
+ */
+export type StewardTokenPublicationRollback = (
+  durableRestored: boolean,
+) => void;
+
 export interface StewardTokenWriteOptions {
   signal?: AbortSignal;
+  /**
+   * Revalidates the caller's external authority after every awaited durable
+   * boundary and immediately before publishing `present`. Returning false
+   * compensates this exact write back to its predecessor without an event.
+   */
+  validate?: StewardTokenWriteValidator;
+  /**
+   * Synchronously install subordinate live/boot state after the durable token
+   * commits but before any authority event or promise resolution. Returning a
+   * rollback lets shared compensation restore that state without publishing an
+   * intermediate mixed account. A throwing callback must undo any partial work
+   * before it throws because no rollback value was returned.
+   */
+  finalizeBeforePublish?: () => StewardTokenPublicationRollback | undefined;
+  /**
+   * Synchronously retire the caller's durable recovery receipt after final
+   * validation and subordinate-state installation. False suppresses the event
+   * and compensates both token and finalizer state.
+   */
+  commitBeforePublish?: () => boolean;
+}
+
+function oneShotPublicationRollback(
+  rollback: StewardTokenPublicationRollback | undefined,
+): StewardTokenPublicationRollback | null {
+  if (!rollback) return null;
+  let completed = false;
+  return (durableRestored) => {
+    if (completed) return;
+    completed = true;
+    rollback(durableRestored);
+  };
+}
+
+function synchronousPublicationRollback(
+  value: unknown,
+): StewardTokenPublicationRollback | null {
+  if (
+    value !== null &&
+    typeof value === "object" &&
+    "then" in value &&
+    typeof (value as { then?: unknown }).then === "function"
+  ) {
+    throw new TypeError("Steward token finalization must be synchronous.");
+  }
+  if (value !== undefined && typeof value !== "function") {
+    throw new TypeError(
+      "Steward token finalization must return a synchronous rollback function.",
+    );
+  }
+  return oneShotPublicationRollback(
+    value as StewardTokenPublicationRollback | undefined,
+  );
+}
+
+async function compensateUnpublishedStewardTokenWrite(
+  token: string,
+  previousToken: string | null,
+  requiredScope: string | null,
+  previousScope: string | null,
+  restorePredecessor?:
+    | ((validate?: StewardTokenWriteValidator) => Promise<boolean>)
+    | null,
+  rollbackPublication?: StewardTokenPublicationRollback | null,
+): Promise<void> {
+  const failures: unknown[] = [];
+  let canonicalPredecessorRestored = false;
+  try {
+    const restored = restorePredecessor
+      ? await restorePredecessor()
+      : await compareAndRestoreStoredStewardToken(token, previousToken);
+    const currentToken = window.localStorage.getItem(STEWARD_TOKEN_KEY);
+    if (!restored && currentToken === token) {
+      throw new Error("Protected Steward token rollback lost authority.");
+    }
+    if (
+      restored &&
+      currentToken === previousToken &&
+      requiredScope &&
+      window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY) === requiredScope
+    ) {
+      if (previousScope === null) {
+        window.localStorage.removeItem(STEWARD_TOKEN_SCOPE_KEY);
+      } else {
+        window.localStorage.setItem(STEWARD_TOKEN_SCOPE_KEY, previousScope);
+      }
+    }
+    canonicalPredecessorRestored =
+      restored &&
+      window.localStorage.getItem(STEWARD_TOKEN_KEY) === previousToken &&
+      (!requiredScope ||
+        window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY) === previousScope);
+    if (canonicalPredecessorRestored) {
+      advanceStewardTokenMutationAuthority();
+    }
+  } catch (error) {
+    failures.push(error);
+  }
+  // Restore canonical durable state before reverting the staged live/client
+  // pair. A listener can therefore never observe a predecessor client while
+  // the unpublished successor is still canonical. The rollback remains
+  // best-effort even when durable compensation fails so callers fail closed
+  // instead of leaving the staged client authoritative in memory.
+  try {
+    rollbackPublication?.(canonicalPredecessorRestored);
+  } catch (error) {
+    failures.push(error);
+  }
+  if (failures.length === 1) {
+    throw new StewardTokenPersistenceError(failures[0]);
+  }
+  if (failures.length > 1) {
+    throw new StewardTokenPersistenceError(
+      new AggregateError(
+        failures,
+        "Could not compensate the unpublished Steward token transaction.",
+      ),
+    );
+  }
+}
+
+function publishedWriteAuthority(
+  token: string,
+  previousToken: string | null,
+  requiredScope: string | null,
+  previousScope: string | null,
+  restorePredecessor:
+    | ((validate?: StewardTokenWriteValidator) => Promise<boolean>)
+    | null,
+  writeAuthority: symbol,
+  rollbackPublication: StewardTokenPublicationRollback | null,
+): StewardTokenWriteAuthority {
+  let restoration: Promise<boolean> | null = null;
+  let pendingRestoredState: StewardSessionChangeDetail["state"] | null = null;
+  let coherentRestorationCompleted = false;
+  let restoredStatePublished = false;
+  const exactRestore =
+    restorePredecessor ??
+    ((validate?: StewardTokenWriteValidator) => {
+      if (stewardTokenMutationAuthority !== writeAuthority) {
+        return Promise.resolve(false);
+      }
+      return compareAndRestoreStoredStewardToken(token, previousToken, {
+        validate,
+      });
+    });
+  return {
+    restorePredecessor(options) {
+      if (restoration) return restoration;
+      const operation = serializeStewardTokenMutation(async () => {
+        if (
+          options?.validate?.() === false ||
+          stewardTokenMutationAuthority !== writeAuthority
+        ) {
+          return false;
+        }
+        const failures: unknown[] = [];
+        let restored = false;
+        try {
+          restored = await exactRestore(options?.validate);
+        } catch (error) {
+          failures.push(error);
+        }
+        if (restored) {
+          advanceStewardTokenMutationAuthority();
+        }
+        if (
+          restored &&
+          window.localStorage.getItem(STEWARD_TOKEN_KEY) === previousToken &&
+          requiredScope &&
+          window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY) === requiredScope
+        ) {
+          try {
+            if (previousScope === null) {
+              window.localStorage.removeItem(STEWARD_TOKEN_SCOPE_KEY);
+            } else {
+              window.localStorage.setItem(
+                STEWARD_TOKEN_SCOPE_KEY,
+                previousScope,
+              );
+            }
+          } catch (error) {
+            failures.push(error);
+          }
+        }
+        let coherentPredecessor =
+          restored &&
+          failures.length === 0 &&
+          window.localStorage.getItem(STEWARD_TOKEN_KEY) === previousToken &&
+          (!requiredScope ||
+            window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY) ===
+              previousScope);
+        try {
+          rollbackPublication?.(coherentPredecessor);
+        } catch (error) {
+          failures.push(error);
+          coherentPredecessor = false;
+        }
+        coherentPredecessor =
+          coherentPredecessor &&
+          window.localStorage.getItem(STEWARD_TOKEN_KEY) === previousToken &&
+          (!requiredScope ||
+            window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY) ===
+              previousScope);
+        if (failures.length > 0) {
+          throw new StewardTokenPersistenceError(
+            new AggregateError(
+              failures,
+              "Could not publish the restored Steward token predecessor.",
+            ),
+          );
+        }
+        if (!coherentPredecessor) return false;
+        coherentRestorationCompleted = true;
+        if (previousToken !== token && options?.validate?.() !== false) {
+          const restoredState = previousToken === null ? "cleared" : "present";
+          if (options?.deferPublication) {
+            pendingRestoredState = restoredState;
+          } else {
+            dispatchStewardSessionChange(restoredState);
+            restoredStatePublished = true;
+          }
+        }
+        return true;
+      });
+      restoration = operation;
+      void operation.catch(() => {
+        if (restoration === operation) restoration = null;
+      });
+      return operation;
+    },
+    publish() {
+      if (!pendingRestoredState) {
+        return (
+          restoredStatePublished ||
+          (coherentRestorationCompleted &&
+            previousToken === token &&
+            window.localStorage.getItem(STEWARD_TOKEN_KEY) === previousToken &&
+            (!requiredScope ||
+              window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY) ===
+                previousScope))
+        );
+      }
+      if (
+        window.localStorage.getItem(STEWARD_TOKEN_KEY) !== previousToken ||
+        (requiredScope &&
+          window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY) !== previousScope)
+      ) {
+        return false;
+      }
+      const state = pendingRestoredState;
+      pendingRestoredState = null;
+      dispatchStewardSessionChange(state);
+      restoredStatePublished = true;
+      return true;
+    },
+  };
 }
 
 /**
@@ -526,51 +872,160 @@ export interface StewardTokenWriteOptions {
 export async function writeStoredStewardToken(
   token: string,
   options?: StewardTokenWriteOptions,
-): Promise<void> {
-  if (typeof window === "undefined") return;
-  await serializeStewardTokenMutation(async () => {
+): Promise<StewardTokenWriteAuthority | null> {
+  if (typeof window === "undefined") return null;
+  return serializeStewardTokenMutation(async () => {
     options?.signal?.throwIfAborted();
+    if (options?.validate?.() === false) return null;
     const requiredScope = configuredLoopbackStewardScope();
     const previousToken = window.localStorage.getItem(STEWARD_TOKEN_KEY);
     const previousScope = window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY);
     const wasCurrent =
       previousToken === token &&
       (!requiredScope || previousScope === requiredScope);
-    if (!stewardTokenPersistence && wasCurrent) return;
-    const commit = await persistStoredStewardToken(
+    if (
+      !stewardTokenPersistence &&
+      wasCurrent &&
+      !options?.finalizeBeforePublish &&
+      !options?.commitBeforePublish
+    ) {
+      return null;
+    }
+    const transaction = await persistStoredStewardToken(
       token,
       requiredScope,
       previousToken,
       previousScope,
     );
-    if (options?.signal?.aborted) {
-      try {
-        const restored = await compareAndRestoreStoredStewardToken(
-          token,
-          previousToken,
-        );
-        if (
-          restored &&
-          requiredScope &&
-          window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY) === requiredScope
-        ) {
-          if (previousScope === null) {
-            window.localStorage.removeItem(STEWARD_TOKEN_SCOPE_KEY);
-          } else {
-            window.localStorage.setItem(STEWARD_TOKEN_SCOPE_KEY, previousScope);
-          }
-        }
-      } catch (error) {
-        throw new StewardTokenPersistenceError(error);
-      }
-      options.signal.throwIfAborted();
+    const abortedAfterPersistence = options?.signal?.aborted === true;
+    const validAfterPersistence = options?.validate?.() !== false;
+    if (abortedAfterPersistence || !validAfterPersistence) {
+      await compensateUnpublishedStewardTokenWrite(
+        token,
+        previousToken,
+        requiredScope,
+        previousScope,
+        transaction?.restorePredecessor,
+      );
+      if (!validAfterPersistence) return null;
+      options?.signal?.throwIfAborted();
     }
     try {
-      await commit?.();
+      // The host receipt remains rollbackable until this validation has run
+      // immediately before its acknowledgement. The caller still revalidates
+      // below because another tab can synchronously plant a durable intent
+      // while the host RPC itself is awaiting its response.
+      await transaction?.commit(options?.validate);
     } catch (error) {
       throw new StewardTokenPersistenceError(error);
     }
+    // Receipt acknowledgement can itself await a renderer/host RPC. A newer
+    // login may plant its recovery marker during that wait, after the earlier
+    // pre-commit validation. Compensate the exact token before any observable
+    // authority event in that case too.
+    const abortedAfterCommit = options?.signal?.aborted === true;
+    const validAfterCommit = options?.validate?.() !== false;
+    if (abortedAfterCommit || !validAfterCommit) {
+      await compensateUnpublishedStewardTokenWrite(
+        token,
+        previousToken,
+        requiredScope,
+        previousScope,
+        transaction?.restorePredecessor,
+      );
+      if (!validAfterCommit) return null;
+      options?.signal?.throwIfAborted();
+    }
+    const writeAuthority = advanceStewardTokenMutationAuthority();
+    let rollbackPublication: StewardTokenPublicationRollback | null = null;
+    try {
+      rollbackPublication = synchronousPublicationRollback(
+        options?.finalizeBeforePublish?.(),
+      );
+    } catch (error) {
+      try {
+        await compensateUnpublishedStewardTokenWrite(
+          token,
+          previousToken,
+          requiredScope,
+          previousScope,
+          transaction?.restorePredecessor,
+        );
+      } catch (compensationError) {
+        throw new StewardTokenPersistenceError(
+          new AggregateError(
+            [error, compensationError],
+            "Steward token finalization and compensation both failed.",
+          ),
+        );
+      }
+      throw error;
+    }
+    const abortedAfterFinalization = options?.signal?.aborted === true;
+    const validAfterFinalization =
+      options?.validate?.() !== false &&
+      exactStoredStewardTokenIsCurrent(token, requiredScope);
+    if (abortedAfterFinalization || !validAfterFinalization) {
+      await compensateUnpublishedStewardTokenWrite(
+        token,
+        previousToken,
+        requiredScope,
+        previousScope,
+        transaction?.restorePredecessor,
+        rollbackPublication,
+      );
+      if (!validAfterFinalization) return null;
+      options?.signal?.throwIfAborted();
+    }
+    if (options?.commitBeforePublish) {
+      let committed = false;
+      try {
+        committed = options.commitBeforePublish();
+      } catch (error) {
+        try {
+          await compensateUnpublishedStewardTokenWrite(
+            token,
+            previousToken,
+            requiredScope,
+            previousScope,
+            transaction?.restorePredecessor,
+            rollbackPublication,
+          );
+        } catch (compensationError) {
+          throw new StewardTokenPersistenceError(
+            new AggregateError(
+              [error, compensationError],
+              "Steward receipt commit and token compensation both failed.",
+            ),
+          );
+        }
+        throw error;
+      }
+      if (
+        !committed ||
+        !exactStoredStewardTokenIsCurrent(token, requiredScope)
+      ) {
+        await compensateUnpublishedStewardTokenWrite(
+          token,
+          previousToken,
+          requiredScope,
+          previousScope,
+          transaction?.restorePredecessor,
+          rollbackPublication,
+        );
+        return null;
+      }
+    }
     if (!wasCurrent) dispatchStewardSessionChange("present");
+    return publishedWriteAuthority(
+      token,
+      previousToken,
+      requiredScope,
+      previousScope,
+      transaction?.restorePredecessor ?? null,
+      writeAuthority,
+      rollbackPublication,
+    );
   });
 }
 
@@ -582,24 +1037,48 @@ export async function writeStoredStewardToken(
 export async function replaceStoredStewardTokenIfCurrent(
   expectedToken: string,
   token: string,
+  options?: Pick<StewardTokenWriteOptions, "validate">,
 ): Promise<boolean> {
   if (typeof window === "undefined") return false;
   return serializeStewardTokenMutation(async () => {
+    if (options?.validate?.() === false) return false;
     const current = readStoredStewardToken();
     if (current !== expectedToken) return false;
     const previousToken = window.localStorage.getItem(STEWARD_TOKEN_KEY);
     const previousScope = window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY);
-    const commit = await persistStoredStewardToken(
+    const requiredScope = configuredLoopbackStewardScope();
+    const transaction = await persistStoredStewardToken(
       token,
-      configuredLoopbackStewardScope(),
+      requiredScope,
       previousToken,
       previousScope,
     );
+    if (options?.validate?.() === false) {
+      await compensateUnpublishedStewardTokenWrite(
+        token,
+        previousToken,
+        requiredScope,
+        previousScope,
+        transaction?.restorePredecessor,
+      );
+      return false;
+    }
     try {
-      await commit?.();
+      await transaction?.commit(options?.validate);
     } catch (error) {
       throw new StewardTokenPersistenceError(error);
     }
+    if (options?.validate?.() === false) {
+      await compensateUnpublishedStewardTokenWrite(
+        token,
+        previousToken,
+        requiredScope,
+        previousScope,
+        transaction?.restorePredecessor,
+      );
+      return false;
+    }
+    advanceStewardTokenMutationAuthority();
     if (current !== token) dispatchStewardSessionChange("present");
     return true;
   });
@@ -610,13 +1089,31 @@ export async function replaceStoredStewardTokenIfCurrent(
  * Once the canonical removal succeeds, invalidation is published even if the
  * legacy cleanup fails; either storage failure remains observable to callers.
  */
-export async function clearStoredStewardToken(): Promise<void> {
-  if (typeof window === "undefined") return;
-  await serializeStewardTokenMutation(async () => {
+export async function clearStoredStewardToken(
+  options?: StewardTokenRemovalOptions,
+): Promise<boolean> {
+  if (typeof window === "undefined") return false;
+  return serializeStewardTokenMutation(async () => {
+    if (options?.validate?.() === false) return false;
+    if (
+      options &&
+      window.localStorage.getItem(STEWARD_TOKEN_KEY) !== options.expectedToken
+    ) {
+      return false;
+    }
     try {
       if (stewardTokenRemoval) {
-        await stewardTokenRemoval();
+        const removed = await stewardTokenRemoval(options);
+        if (removed === false) return false;
       } else {
+        if (options?.validate?.() === false) return false;
+        if (
+          options &&
+          window.localStorage.getItem(STEWARD_TOKEN_KEY) !==
+            options.expectedToken
+        ) {
+          return false;
+        }
         window.localStorage.removeItem(STEWARD_TOKEN_KEY);
       }
     } catch (error) {
@@ -624,9 +1121,16 @@ export async function clearStoredStewardToken(): Promise<void> {
       // obsolete refresh-key cleanup so they never publish a false logout.
       throw new StewardTokenRemovalError(error);
     }
-    dispatchStewardSessionChange("cleared");
+    // Once exact terminal removal is acquired, A stays deleted even if B plants
+    // a marker while the host CAS awaits. The true result means teardown may
+    // continue under its mutation lease; only the observable transition is
+    // suppressed. Unlike canceled writes, terminal removals never restore A.
+    const publishAllowed = options?.validate?.() !== false;
+    advanceStewardTokenMutationAuthority();
+    if (publishAllowed) dispatchStewardSessionChange("cleared");
     window.localStorage.removeItem(STEWARD_TOKEN_SCOPE_KEY);
     window.localStorage.removeItem(STEWARD_REFRESH_TOKEN_KEY);
+    return true;
   });
 }
 

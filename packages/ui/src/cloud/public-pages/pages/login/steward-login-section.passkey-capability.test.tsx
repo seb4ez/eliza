@@ -16,6 +16,13 @@ import {
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  beginStewardSessionLogout,
+  beginStewardSessionRecovery,
+  completeStewardSessionLogout,
+  readStewardSessionLogoutIntents,
+  rejectStewardSessionRecovery,
+} from "../../../lib/steward-session-recovery-marker";
 
 const capabilityRef = vi.hoisted(() => ({
   usable: false,
@@ -55,6 +62,7 @@ const emailLoginSpies = vi.hoisted(() => ({
 const sessionSpies = vi.hoisted(() => ({
   recover: vi.fn(),
   hasCookie: false,
+  sync: vi.fn(),
 }));
 
 vi.mock("@elizaos/shared/steward-session-client", async (importOriginal) => {
@@ -127,7 +135,7 @@ vi.mock("../../lib/steward-session", () => ({
   exchangeStewardCodeViaApi: vi.fn(),
   recoverStewardSessionViaCookie: sessionSpies.recover,
   refreshStewardSessionViaCookie: vi.fn(),
-  syncStewardSessionCookie: vi.fn(() => Promise.resolve()),
+  syncStewardSessionCookie: sessionSpies.sync,
 }));
 
 vi.mock("../../lib/login-return-to", () => ({
@@ -136,6 +144,7 @@ vi.mock("../../lib/login-return-to", () => ({
   storePendingOAuthReturnTo: () => undefined,
 }));
 
+import { STEWARD_TOKEN_KEY } from "@elizaos/shared/steward-session-client";
 import { StewardApiError } from "@stwd/sdk";
 import StewardLoginSection from "./steward-login-section";
 
@@ -196,10 +205,16 @@ describe("StewardLoginSection passkey capability gating", () => {
     });
     sessionSpies.recover.mockResolvedValue(null);
     sessionSpies.hasCookie = false;
+    sessionSpies.sync.mockResolvedValue(undefined);
   });
 
   afterEach(() => {
     cleanup();
+    for (const intent of readStewardSessionLogoutIntents("elizacloud")
+      .intents) {
+      completeStewardSessionLogout(intent);
+    }
+    window.localStorage.clear();
     vi.clearAllMocks();
   });
 
@@ -211,6 +226,67 @@ describe("StewardLoginSection passkey capability gating", () => {
     await waitFor(() => expect(sessionSpies.recover).toHaveBeenCalledTimes(1));
     expect(screen.getByRole("button", { name: /Google/i })).toBeTruthy();
     expect(screen.queryByText("Refresh token rejected")).toBeNull();
+  });
+
+  it("hydrates a returning cookie-only session before showing fresh login", async () => {
+    sessionSpies.hasCookie = true;
+    sessionSpies.recover.mockResolvedValue({
+      ok: true,
+      token: "returning-cookie-token",
+    });
+
+    renderSection();
+
+    await waitFor(() =>
+      expect(window.localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(
+        "returning-cookie-token",
+      ),
+    );
+    expect(sessionSpies.recover).toHaveBeenCalledTimes(1);
+  });
+
+  it("never hydrates a cookie-only session while durable logout is pending", async () => {
+    sessionSpies.hasCookie = true;
+    beginStewardSessionLogout("elizacloud", "logout", "cloud.eliza.app");
+
+    renderSection();
+
+    expect(
+      await screen.findByText(/Session recovery storage cannot be read/i),
+    ).toBeTruthy();
+    expect(sessionSpies.recover).not.toHaveBeenCalled();
+    expect(window.localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+  });
+
+  it("does not finish stored-token recovery when login B starts during its cookie POST", async () => {
+    window.localStorage.setItem(STEWARD_TOKEN_KEY, "stored-account-a");
+    let releaseSync: () => void = () => {};
+    const syncWait = new Promise<void>((resolve) => {
+      releaseSync = resolve;
+    });
+    sessionSpies.sync.mockImplementation(async () => syncWait);
+
+    renderSection();
+    await waitFor(() => expect(sessionSpies.sync).toHaveBeenCalledOnce());
+    const recoveryB = beginStewardSessionRecovery("elizacloud", "provider");
+    const options = sessionSpies.sync.mock.calls[0]?.[2] as
+      | { validate?: () => boolean }
+      | undefined;
+    expect(options?.validate?.()).toBe(false);
+    releaseSync();
+
+    try {
+      expect(
+        await screen.findByText(
+          /Another session change is still being finalized/i,
+        ),
+      ).toBeTruthy();
+      expect(window.localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(
+        "stored-account-a",
+      );
+    } finally {
+      rejectStewardSessionRecovery(recoveryB);
+    }
   });
 
   it("hides passkey, omits webauthn autocomplete, and routes Enter to Magic Link when unsupported", async () => {

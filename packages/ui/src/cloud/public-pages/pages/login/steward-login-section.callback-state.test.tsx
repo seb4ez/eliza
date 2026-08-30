@@ -17,6 +17,10 @@ import { StewardSessionError } from "@elizaos/shared/steward-session-client";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  beginStewardSessionRecovery,
+  readStewardSessionRecovery,
+} from "../../../lib/steward-session-recovery-marker";
 
 const callbackState = vi.hoisted(() => ({
   hasCallback: true,
@@ -28,7 +32,8 @@ const callbackState = vi.hoisted(() => ({
   pendingReturnTo: null as string | null,
   exchangeCalls: 0,
   exchangeSignals: [] as AbortSignal[],
-  exchange: (): Promise<{ token?: string }> => new Promise(() => {}),
+  exchange: (_signal?: AbortSignal): Promise<{ token?: string }> =>
+    new Promise(() => {}),
   recover: vi.fn(),
   resolveReturnTo: vi.fn(),
   sync: vi.fn(),
@@ -50,7 +55,7 @@ vi.mock("../../lib/steward-session", () => ({
   ) => {
     callbackState.exchangeCalls += 1;
     if (options?.signal) callbackState.exchangeSignals.push(options.signal);
-    return callbackState.exchange();
+    return callbackState.exchange(options?.signal);
   },
   recoverStewardSessionViaCookie: callbackState.recover,
   refreshStewardSessionViaCookie: () => Promise.resolve({ ok: true as const }),
@@ -125,6 +130,26 @@ vi.mock("../../lib/login-return-to", () => ({
 
 import StewardLoginSection from "./steward-login-section";
 
+function createMemoryStorage(): Storage {
+  const values = new Map<string, string>();
+  return {
+    get length() {
+      return values.size;
+    },
+    clear: () => values.clear(),
+    getItem: (key) => values.get(key) ?? null,
+    key: (index) => [...values.keys()][index] ?? null,
+    removeItem: (key) => {
+      values.delete(key);
+    },
+    setItem: (key, value) => {
+      values.set(key, String(value));
+    },
+  };
+}
+
+let storage: Storage;
+
 function renderSection(initialUrl = "/login?code=callback-code&state=state-1") {
   return render(
     <MemoryRouter initialEntries={[initialUrl]}>
@@ -133,8 +158,24 @@ function renderSection(initialUrl = "/login?code=callback-code&state=state-1") {
   );
 }
 
+function pendingExchange(signal?: AbortSignal): Promise<{ token?: string }> {
+  return new Promise((_resolve, reject) => {
+    signal?.addEventListener(
+      "abort",
+      () => reject(new DOMException("Aborted", "AbortError")),
+      { once: true },
+    );
+  });
+}
+
 describe("StewardLoginSection — OAuth callback completion state (#13519)", () => {
   beforeEach(() => {
+    storage = createMemoryStorage();
+    vi.stubGlobal("localStorage", storage);
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      value: storage,
+    });
     callbackState.hasCallback = true;
     callbackState.returnedState = "state-1";
     callbackState.expectedState = "state-1";
@@ -144,15 +185,21 @@ describe("StewardLoginSection — OAuth callback completion state (#13519)", () 
     callbackState.pendingReturnTo = null;
     callbackState.exchangeCalls = 0;
     callbackState.exchangeSignals = [];
-    callbackState.exchange = () => new Promise(() => {});
+    callbackState.exchange = pendingExchange;
     callbackState.recover.mockReset().mockResolvedValue(null);
     callbackState.resolveReturnTo.mockReset().mockReturnValue("/cloud");
     callbackState.sync.mockReset().mockResolvedValue(undefined);
+    window.localStorage.clear();
+    window.sessionStorage.clear();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     cleanup();
-    window.localStorage.clear();
+    await Promise.resolve();
+    await Promise.resolve();
+    storage.clear();
+    window.sessionStorage.clear();
+    vi.unstubAllGlobals();
     vi.clearAllMocks();
   });
 
@@ -193,7 +240,15 @@ describe("StewardLoginSection — OAuth callback completion state (#13519)", () 
     act(() => window.dispatchEvent(historyRestore));
 
     await waitFor(() => expect(callbackState.recover).toHaveBeenCalledOnce());
+    expect(callbackState.recover).toHaveBeenCalledWith(
+      expect.objectContaining({ rejectedSession: "preserve" }),
+    );
     expect(callbackState.sync).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(window.localStorage.getItem("steward_session_token")).toBe(
+        "restored-callback-token",
+      ),
+    );
     expect(callbackState.exchangeSignals[0]?.aborted).toBe(true);
     await waitFor(() =>
       expect(callbackState.resolveReturnTo).toHaveBeenCalledWith(
@@ -205,6 +260,187 @@ describe("StewardLoginSection — OAuth callback completion state (#13519)", () 
     expect(staleRouterSearch?.get("code")).toBe("callback-code");
   });
 
+  it("keeps cookie authority across an ordinary unmount and remount", async () => {
+    callbackState.pendingReturnTo = "/chat";
+    callbackState.resolveReturnTo.mockReturnValue("/chat");
+    callbackState.recover.mockResolvedValue({
+      ok: true,
+      token: "new-server-account-token",
+    });
+    window.localStorage.setItem(
+      "steward_session_token",
+      "previous-account-token",
+    );
+
+    const firstMount = renderSection(
+      "/login?code=callback-code&state=state-1&returnTo=%2Fchat",
+    );
+    await waitFor(() => expect(callbackState.exchangeCalls).toBe(1));
+    expect(readStewardSessionRecovery("elizacloud")).toMatchObject({
+      hasOAuth: true,
+      receipts: [expect.any(String)],
+    });
+
+    firstMount.unmount();
+    // A real tab close drops sessionStorage. The v2 receipt is intentionally
+    // localStorage-backed, so the next document still reconciles cookie-first.
+    window.sessionStorage.clear();
+    callbackState.hasCallback = false;
+    callbackState.codeAvailable = false;
+    callbackState.hasAuthedCookie = true;
+    renderSection("/login?returnTo=%2Fchat");
+
+    await waitFor(() => expect(callbackState.recover).toHaveBeenCalledOnce());
+    expect(callbackState.recover).toHaveBeenCalledWith(
+      expect.objectContaining({ rejectedSession: "preserve" }),
+    );
+    expect(callbackState.sync).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(window.localStorage.getItem("steward_session_token")).toBe(
+        "new-server-account-token",
+      ),
+    );
+    await waitFor(() =>
+      expect(readStewardSessionRecovery("elizacloud").receipts).toHaveLength(0),
+    );
+    await waitFor(() =>
+      expect(callbackState.resolveReturnTo).toHaveBeenCalledWith(
+        expect.objectContaining({ get: expect.any(Function) }),
+        "/chat",
+      ),
+    );
+  });
+
+  it("does not treat a bearer-only steward-authed cookie as mutation ambiguity", async () => {
+    callbackState.hasCallback = false;
+    callbackState.codeAvailable = false;
+    callbackState.hasAuthedCookie = true;
+    callbackState.recover.mockResolvedValue({
+      ok: true,
+      token: "new-server-account-token",
+    });
+    window.localStorage.setItem(
+      "steward_session_token",
+      "previous-account-token",
+    );
+
+    renderSection("/login");
+
+    await waitFor(() =>
+      expect(callbackState.sync).toHaveBeenCalledWith(
+        "previous-account-token",
+        null,
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      ),
+    );
+    expect(callbackState.recover).not.toHaveBeenCalled();
+  });
+
+  it("keeps an ambiguity receipt and never replays the old account on a 200 response without a token", async () => {
+    callbackState.hasCallback = false;
+    callbackState.codeAvailable = false;
+    callbackState.recover.mockResolvedValue({ ok: true });
+    window.localStorage.setItem(
+      "steward_session_token",
+      "previous-account-token",
+    );
+    const receipt = beginStewardSessionRecovery("elizacloud", "provider");
+
+    renderSection("/login");
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(
+          "The server session was restored, but its browser token could not be hydrated. Retry session recovery.",
+        ),
+      ).toBeTruthy(),
+    );
+    expect(callbackState.sync).not.toHaveBeenCalled();
+    expect(readStewardSessionRecovery("elizacloud").receipts).toContain(
+      receipt.receipt,
+    );
+    expect(
+      screen.getByRole("button", { name: "Retry session recovery" }),
+    ).toBeTruthy();
+  });
+
+  it("keeps an ambiguity receipt and never replays account A after two rejected cookie reads", async () => {
+    callbackState.hasCallback = false;
+    callbackState.codeAvailable = false;
+    callbackState.recover.mockResolvedValue(null);
+    window.localStorage.setItem(
+      "steward_session_token",
+      "previous-account-token-A",
+    );
+    const receipt = beginStewardSessionRecovery("elizacloud", "provider");
+
+    renderSection("/login");
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(
+          "The previous sign-in may have completed, but its browser session could not be recovered. Retry session recovery.",
+        ),
+      ).toBeTruthy(),
+    );
+    expect(callbackState.sync).not.toHaveBeenCalled();
+    expect(readStewardSessionRecovery("elizacloud").receipts).toContain(
+      receipt.receipt,
+    );
+  });
+
+  it("does not dispatch an OAuth exchange when the durable receipt write fails", async () => {
+    const workingSetItem = storage.setItem.bind(storage);
+    storage.setItem = (key, value) => {
+      if (key.startsWith("eliza.steward.server-session-recovery.v2:")) {
+        throw new DOMException("Storage denied", "SecurityError");
+      }
+      workingSetItem(key, value);
+    };
+
+    renderSection();
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(
+          "Sign-in cannot start because durable recovery storage is unavailable. Enable site storage and try again.",
+        ),
+      ).toBeTruthy(),
+    );
+    expect(callbackState.exchangeCalls).toBe(0);
+  });
+
+  it("blocks local replay when durable marker enumeration is unavailable", async () => {
+    callbackState.hasCallback = false;
+    callbackState.codeAvailable = false;
+    window.localStorage.setItem(
+      "steward_session_token",
+      "previous-account-token-A",
+    );
+    const receipt = beginStewardSessionRecovery("elizacloud", "provider");
+    const workingKey = storage.key.bind(storage);
+    storage.key = () => {
+      throw new DOMException("Storage denied", "SecurityError");
+    };
+
+    renderSection("/login");
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(
+          "Session recovery storage cannot be read. Enable site storage and retry before continuing.",
+        ),
+      ).toBeTruthy(),
+    );
+    expect(callbackState.recover).not.toHaveBeenCalled();
+    expect(callbackState.sync).not.toHaveBeenCalled();
+
+    storage.key = workingKey;
+    expect(readStewardSessionRecovery("elizacloud").receipts).toContain(
+      receipt.receipt,
+    );
+  });
+
   it("keeps callback account authority across repeated BFCache restores", async () => {
     callbackState.hasAuthedCookie = true;
     callbackState.pendingReturnTo = "/chat";
@@ -214,9 +450,12 @@ describe("StewardLoginSection — OAuth callback completion state (#13519)", () 
     ) => void = () => {};
     callbackState.recover
       .mockImplementationOnce(
-        () =>
+        (options?: { signal?: AbortSignal }) =>
           new Promise((resolve) => {
             resolveFirstRecovery = resolve;
+            options?.signal?.addEventListener("abort", () => resolve(null), {
+              once: true,
+            });
           }),
       )
       .mockResolvedValueOnce({
@@ -281,6 +520,10 @@ describe("StewardLoginSection — OAuth callback completion state (#13519)", () 
     // Completing spinner is gone; the sign-in options are reachable again.
     expect(screen.queryByText("Completing sign-in…")).toBeNull();
     expect(screen.getByPlaceholderText("you@example.com")).toBeTruthy();
+    expect(readStewardSessionRecovery("elizacloud")).toMatchObject({
+      hasOAuth: true,
+      receipts: [expect.any(String)],
+    });
   });
 
   it("shows a friendly 'expired / try again' message (not the raw 401) when a stale or cross-tenant one-time code is rejected", async () => {
@@ -304,6 +547,7 @@ describe("StewardLoginSection — OAuth callback completion state (#13519)", () 
     expect(screen.queryByText(/Unauthorized/)).toBeNull();
     expect(screen.queryByText("Completing sign-in…")).toBeNull();
     expect(screen.getByPlaceholderText("you@example.com")).toBeTruthy();
+    expect(readStewardSessionRecovery("elizacloud").receipts).toHaveLength(0);
   });
 
   it("refuses the exchange when the callback state does not match the stashed state", async () => {

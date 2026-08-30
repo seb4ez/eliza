@@ -27,6 +27,12 @@ import {
   invalidateStewardServerCookieSyncMarker,
   markStewardServerCookieSynced,
 } from "../lib/steward-session-cookie-sync-marker";
+import {
+  beginStewardSessionRecovery,
+  isStewardSessionRecoverySnapshotLive,
+  readStewardSessionRecovery,
+  rejectStewardSessionRecovery,
+} from "../lib/steward-session-recovery-marker";
 
 import {
   clearServerStewardSessionCookies,
@@ -272,15 +278,132 @@ describe("clearStaleStewardSession", () => {
       ),
     ).toBe(false);
   });
+
+  it("stops every bearer scrub when exact token removal loses to account B", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, "token-a");
+    savePersistedActiveServer({
+      id: "cloud:account-b-agent",
+      kind: "cloud",
+      label: "Account B",
+      apiBase: "https://account-b-agent.example.test",
+      accessToken: "account-b-active-bearer",
+    });
+    saveAgentProfileRegistry({
+      version: 1,
+      activeProfileId: "account-b-profile",
+      profiles: [
+        {
+          id: "account-b-profile",
+          label: "Account B profile",
+          kind: "remote",
+          apiBase: "https://account-b-profile.example.test",
+          accessToken: "account-b-profile-bearer",
+          createdAt: "2026-08-30T00:00:00.000Z",
+        },
+      ],
+    });
+    const snapshot = readStewardSessionRecovery("elizacloud");
+    let accountBReceipt: ReturnType<typeof beginStewardSessionRecovery> | null =
+      null;
+    const unregister = registerStewardTokenRemoval(async () => {
+      accountBReceipt = beginStewardSessionRecovery("elizacloud", "provider");
+      localStorage.setItem(STEWARD_TOKEN_KEY, "token-b");
+      return false;
+    });
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    fetchSpy.mockClear();
+
+    try {
+      await expect(
+        clearStaleStewardSession(undefined, {
+          expectedToken: "token-a",
+          validate: () => isStewardSessionRecoverySnapshotLive(snapshot),
+        }),
+      ).resolves.toBe(false);
+    } finally {
+      unregister();
+      if (accountBReceipt) rejectStewardSessionRecovery(accountBReceipt);
+    }
+
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("token-b");
+    expect(loadPersistedActiveServer()?.accessToken).toBe(
+      "account-b-active-bearer",
+    );
+    expect(loadAgentProfileRegistry().profiles[0]?.accessToken).toBe(
+      "account-b-profile-bearer",
+    );
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("finishes acquired terminal scrubs but suppresses publication when B starts", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, "terminal-token-a");
+    savePersistedActiveServer({
+      id: "cloud:terminal-a-agent",
+      kind: "cloud",
+      label: "Terminal A",
+      apiBase: "https://terminal-a-agent.example.test",
+      accessToken: "terminal-a-active-bearer",
+    });
+    saveAgentProfileRegistry({
+      version: 1,
+      activeProfileId: "terminal-a-profile",
+      profiles: [
+        {
+          id: "terminal-a-profile",
+          label: "Terminal A profile",
+          kind: "remote",
+          apiBase: "https://terminal-a-profile.example.test",
+          accessToken: "terminal-a-profile-bearer",
+          createdAt: "2026-08-30T00:00:00.000Z",
+        },
+      ],
+    });
+    const snapshot = readStewardSessionRecovery("elizacloud");
+    let accountBReceipt: ReturnType<typeof beginStewardSessionRecovery> | null =
+      null;
+    const unregister = registerStewardTokenRemoval(async () => {
+      localStorage.removeItem(STEWARD_TOKEN_KEY);
+      accountBReceipt = beginStewardSessionRecovery("elizacloud", "provider");
+      return true;
+    });
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(null, { status: 204 }));
+    const syncListener = vi.fn();
+    window.addEventListener("steward-token-sync", syncListener);
+    const validate = vi.fn(() =>
+      isStewardSessionRecoverySnapshotLive(snapshot),
+    );
+
+    try {
+      await expect(
+        clearStaleStewardSession(undefined, {
+          expectedToken: "terminal-token-a",
+          validate,
+        }),
+      ).resolves.toBe(true);
+      expect(validate()).toBe(false);
+    } finally {
+      unregister();
+      window.removeEventListener("steward-token-sync", syncListener);
+      if (accountBReceipt) rejectStewardSessionRecovery(accountBReceipt);
+    }
+
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(loadPersistedActiveServer()?.accessToken).toBeUndefined();
+    expect(loadAgentProfileRegistry().profiles[0]?.accessToken).toBeUndefined();
+    expect(fetchSpy).toHaveBeenCalled();
+    expect(syncListener).not.toHaveBeenCalled();
+  });
 });
 
 describe("clearServerStewardSessionCookies", () => {
-  it("marks every cookie-clearing DELETE as a non-simple request", () => {
+  it("marks every cookie-clearing DELETE as a non-simple request", async () => {
     const fetchSpy = vi
       .spyOn(globalThis, "fetch")
       .mockResolvedValue(new Response(null, { status: 204 }));
 
-    clearServerStewardSessionCookies();
+    await clearServerStewardSessionCookies();
 
     expect(fetchSpy).toHaveBeenCalled();
     for (const [url, init] of fetchSpy.mock.calls) {
@@ -290,6 +413,34 @@ describe("clearServerStewardSessionCookies", () => {
         credentials: "include",
         headers: { "Content-Type": "application/json" },
       });
+    }
+  });
+
+  it("releases the session mutation lease when a cookie DELETE never settles", async () => {
+    vi.useFakeTimers();
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(() => new Promise<Response>(() => {}));
+    try {
+      let settled = false;
+      const clearing = clearServerStewardSessionCookies().then(() => {
+        settled = true;
+      });
+      for (
+        let turn = 0;
+        turn < 16 && fetchSpy.mock.calls.length === 0;
+        turn++
+      ) {
+        await Promise.resolve();
+      }
+      expect(fetchSpy).toHaveBeenCalled();
+      expect(settled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(10_000);
+      await expect(clearing).resolves.toBeUndefined();
+      expect(settled).toBe(true);
+    } finally {
+      vi.useRealTimers();
     }
   });
 });

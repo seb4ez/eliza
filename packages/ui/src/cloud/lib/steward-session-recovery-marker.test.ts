@@ -4,10 +4,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   beginStewardSessionLogout,
   beginStewardSessionRecovery,
+  commitStewardSessionRecoveryForPublication,
   completeStewardSessionLogout,
   completeStewardSessionRecovery,
+  completeStewardSessionRecoveryReceipt,
   completeStewardSessionRecoverySnapshot,
   hasStewardSessionRecovery,
+  isStewardSessionRecoveryReceiptLive,
+  isStewardSessionRecoverySnapshotLive,
   readStewardSessionLogoutIntents,
   readStewardSessionRecovery,
   rejectStewardSessionRecovery,
@@ -107,6 +111,106 @@ describe("Steward session recovery receipts", () => {
     );
   });
 
+  it.each(["complete", "reject"] as const)(
+    "keeps an empty snapshot invalid after a newer receipt is %s",
+    (outcome) => {
+      const empty = readStewardSessionRecovery(TENANT);
+      expect(isStewardSessionRecoverySnapshotLive(empty)).toBe(true);
+
+      const newer = beginStewardSessionRecovery(TENANT, "provider");
+      if (outcome === "complete") {
+        completeStewardSessionRecovery(newer);
+      } else {
+        rejectStewardSessionRecovery(newer);
+      }
+
+      const after = readStewardSessionRecovery(TENANT);
+      expect(after.receipts).toEqual([]);
+      expect(after.generation).toBe(newer.receipt);
+      expect(isStewardSessionRecoverySnapshotLive(empty)).toBe(false);
+    },
+  );
+
+  it("confirms exact receipt removal before authenticated publication", () => {
+    const recovery = beginStewardSessionRecovery(TENANT, "provider");
+
+    expect(commitStewardSessionRecoveryForPublication(recovery)).toBe(true);
+    expect(readStewardSessionRecovery(TENANT)).toMatchObject({
+      receipts: [],
+      generation: recovery.receipt,
+    });
+  });
+
+  it("rejects publication when durable receipt removal fails", () => {
+    const recovery = beginStewardSessionRecovery(TENANT, "provider");
+    const remove = storage.removeItem.bind(storage);
+    storage.removeItem = (key) => {
+      if (key.endsWith(`:${recovery.receipt}`)) {
+        throw new DOMException("Storage denied", "SecurityError");
+      }
+      remove(key);
+    };
+
+    expect(commitStewardSessionRecoveryForPublication(recovery)).toBe(false);
+    expect(readStewardSessionRecovery(TENANT).receipts).toEqual([
+      recovery.receipt,
+    ]);
+  });
+
+  it("invalidates an empty snapshot across independently evaluated module instances", async () => {
+    const moduleA = await import("./steward-session-recovery-marker");
+    const emptyA = moduleA.readStewardSessionRecovery(TENANT);
+    vi.resetModules();
+    const moduleB = await import("./steward-session-recovery-marker");
+
+    const newerB = moduleB.beginStewardSessionRecovery(TENANT, "provider");
+    moduleB.completeStewardSessionRecovery(newerB);
+
+    expect(moduleB.readStewardSessionRecovery(TENANT).receipts).toEqual([]);
+    expect(moduleA.isStewardSessionRecoverySnapshotLive(emptyA)).toBe(false);
+  });
+
+  it("invalidates even an empty snapshot while a newer receipt remains live", () => {
+    const empty = readStewardSessionRecovery(TENANT);
+    expect(isStewardSessionRecoverySnapshotLive(empty)).toBe(true);
+
+    beginStewardSessionRecovery(TENANT, "provider");
+
+    expect(isStewardSessionRecoverySnapshotLive(empty)).toBe(false);
+  });
+
+  it("supersedes an individual receipt only for receipts outside its initial ancestry", () => {
+    const older = beginStewardSessionRecovery(TENANT, "provider");
+    const accountA = beginStewardSessionRecovery(TENANT, "provider");
+
+    rejectStewardSessionRecovery(older);
+    expect(isStewardSessionRecoveryReceiptLive(accountA)).toBe(true);
+
+    const accountB = beginStewardSessionRecovery(TENANT, "provider");
+    expect(isStewardSessionRecoveryReceiptLive(accountA)).toBe(false);
+    expect(isStewardSessionRecoveryReceiptLive(accountB)).toBe(true);
+  });
+
+  it.each(["complete", "reject"] as const)(
+    "does not revive receipt A after newer receipt B is %s",
+    (outcome) => {
+      const accountA = beginStewardSessionRecovery(TENANT, "provider");
+      const accountB = beginStewardSessionRecovery(TENANT, "provider");
+      expect(isStewardSessionRecoveryReceiptLive(accountA)).toBe(false);
+
+      if (outcome === "complete") {
+        completeStewardSessionRecoveryReceipt(accountB);
+      } else {
+        rejectStewardSessionRecovery(accountB);
+      }
+
+      expect(readStewardSessionRecovery(TENANT).receipts).toEqual([
+        accountA.receipt,
+      ]);
+      expect(isStewardSessionRecoveryReceiptLive(accountA)).toBe(false);
+    },
+  );
+
   it("fails closed when a receipt cannot be persisted durably", () => {
     storage.setItem = () => {
       throw new DOMException("Storage denied", "SecurityError");
@@ -116,6 +220,24 @@ describe("Steward session recovery receipts", () => {
       "durable recovery storage is unavailable",
     );
     expect(readStewardSessionRecovery(TENANT).receipts).toHaveLength(0);
+  });
+
+  it("fails closed and leaves a conservative marker when generation persistence fails", () => {
+    const persist = storage.setItem.bind(storage);
+    let writes = 0;
+    storage.setItem = (key, value) => {
+      writes += 1;
+      if (writes === 2) {
+        throw new DOMException("Storage denied", "SecurityError");
+      }
+      persist(key, value);
+    };
+
+    expect(() => beginStewardSessionRecovery(TENANT, "provider")).toThrow(
+      "durable recovery generation storage is unavailable",
+    );
+    expect(readStewardSessionRecovery(TENANT).receipts).toHaveLength(1);
+    expect(hasStewardSessionRecovery(TENANT)).toBe(true);
   });
 
   it("reports storage as unavailable when marker enumeration fails", () => {
@@ -208,6 +330,7 @@ describe("Steward session recovery receipts", () => {
     expect(readStewardSessionLogoutIntents(TENANT).intents).toEqual([logout]);
     expect(readStewardSessionRecovery(TENANT)).toMatchObject({
       receipts: [login.receipt],
+      generation: logout.receipt,
       storageAvailable: false,
     });
     expect(hasStewardSessionRecovery(TENANT)).toBe(true);
@@ -216,6 +339,7 @@ describe("Steward session recovery receipts", () => {
     expect(readStewardSessionLogoutIntents(TENANT).intents).toEqual([]);
     expect(readStewardSessionRecovery(TENANT)).toMatchObject({
       receipts: [],
+      generation: logout.receipt,
       storageAvailable: true,
     });
   });

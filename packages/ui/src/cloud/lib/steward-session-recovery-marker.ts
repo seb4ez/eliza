@@ -12,6 +12,7 @@ export const STEWARD_SESSION_RECOVERY_CHANGE_EVENT =
 
 const RECOVERY_KEY_PREFIX = "eliza.steward.server-session-recovery.v2";
 const LOGOUT_KEY_PREFIX = "eliza.steward.server-session-logout.v1";
+const GENERATION_KEY_PREFIX = "eliza.steward.server-session-generation.v1";
 
 export type StewardSessionRecoveryKind = "oauth" | "provider" | "telegram";
 export type StewardSessionLogoutKind = "logout" | "account-switch";
@@ -19,6 +20,11 @@ export type StewardSessionLogoutKind = "logout" | "account-switch";
 export interface StewardSessionRecoverySnapshot {
   tenantId: string;
   receipts: readonly string[];
+  /**
+   * Last origin-wide mutation nonce. It is never rewound when receipts retire,
+   * so an empty A snapshot cannot become live again after B begins and finishes.
+   */
+  generation: string | null;
   hasOAuth: boolean;
   /** False means absence cannot be proven and every passive writer must stop. */
   storageAvailable: boolean;
@@ -70,6 +76,44 @@ function logoutKeyPrefix(tenantId: string): string {
 
 function logoutMarkerKey(tenantId: string, receipt: string): string {
   return `${logoutKeyPrefix(tenantId)}${receipt}`;
+}
+
+function generationKey(tenantId: string): string {
+  return `${GENERATION_KEY_PREFIX}:${encodeURIComponent(tenantId)}`;
+}
+
+function readGeneration(tenantId: string): {
+  generation: string | null;
+  storageAvailable: boolean;
+} {
+  if (typeof window === "undefined") {
+    return { generation: null, storageAvailable: false };
+  }
+  try {
+    return {
+      generation: window.localStorage.getItem(generationKey(tenantId)),
+      storageAvailable: true,
+    };
+  } catch (error) {
+    void error;
+    return { generation: null, storageAvailable: false };
+  }
+}
+
+function persistGeneration(
+  tenantId: string,
+  generation: string,
+  unavailableMessage: string,
+): void {
+  if (typeof window === "undefined") {
+    throw new StewardSessionRecoveryStorageError();
+  }
+  try {
+    window.localStorage.setItem(generationKey(tenantId), generation);
+  } catch (error) {
+    void error;
+    throw new StewardSessionRecoveryStorageError(unavailableMessage);
+  }
 }
 
 function parseMarkerKind(value: string | null): StewardSessionRecoveryKind {
@@ -274,15 +318,18 @@ export function readStewardSessionRecovery(
 ): StewardSessionRecoverySnapshot {
   const { markers, storageAvailable } = readMarkers(tenantId);
   const logout = readLogoutMarkers(tenantId);
+  const generation = readGeneration(tenantId);
   return {
     tenantId,
     receipts: [...markers.keys()].sort(),
+    generation: generation.generation,
     hasOAuth: [...markers.values()].includes("oauth"),
     // A logout intent is intentionally not a login-recovery receipt. Reporting
     // the snapshot unavailable makes legacy cookie-first recovery stop before
     // it can replay a bearer while the logout is awaiting/replaying its lock.
     storageAvailable:
       storageAvailable &&
+      generation.storageAvailable &&
       logout.storageAvailable &&
       logout.intents.length === 0,
   };
@@ -301,11 +348,28 @@ export function hasStewardSessionRecovery(tenantId: string): boolean {
 }
 
 export function isStewardSessionRecoveryReceiptLive(
-  recovery: Pick<StewardSessionRecoveryReceipt, "tenantId" | "receipt">,
+  recovery: Pick<
+    StewardSessionRecoveryReceipt,
+    "tenantId" | "receipt" | "preexistingReceipts"
+  >,
 ): boolean {
   const snapshot = readStewardSessionRecovery(recovery.tenantId);
+  const receiptsOwnedWhenStarted = new Set([
+    recovery.receipt,
+    ...recovery.preexistingReceipts,
+  ]);
   return (
-    snapshot.storageAvailable && snapshot.receipts.includes(recovery.receipt)
+    snapshot.storageAvailable &&
+    // A later begin permanently supersedes this continuation even if that
+    // newer receipt finishes before this tab is scheduled again. Receipt-list
+    // ancestry alone would otherwise permit A -> B -> [A] ABA revival.
+    snapshot.generation === recovery.receipt &&
+    snapshot.receipts.includes(recovery.receipt) &&
+    // Older receipts may disappear while this transaction waits: a newer
+    // successful transaction can legitimately reconcile them. Any receipt
+    // outside this transaction's initial ancestry is newer, however, and
+    // synchronously supersedes this continuation before local publication.
+    snapshot.receipts.every((receipt) => receiptsOwnedWhenStarted.has(receipt))
   );
 }
 
@@ -314,8 +378,13 @@ export function isStewardSessionRecoverySnapshotLive(
 ): boolean {
   const current = readStewardSessionRecovery(expected.tenantId);
   return (
+    expected.storageAvailable &&
     current.storageAvailable &&
-    expected.receipts.every((receipt) => current.receipts.includes(receipt))
+    current.generation === expected.generation &&
+    current.receipts.length === expected.receipts.length &&
+    expected.receipts.every(
+      (receipt, index) => current.receipts[index] === receipt,
+    )
   );
 }
 
@@ -330,8 +399,21 @@ export function beginStewardSessionRecovery(
       "Sign-in cannot start because durable recovery storage cannot be read. Enable site storage and try again.",
     );
   }
-  const receipt = createReceipt(new Set(before.receipts));
+  const receipt = createReceipt(
+    new Set([
+      ...before.receipts,
+      ...(before.generation ? [before.generation] : []),
+    ]),
+  );
   persistMarker(tenantId, receipt, kind);
+  // Receipt deletion is not a generation rollback. Keeping this nonce after
+  // success/rejection makes snapshot authority monotonic across tab scheduling
+  // and storage-event delivery order without a racy cross-tab counter.
+  persistGeneration(
+    tenantId,
+    receipt,
+    "Sign-in cannot start because durable recovery generation storage is unavailable. Enable site storage and try again.",
+  );
   notifyRecoveryChange();
   return {
     tenantId,
@@ -353,7 +435,12 @@ export function beginStewardSessionLogout(
 ): StewardSessionLogoutIntent {
   const recovery = readMarkers(tenantId);
   const logout = readLogoutMarkers(tenantId);
-  if (!recovery.storageAvailable || !logout.storageAvailable) {
+  const generation = readGeneration(tenantId);
+  if (
+    !recovery.storageAvailable ||
+    !logout.storageAvailable ||
+    !generation.storageAvailable
+  ) {
     throw new StewardSessionRecoveryStorageError(
       "Sign-out cannot start because durable recovery storage cannot be read. Enable site storage and try again.",
     );
@@ -371,6 +458,7 @@ export function beginStewardSessionLogout(
   const existingReceipts = new Set([
     ...recovery.markers.keys(),
     ...logout.intents.map((intent) => intent.receipt),
+    ...(generation.generation ? [generation.generation] : []),
   ]);
   const receipt = createReceipt(existingReceipts);
   const intent: StewardSessionLogoutIntent = {
@@ -401,6 +489,11 @@ export function beginStewardSessionLogout(
       "Sign-out cannot start because durable recovery storage is unavailable. Enable site storage and try again.",
     );
   }
+  persistGeneration(
+    tenantId,
+    receipt,
+    "Sign-out cannot start because durable recovery generation storage is unavailable. Enable site storage and try again.",
+  );
   notifyRecoveryChange();
   return intent;
 }
@@ -465,6 +558,27 @@ export function completeStewardSessionRecovery(
     recovery.receipt,
     ...recovery.preexistingReceipts,
   ]);
+}
+
+/**
+ * Commit one live receipt immediately before publishing authenticated state.
+ * The boolean is the publication fence: it proves every owned marker is gone
+ * and no newer generation began before the post-removal read. A failed
+ * localStorage removal or concurrent successor therefore keeps publication
+ * fail-closed instead of being hidden behind the best-effort cleanup API.
+ */
+export function commitStewardSessionRecoveryForPublication(
+  recovery: StewardSessionRecoveryReceipt,
+): boolean {
+  if (!isStewardSessionRecoveryReceiptLive(recovery)) return false;
+  const ownedReceipts = [recovery.receipt, ...recovery.preexistingReceipts];
+  removeReceipts(recovery.tenantId, ownedReceipts);
+  const current = readStewardSessionRecovery(recovery.tenantId);
+  return (
+    current.storageAvailable &&
+    current.generation === recovery.receipt &&
+    ownedReceipts.every((receipt) => !current.receipts.includes(receipt))
+  );
 }
 
 /** Retire exactly the receipts reconciled by one cookie-first read. */

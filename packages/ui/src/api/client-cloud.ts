@@ -18,11 +18,16 @@ import {
   startCloudConversationHandoff,
 } from "../cloud/handoff/cloud-handoff-supervisor";
 import { isRetryableHandoffHttpStatus } from "../cloud/handoff/conversation-handoff";
-import { enqueueStewardSessionMutation } from "../cloud/lib/steward-session-mutation-queue";
+import {
+  enqueueStewardSessionMutation,
+  type StewardSessionMutationLease,
+} from "../cloud/lib/steward-session-mutation-queue";
 import {
   beginStewardSessionRecovery,
   completeStewardSessionRecovery,
   isStewardSessionRecoveryReceiptLive,
+  isStewardSessionRecoverySnapshotLive,
+  readStewardSessionRecovery,
   rejectStewardSessionRecovery,
 } from "../cloud/lib/steward-session-recovery-marker";
 import {
@@ -659,12 +664,38 @@ export function getCloudAuthToken(client?: ElizaClient): string | null {
   return clientToken || null;
 }
 
-async function clearStoredStewardTokenIfCurrent(token: string): Promise<void> {
-  if (readStoredStewardToken()?.trim() !== token) return;
-  await clearStoredStewardToken();
-  if (typeof window !== "undefined") {
+async function clearStoredStewardTokenIfCurrent(
+  token: string,
+): Promise<boolean> {
+  const cleared = await clearStoredStewardToken({ expectedToken: token });
+  if (cleared && typeof window !== "undefined") {
     window.dispatchEvent(new CustomEvent("steward-token-sync"));
   }
+  return cleared;
+}
+
+async function clearEndedStewardAccountIfCurrent(
+  expectedToken: string | null,
+  mutationLease: StewardSessionMutationLease,
+  validateAuthority: () => boolean,
+): Promise<void> {
+  const readCurrentToken = () => readStoredStewardToken()?.trim() || null;
+  if (!validateAuthority() || readCurrentToken() !== expectedToken) return;
+  // Load lazily to avoid making the low-level Cloud transport participate in
+  // the API-client singleton cycle owned by StewardProviderShared. The full
+  // teardown is required here: a dedicated/self-hosted active-server bearer
+  // and profile mirrors remain usable even after the Steward JWT is removed.
+  const { clearStaleStewardSession } = await import(
+    "../cloud/shell/StewardProviderShared"
+  );
+  // Keep the exact-token guard adjacent to the destructive helper. The caller
+  // already owns the origin mutation lease, so account B cannot interleave;
+  // passing that lease also avoids a nested Web Locks request.
+  if (!validateAuthority() || readCurrentToken() !== expectedToken) return;
+  await clearStaleStewardSession(mutationLease, {
+    expectedToken,
+    validate: validateAuthority,
+  });
 }
 
 function readDirectCloudToken(client: ElizaClient): string | null {
@@ -718,8 +749,47 @@ export async function refreshCloudStewardSession(opts?: {
   endpoint?: string;
   /** Surface throttling/outage responses instead of treating them as logout. */
   throwOnTransientHttpFailure?: boolean;
+  /**
+   * Runs before the origin-wide cookie-mutation lease is released. Web callers
+   * that publish the returned access token must do so here, never after the
+   * promise resolves, or a newer login can be overwritten locally.
+   */
+  commitRefreshedSession?: (
+    session: {
+      token?: string;
+      expiresAt?: number;
+      expiresIn?: number;
+    },
+    authority: { validate: () => boolean },
+  ) => Promise<void> | void;
+  /** Existing transaction lease for nested auth helpers (avoids deadlock). */
+  mutationLease?: StewardSessionMutationLease;
 }): Promise<{ token?: string; expiresAt?: number; expiresIn?: number } | null> {
   const endpoint = opts?.endpoint ?? STEWARD_REFRESH_ENDPOINT;
+  if (!opts?.mutationLease) {
+    return enqueueStewardSessionMutation((mutationLease) =>
+      refreshCloudStewardSession({ ...opts, mutationLease }),
+    );
+  }
+  // A durable login receipt means a newer account mutation owns this origin.
+  // This check runs only after queue admission, so a refresh already in flight
+  // finishes before the newer login, while refreshes queued afterwards never
+  // replay the older browser token over it. Enumeration failure also blocks.
+  const tenantId = configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID);
+  const authoritySnapshot =
+    typeof window === "undefined" ? null : readStewardSessionRecovery(tenantId);
+  if (
+    authoritySnapshot &&
+    (!authoritySnapshot.storageAvailable ||
+      authoritySnapshot.receipts.length > 0)
+  ) {
+    return null;
+  }
+  const refreshAuthority = {
+    validate: () =>
+      authoritySnapshot === null ||
+      isStewardSessionRecoverySnapshotLive(authoritySnapshot),
+  };
   if (shouldUseNativeStewardRefreshHttp(endpoint)) {
     const token = readStoredStewardToken()?.trim();
     if (!token) return null;
@@ -738,6 +808,20 @@ export async function refreshCloudStewardSession(opts?: {
       { method: "POST", url: endpoint },
     );
     if (response.status < 200 || response.status >= 300) {
+      const failure = parseDirectCloudJsonSafe(response.data) as {
+        code?: string;
+      } | null;
+      if (response.status === 401 && failure?.code === "session_ended") {
+        // Only the server's explicit cross-host logout verdict is
+        // authoritative while a JWT is still valid. Keep the compare guard so
+        // a delayed response for account A cannot erase a newer account B.
+        await clearEndedStewardAccountIfCurrent(
+          token,
+          opts.mutationLease,
+          refreshAuthority.validate,
+        );
+        return null;
+      }
       if (
         opts?.throwOnTransientHttpFailure &&
         (response.status === 429 || response.status >= 500)
@@ -769,10 +853,16 @@ export async function refreshCloudStewardSession(opts?: {
         },
       );
     }
+    if (parsed?.token?.trim()) {
+      if (!refreshAuthority.validate()) return null;
+      await opts?.commitRefreshedSession?.(parsed, refreshAuthority);
+      if (!refreshAuthority.validate()) return null;
+    }
     return parsed;
   }
 
   if (typeof fetch === "undefined") return null;
+  const tokenAtDispatch = readStoredStewardToken()?.trim() || null;
   // Cloud account reads can legitimately take longer than 15 seconds on a cold
   // regional worker. Keep the request bounded at DIRECT_CLOUD_HTTP_TIMEOUT_MS,
   // but use the portable helper — `AbortSignal.timeout` is missing on iOS
@@ -794,6 +884,24 @@ export async function refreshCloudStewardSession(opts?: {
       signal: stewardSignal,
     });
     if (!response.ok) {
+      if (response.status === 401) {
+        const failure = (await response.json().catch((err: unknown) => {
+          if (isTimeoutAbortError(err)) throw err;
+          return null;
+        })) as { code?: string } | null;
+        if (failure?.code === "session_ended") {
+          // A bare 401 can be a stale proxy or refresh-rotation loser. The
+          // structured logout code is the sole authority to retire a still-
+          // valid local mirror, and the exact-token guard protects a newer
+          // login that won while this request was settling.
+          await clearEndedStewardAccountIfCurrent(
+            tokenAtDispatch,
+            opts.mutationLease,
+            refreshAuthority.validate,
+          );
+          return null;
+        }
+      }
       if (
         opts?.throwOnTransientHttpFailure &&
         (response.status === 429 || response.status >= 500)
@@ -834,6 +942,11 @@ export async function refreshCloudStewardSession(opts?: {
           context: { endpoint, status: response.status },
         },
       );
+    }
+    if (parsed?.token?.trim()) {
+      if (!refreshAuthority.validate()) return null;
+      await opts?.commitRefreshedSession?.(parsed, refreshAuthority);
+      if (!refreshAuthority.validate()) return null;
     }
     return parsed;
   } catch (err) {
@@ -5239,9 +5352,23 @@ async function persistCloudSelectionStewardAuthority(
         return false;
       }
       writeStarted = true;
-      await writeStoredStewardToken(token, { signal });
+      await writeStoredStewardToken(token, {
+        signal,
+        validate: () => {
+          const currentToken = readStoredStewardToken()?.trim() || null;
+          return (
+            isStewardSessionRecoveryReceiptLive(recovery) &&
+            (currentToken === expectedStoredToken || currentToken === token)
+          );
+        },
+      });
       signal?.throwIfAborted();
-      if (!isStewardSessionRecoveryReceiptLive(recovery)) return false;
+      if (
+        !isStewardSessionRecoveryReceiptLive(recovery) ||
+        readStoredStewardToken()?.trim() !== token
+      ) {
+        return false;
+      }
       completeStewardSessionRecovery(recovery);
       return true;
     });

@@ -22,7 +22,11 @@ const harness = vi.hoisted(() => ({
 
 vi.mock("../../lib/steward-session", () => ({
   hasStewardOAuthCallbackInUrl: () => harness.hasCallback,
-  consumeStewardCodeFromQuery: () => harness.code,
+  consumeStewardCodeFromQuery: () => {
+    const code = harness.code;
+    harness.code = null;
+    return code;
+  },
   consumeStewardOAuthStateFromCallback: () => "state-1",
   stripLegacyTokenHashFromAddressBar: () => false,
   exchangeStewardCodeViaApi: () => new Promise(() => {}),
@@ -115,10 +119,12 @@ describe("StewardLoginSection — reserved loading geometry (#18256)", () => {
     harness.hasCallback = false;
     harness.code = null;
     harness.providers = () => new Promise(() => {});
+    window.localStorage.clear();
   });
 
   afterEach(() => {
     cleanup();
+    window.localStorage.clear();
     vi.clearAllMocks();
   });
 

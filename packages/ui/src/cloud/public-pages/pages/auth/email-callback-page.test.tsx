@@ -14,6 +14,7 @@ import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { readStewardSessionRecovery } from "../../../lib/steward-session-recovery-marker";
 
 const callbackState = vi.hoisted(() => ({
   verifyEmailCallback:
@@ -31,6 +32,16 @@ const callbackState = vi.hoisted(() => ({
 const sessionSpies = vi.hoisted(() => ({
   sync: vi.fn(),
 }));
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 
 // Stub StewardAuthProvider with a marker that ALSO supplies the Steward context
 // — what the real provider does once its runtime mounts. This lets the test
@@ -296,6 +307,10 @@ describe("EmailCallbackPage", () => {
     expect(sessionSpies.sync).toHaveBeenCalledWith(
       "private-session-token",
       "private-refresh-token",
+      expect.objectContaining({
+        mutationLease: expect.any(Object),
+        validate: expect.any(Function),
+      }),
     );
     expect(sessionSpies.sync.mock.invocationCallOrder[0]).toBeLessThan(
       callbackState.publishComplete.mock.invocationCallOrder[0],
@@ -303,6 +318,86 @@ describe("EmailCallbackPage", () => {
     expect(
       JSON.stringify(callbackState.publishComplete.mock.calls),
     ).not.toContain("private-session-token");
+  });
+
+  it("keeps a durable ambiguity receipt when the tab closes after cookie dispatch", async () => {
+    const cookieCommit = deferred<void>();
+    callbackState.verifyEmailCallback.mockResolvedValue({
+      token: "tab-close-session-token",
+      refreshToken: "tab-close-refresh-token",
+    });
+    sessionSpies.sync.mockReturnValue(cookieCommit.promise);
+
+    const mounted = render(
+      <MemoryRouter
+        initialEntries={[
+          "/auth/callback/email?token=tab-close-link&email=close%40example.com",
+        ]}
+      >
+        <EmailCallbackPage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(sessionSpies.sync).toHaveBeenCalledTimes(1));
+    const beforeClose = readStewardSessionRecovery("elizacloud");
+    expect(beforeClose.receipts).toHaveLength(1);
+
+    mounted.unmount();
+    window.sessionStorage.clear();
+    expect(readStewardSessionRecovery("elizacloud").receipts).toEqual(
+      beforeClose.receipts,
+    );
+
+    cookieCommit.resolve();
+    await waitFor(() =>
+      expect(readStewardSessionRecovery("elizacloud").receipts).toHaveLength(0),
+    );
+  });
+
+  it("fails closed before cookie dispatch when durable receipt storage is unavailable", async () => {
+    callbackState.verifyEmailCallback.mockResolvedValue({
+      token: "storage-failure-session-token",
+    });
+    const originalStorage = window.localStorage;
+    const deniedStorage: Storage = {
+      get length() {
+        return originalStorage.length;
+      },
+      clear: () => originalStorage.clear(),
+      getItem: (key) => originalStorage.getItem(key),
+      key: (index) => originalStorage.key(index),
+      removeItem: (key) => originalStorage.removeItem(key),
+      setItem: () => {
+        throw new DOMException("Storage denied", "SecurityError");
+      },
+    };
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      value: deniedStorage,
+    });
+    try {
+      render(
+        <MemoryRouter
+          initialEntries={[
+            "/auth/callback/email?token=storage-failure-link&email=storage%40example.com",
+          ]}
+        >
+          <EmailCallbackPage />
+        </MemoryRouter>,
+      );
+
+      expect(
+        await screen.findByText(
+          "Sign-in cannot start because durable recovery storage is unavailable. Enable site storage and try again.",
+        ),
+      ).toBeTruthy();
+      expect(sessionSpies.sync).not.toHaveBeenCalled();
+    } finally {
+      Object.defineProperty(window, "localStorage", {
+        configurable: true,
+        value: originalStorage,
+      });
+    }
   });
 
   it("falls back safely when callback state contains a backslash authority", async () => {

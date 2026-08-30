@@ -341,9 +341,9 @@ describe("Steward session storage transitions", () => {
     });
 
     try {
-      await expect(writeStoredStewardToken("attempt-token-a")).rejects.toMatchObject(
-        { name: "StewardTokenPersistenceError" },
-      );
+      await expect(
+        writeStoredStewardToken("attempt-token-a"),
+      ).rejects.toMatchObject({ name: "StewardTokenPersistenceError" });
     } finally {
       Object.defineProperty(window, "localStorage", {
         configurable: true,
@@ -383,6 +383,415 @@ describe("Steward session storage transitions", () => {
     expect(transitions[1]?.sessionEpoch).toBeGreaterThan(
       transitions[0]?.sessionEpoch ?? 0,
     );
+  });
+
+  it("does not clear or publish when exact removal authority is superseded", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, "token-a");
+    localStorage.setItem(STEWARD_TOKEN_SCOPE_KEY, "scope-a");
+    localStorage.setItem(STEWARD_REFRESH_TOKEN_KEY, "legacy-refresh-a");
+    const transitions: StewardSessionChangeDetail[] = [];
+    const listener = (event: Event) => {
+      transitions.push(
+        (event as CustomEvent<StewardSessionChangeDetail>).detail,
+      );
+    };
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+    const removal = vi.fn(async () => {
+      localStorage.setItem(STEWARD_TOKEN_KEY, "token-b");
+      localStorage.setItem(STEWARD_TOKEN_SCOPE_KEY, "scope-b");
+      return false;
+    });
+    const unregister = registerStewardTokenRemoval(removal);
+
+    try {
+      await expect(
+        clearStoredStewardToken({
+          expectedToken: "token-a",
+          validate: () => true,
+        }),
+      ).resolves.toBe(false);
+    } finally {
+      unregister();
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+    }
+
+    expect(removal).toHaveBeenCalledWith({
+      expectedToken: "token-a",
+      validate: expect.any(Function),
+    });
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("token-b");
+    expect(localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY)).toBe("scope-b");
+    expect(localStorage.getItem(STEWARD_REFRESH_TOKEN_KEY)).toBe(
+      "legacy-refresh-a",
+    );
+    expect(transitions).toEqual([]);
+  });
+
+  it("keeps terminal teardown acquired without publishing when authority changes after CAS", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, "terminal-token-a");
+    localStorage.setItem(STEWARD_TOKEN_SCOPE_KEY, "scope-a");
+    let authoritative = true;
+    const transitions: StewardSessionChangeDetail[] = [];
+    const listener = (event: Event) => {
+      transitions.push(
+        (event as CustomEvent<StewardSessionChangeDetail>).detail,
+      );
+    };
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+    const unregister = registerStewardTokenRemoval(async () => {
+      localStorage.removeItem(STEWARD_TOKEN_KEY);
+      authoritative = false;
+      return true;
+    });
+
+    try {
+      await expect(
+        clearStoredStewardToken({
+          expectedToken: "terminal-token-a",
+          validate: () => authoritative,
+        }),
+      ).resolves.toBe(true);
+    } finally {
+      unregister();
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+    }
+
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY)).toBeNull();
+    expect(transitions).toEqual([]);
+  });
+
+  it("treats an exact absent token as distinct from unconditional removal", async () => {
+    const removal = vi.fn().mockResolvedValue(true);
+    const unregister = registerStewardTokenRemoval(removal);
+
+    try {
+      await expect(
+        clearStoredStewardToken({
+          expectedToken: null,
+          validate: () => true,
+        }),
+      ).resolves.toBe(true);
+    } finally {
+      unregister();
+    }
+
+    expect(removal).toHaveBeenCalledWith({
+      expectedToken: null,
+      validate: expect.any(Function),
+    });
+  });
+
+  it("restores an already-published predecessor through its exact write handle", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, "token-old");
+    const transitions: StewardSessionChangeDetail[] = [];
+    const listener = (event: Event) => {
+      transitions.push(
+        (event as CustomEvent<StewardSessionChangeDetail>).detail,
+      );
+    };
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+    let receiptLive = true;
+    const restorePredecessor = vi.fn(async () => {
+      if (!receiptLive) return false;
+      receiptLive = false;
+      localStorage.setItem(STEWARD_TOKEN_KEY, "token-old");
+      return true;
+    });
+    const unregister = registerStewardTokenPersistence(async (token) => {
+      localStorage.setItem(STEWARD_TOKEN_KEY, token);
+      return {
+        commit: async () => undefined,
+        restorePredecessor,
+      };
+    });
+
+    try {
+      const authority = await writeStoredStewardToken("token-a");
+      expect(authority).not.toBeNull();
+      await expect(authority?.restorePredecessor()).resolves.toBe(true);
+      await expect(authority?.restorePredecessor()).resolves.toBe(true);
+    } finally {
+      unregister();
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+    }
+
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("token-old");
+    expect(restorePredecessor).toHaveBeenCalledOnce();
+    expect(transitions.map(({ state }) => state)).toEqual([
+      "present",
+      "present",
+    ]);
+  });
+
+  it("provides an exact browser fallback authority for a published write", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, "browser-token-old");
+
+    const authority = await writeStoredStewardToken("browser-token-a");
+
+    expect(authority).not.toBeNull();
+    await expect(authority?.restorePredecessor()).resolves.toBe(true);
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("browser-token-old");
+  });
+
+  it("fences same-value ABA from an older browser fallback authority", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, "browser-token-old");
+    const oldAuthority = await writeStoredStewardToken("same-browser-token-a");
+
+    await writeStoredStewardToken("browser-token-b");
+    await writeStoredStewardToken("same-browser-token-a");
+
+    await expect(oldAuthority?.restorePredecessor()).resolves.toBe(false);
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(
+      "same-browser-token-a",
+    );
+  });
+
+  it("finalizes subordinate state and commits recovery before publishing", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, "token-old");
+    let liveClientToken = "token-old";
+    const order: string[] = [];
+    const listener = () => {
+      order.push(
+        `event:${localStorage.getItem(STEWARD_TOKEN_KEY)}:${liveClientToken}`,
+      );
+    };
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+
+    try {
+      const authority = await writeStoredStewardToken("token-b", {
+        finalizeBeforePublish: () => {
+          order.push(`finalize:${localStorage.getItem(STEWARD_TOKEN_KEY)}`);
+          liveClientToken = "token-b";
+          return () => {
+            liveClientToken = "token-old";
+          };
+        },
+        commitBeforePublish: () => {
+          order.push(`commit:${liveClientToken}`);
+          return true;
+        },
+      });
+
+      expect(authority).not.toBeNull();
+    } finally {
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+    }
+
+    expect(order).toEqual([
+      "finalize:token-b",
+      "commit:token-b",
+      "event:token-b:token-b",
+    ]);
+  });
+
+  it("restores durable state before rolling back an unpublished finalizer", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, "token-old");
+    let liveClientToken = "token-old";
+    const rollbackObservations: Array<string | null> = [];
+    const transitions: StewardSessionChangeDetail[] = [];
+    const listener = (event: Event) => {
+      transitions.push(
+        (event as CustomEvent<StewardSessionChangeDetail>).detail,
+      );
+    };
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+
+    try {
+      const authority = await writeStoredStewardToken("token-b", {
+        finalizeBeforePublish: () => {
+          liveClientToken = "token-b";
+          return () => {
+            rollbackObservations.push(localStorage.getItem(STEWARD_TOKEN_KEY));
+            liveClientToken = "token-old";
+          };
+        },
+        commitBeforePublish: () => false,
+      });
+
+      expect(authority).toBeNull();
+    } finally {
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+    }
+
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("token-old");
+    expect(liveClientToken).toBe("token-old");
+    expect(rollbackObservations).toEqual(["token-old"]);
+    expect(transitions).toEqual([]);
+  });
+
+  it("clears staged live authority when durable compensation loses", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, "token-old");
+    let liveClientToken: string | null = "token-old";
+    const rollbackStates: boolean[] = [];
+    const unregister = registerStewardTokenPersistence(async (token) => {
+      localStorage.setItem(STEWARD_TOKEN_KEY, token);
+      return {
+        commit: async () => undefined,
+        restorePredecessor: async () => false,
+      };
+    });
+
+    try {
+      await expect(
+        writeStoredStewardToken("token-a", {
+          finalizeBeforePublish: () => {
+            liveClientToken = "token-a";
+            return (durableRestored) => {
+              rollbackStates.push(durableRestored);
+              liveClientToken = durableRestored ? "token-old" : null;
+            };
+          },
+          commitBeforePublish: () => false,
+        }),
+      ).rejects.toMatchObject({ name: "StewardTokenPersistenceError" });
+    } finally {
+      unregister();
+    }
+
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("token-a");
+    expect(liveClientToken).toBeNull();
+    expect(rollbackStates).toEqual([false]);
+  });
+
+  it("defers a restored predecessor event until its live pair is coherent", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, "token-old");
+    let liveClientToken = "token-old";
+    const observations: string[] = [];
+    const listener = () => {
+      observations.push(
+        `${localStorage.getItem(STEWARD_TOKEN_KEY)}:${liveClientToken}`,
+      );
+    };
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+
+    try {
+      const authority = await writeStoredStewardToken("token-a", {
+        finalizeBeforePublish: () => {
+          liveClientToken = "token-a";
+          return () => {
+            liveClientToken = "token-old";
+          };
+        },
+      });
+      expect(observations).toEqual(["token-a:token-a"]);
+
+      await expect(
+        authority?.restorePredecessor({ deferPublication: true }),
+      ).resolves.toBe(true);
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("token-old");
+      expect(liveClientToken).toBe("token-old");
+      expect(observations).toEqual(["token-a:token-a"]);
+
+      expect(authority?.publish?.()).toBe(true);
+      expect(observations).toEqual(["token-a:token-a", "token-old:token-old"]);
+    } finally {
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+    }
+  });
+
+  it("finishes durable predecessor cleanup when live rollback throws", async () => {
+    setLocalCloudTarget("https://api.eliza.app");
+    await writeStoredStewardToken("production-token-old");
+    setLocalCloudTarget("https://api-staging.eliza.app");
+    const rollbackStates: boolean[] = [];
+    const transitions: StewardSessionChangeDetail[] = [];
+    const listener = (event: Event) => {
+      transitions.push(
+        (event as CustomEvent<StewardSessionChangeDetail>).detail,
+      );
+    };
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+
+    try {
+      const authority = await writeStoredStewardToken("staging-token-a", {
+        finalizeBeforePublish: () => (durableRestored) => {
+          rollbackStates.push(durableRestored);
+          throw new Error("live client rollback failed");
+        },
+      });
+      transitions.length = 0;
+
+      await expect(authority?.restorePredecessor()).rejects.toMatchObject({
+        name: "StewardTokenPersistenceError",
+        cause: expect.any(AggregateError),
+      });
+    } finally {
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+    }
+
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(
+      "production-token-old",
+    );
+    expect(localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY)).toBe(
+      "eliza-cloud:production",
+    );
+    expect(rollbackStates).toEqual([true]);
+    expect(transitions).toEqual([]);
+  });
+
+  it("runs finalization and receipt commit for a same-token login", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, "same-token");
+    const finalizeBeforePublish = vi.fn(() => undefined);
+    const commitBeforePublish = vi.fn(() => true);
+    const transitions: StewardSessionChangeDetail[] = [];
+    const listener = (event: Event) => {
+      transitions.push(
+        (event as CustomEvent<StewardSessionChangeDetail>).detail,
+      );
+    };
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+
+    try {
+      const authority = await writeStoredStewardToken("same-token", {
+        finalizeBeforePublish,
+        commitBeforePublish,
+      });
+
+      expect(authority).not.toBeNull();
+      await expect(
+        authority?.restorePredecessor({ deferPublication: true }),
+      ).resolves.toBe(true);
+      expect(authority?.publish?.()).toBe(true);
+    } finally {
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+    }
+
+    expect(finalizeBeforePublish).toHaveBeenCalledOnce();
+    expect(commitBeforePublish).toHaveBeenCalledOnce();
+    expect(transitions).toEqual([]);
+  });
+
+  it("does not let an old receipt roll back a same-value ABA successor", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, "token-old");
+    let receiptLive = true;
+    const restorePredecessor = vi.fn(async () => {
+      if (!receiptLive) return false;
+      localStorage.setItem(STEWARD_TOKEN_KEY, "token-old");
+      return true;
+    });
+    const unregister = registerStewardTokenPersistence(async (token) => {
+      localStorage.setItem(STEWARD_TOKEN_KEY, token);
+      return {
+        commit: async () => undefined,
+        restorePredecessor,
+      };
+    });
+
+    try {
+      const authority = await writeStoredStewardToken("same-bytes-a");
+      expect(authority).not.toBeNull();
+      localStorage.setItem(STEWARD_TOKEN_KEY, "token-b");
+      localStorage.setItem(STEWARD_TOKEN_KEY, "same-bytes-a");
+      receiptLive = false;
+
+      await expect(authority?.restorePredecessor()).resolves.toBe(false);
+    } finally {
+      unregister();
+    }
+
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("same-bytes-a");
+    expect(restorePredecessor).toHaveBeenCalledOnce();
   });
 
   it("does not advance authority when the same token is persisted again", async () => {
@@ -520,8 +929,9 @@ describe("Steward session storage transitions", () => {
       releaseCommit = resolve;
     });
     const commit = vi.fn(() => commitWait);
-    const unregister = registerStewardTokenPersistence(async () => {
+    const unregister = registerStewardTokenPersistence(async (token) => {
       await persistence;
+      localStorage.setItem(STEWARD_TOKEN_KEY, token);
       return commit;
     });
     const transitions: StewardSessionChangeDetail[] = [];
@@ -598,6 +1008,138 @@ describe("Steward session storage transitions", () => {
       }
     },
   );
+
+  it("compensates when external authority changes during protected persistence", async () => {
+    let authoritative = true;
+    let markPersistenceStarted: () => void = () => {};
+    const persistenceStarted = new Promise<void>((resolve) => {
+      markPersistenceStarted = resolve;
+    });
+    let releasePersistence: () => void = () => {};
+    const persistenceWait = new Promise<void>((resolve) => {
+      releasePersistence = resolve;
+    });
+    const commit = vi.fn(async () => undefined);
+    const unregister = registerStewardTokenPersistence(async (token) => {
+      markPersistenceStarted();
+      await persistenceWait;
+      localStorage.setItem(STEWARD_TOKEN_KEY, token);
+      return commit;
+    });
+    const transitions: StewardSessionChangeDetail[] = [];
+    const listener = (event: Event) => {
+      transitions.push(
+        (event as CustomEvent<StewardSessionChangeDetail>).detail,
+      );
+    };
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+
+    try {
+      const write = writeStoredStewardToken("account-a", {
+        validate: () => authoritative,
+      });
+      await persistenceStarted;
+      authoritative = false;
+      releasePersistence();
+
+      await write;
+      expect(commit).not.toHaveBeenCalled();
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+      expect(transitions).toEqual([]);
+    } finally {
+      unregister();
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+    }
+  });
+
+  it("compensates when external authority changes during receipt commit", async () => {
+    let authoritative = true;
+    let markCommitStarted: () => void = () => {};
+    const commitStarted = new Promise<void>((resolve) => {
+      markCommitStarted = resolve;
+    });
+    let releaseCommit: () => void = () => {};
+    const commitWait = new Promise<void>((resolve) => {
+      releaseCommit = resolve;
+    });
+    const unregister = registerStewardTokenPersistence(async (token) => {
+      localStorage.setItem(STEWARD_TOKEN_KEY, token);
+      return async (validate) => {
+        expect(validate?.()).toBe(true);
+        markCommitStarted();
+        await commitWait;
+      };
+    });
+    const transitions: StewardSessionChangeDetail[] = [];
+    const listener = (event: Event) => {
+      transitions.push(
+        (event as CustomEvent<StewardSessionChangeDetail>).detail,
+      );
+    };
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+
+    try {
+      const write = writeStoredStewardToken("account-a", {
+        validate: () => authoritative,
+      });
+      await commitStarted;
+      authoritative = false;
+      releaseCommit();
+
+      await write;
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+      expect(transitions).toEqual([]);
+    } finally {
+      unregister();
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+    }
+  });
+
+  it("does not publish a refreshed replacement superseded during persistence", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, "account-a-old");
+    let authoritative = true;
+    let markPersistenceStarted: () => void = () => {};
+    const persistenceStarted = new Promise<void>((resolve) => {
+      markPersistenceStarted = resolve;
+    });
+    let releasePersistence: () => void = () => {};
+    const persistenceWait = new Promise<void>((resolve) => {
+      releasePersistence = resolve;
+    });
+    const commit = vi.fn(async () => undefined);
+    const unregister = registerStewardTokenPersistence(async (token) => {
+      markPersistenceStarted();
+      await persistenceWait;
+      localStorage.setItem(STEWARD_TOKEN_KEY, token);
+      return commit;
+    });
+    const transitions: StewardSessionChangeDetail[] = [];
+    const listener = (event: Event) => {
+      transitions.push(
+        (event as CustomEvent<StewardSessionChangeDetail>).detail,
+      );
+    };
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+
+    try {
+      const replacement = replaceStoredStewardTokenIfCurrent(
+        "account-a-old",
+        "account-a-refreshed",
+        { validate: () => authoritative },
+      );
+      await persistenceStarted;
+      authoritative = false;
+      releasePersistence();
+
+      await expect(replacement).resolves.toBe(false);
+      expect(commit).not.toHaveBeenCalled();
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("account-a-old");
+      expect(transitions).toEqual([]);
+    } finally {
+      unregister();
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+    }
+  });
 
   it("lets a newer queued write survive an aborted predecessor rollback", async () => {
     let markFirstStarted: () => void = () => {};

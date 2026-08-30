@@ -9,16 +9,31 @@
  * live cloud.
  */
 
+import {
+  registerStewardTokenPersistence,
+  STEWARD_SESSION_CHANGE_EVENT,
+  writeStoredStewardToken,
+} from "@elizaos/shared/steward-session-client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { enqueueStewardSessionMutation } from "../cloud/lib/steward-session-mutation-queue";
 import {
   beginStewardSessionRecovery,
   completeStewardSessionRecovery,
   readStewardSessionRecovery,
+  rejectStewardSessionRecovery,
 } from "../cloud/lib/steward-session-recovery-marker";
 import {
   configuredStewardTenantId,
   DEFAULT_STEWARD_TENANT_ID,
 } from "../cloud/shell/steward-config";
+import {
+  loadAgentProfileRegistry,
+  saveAgentProfileRegistry,
+} from "../state/agent-profiles";
+import {
+  loadPersistedActiveServer,
+  savePersistedActiveServer,
+} from "../state/persistence";
 import { ElizaClient } from "./client-base";
 import {
   cloudTokenSecsRemaining,
@@ -94,6 +109,114 @@ describe("getCloudAuthToken (Cloud = Steward everywhere)", () => {
 
     window.removeEventListener("steward-token-sync", listener);
     expect(listener).toHaveBeenCalledTimes(2);
+  });
+
+  it("updates the REST bearer silently during terminal teardown", () => {
+    const listener = vi.fn();
+    window.addEventListener("steward-token-sync", listener);
+    const client = new ElizaClient();
+    client.setToken("client-token");
+    listener.mockClear();
+
+    client.clearTokenSilently();
+
+    window.removeEventListener("steward-token-sync", listener);
+    expect(client.getRestAuthToken()).toBeNull();
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  it("publishes and restores only coherent session-target pairs", () => {
+    const client = new ElizaClient("https://api.eliza.app", "old-token");
+    let finalized = false;
+    const observed: Array<[string, string | null, boolean]> = [];
+    const observe = () => {
+      observed.push([
+        client.getBaseUrl(),
+        client.getRestAuthToken(),
+        finalized,
+      ]);
+    };
+    const offBase = client.onBaseUrlChange(observe);
+    const offAuthority = client.onAuthorityChange(observe);
+
+    const authority = client.installSessionTarget(
+      {
+        baseUrl: "https://00000000-0000-4000-8000-000000000020.cloud.eliza.app",
+        token: "new-token",
+      },
+      {
+        persist: false,
+        finalizeBeforePublish: () => {
+          finalized = true;
+        },
+      },
+    );
+
+    expect(authority).not.toBeNull();
+    expect(observed).toEqual([
+      [
+        "https://00000000-0000-4000-8000-000000000020.cloud.eliza.app",
+        "new-token",
+        true,
+      ],
+      [
+        "https://00000000-0000-4000-8000-000000000020.cloud.eliza.app",
+        "new-token",
+        true,
+      ],
+    ]);
+    observed.length = 0;
+    expect(authority?.restoreIfCurrent()).toBe(true);
+    expect(observed).toEqual([
+      ["https://api.eliza.app", "old-token", true],
+      ["https://api.eliza.app", "old-token", true],
+    ]);
+    offBase();
+    offAuthority();
+  });
+
+  it("restores the predecessor before exposing a failed target finalizer", () => {
+    const client = new ElizaClient("https://api.eliza.app", "old-token");
+    const observed = vi.fn();
+    const offAuthority = client.onAuthorityChange(observed);
+
+    expect(() =>
+      client.installSessionTarget(
+        {
+          baseUrl:
+            "https://00000000-0000-4000-8000-000000000020.cloud.eliza.app",
+          token: "new-token",
+        },
+        {
+          persist: false,
+          finalizeBeforePublish: () => {
+            throw new Error("receipt superseded");
+          },
+        },
+      ),
+    ).toThrow("receipt superseded");
+    expect(client.getBaseUrl()).toBe("https://api.eliza.app");
+    expect(client.getRestAuthToken()).toBe("old-token");
+    expect(observed).not.toHaveBeenCalled();
+    offAuthority();
+  });
+
+  it("does not let an old session-target handle restore across same-value ABA", () => {
+    const client = new ElizaClient("https://api.eliza.app", "old-token");
+    const targetA = {
+      baseUrl: "https://00000000-0000-4000-8000-000000000020.cloud.eliza.app",
+      token: "token-a",
+    };
+    const firstA = client.installSessionTarget(targetA);
+    client.installSessionTarget({
+      baseUrl: "https://00000000-0000-4000-8000-000000000021.cloud.eliza.app",
+      token: "token-b",
+    });
+    client.installSessionTarget(targetA);
+
+    expect(firstA?.restoreIfCurrent()).toBe(false);
+    expect(client.getBaseUrl()).toBe(targetA.baseUrl);
+    expect(client.getRestAuthToken()).toBe(targetA.token);
   });
 
   it("returns null when no token is available anywhere", () => {
@@ -284,6 +407,104 @@ describe("refreshCloudStewardSession (web/fetch branch)", () => {
     expect(result).toEqual({ token: "rotated-jwt", expiresIn: 900 });
   });
 
+  it("holds the origin mutation lease through refreshed-token publication", async () => {
+    const publish = deferred<void>();
+    const order: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ token: "rotated-jwt" }),
+      })),
+    );
+
+    const refresh = refreshCloudStewardSession({
+      commitRefreshedSession: async () => {
+        order.push("refresh-publish-start");
+        await publish.promise;
+        order.push("refresh-publish-end");
+      },
+    });
+    await vi.waitFor(() => expect(order).toEqual(["refresh-publish-start"]));
+    const laterLogin = enqueueStewardSessionMutation(async () => {
+      order.push("later-login");
+    });
+
+    await Promise.resolve();
+    expect(order).toEqual(["refresh-publish-start"]);
+    publish.resolve();
+    await Promise.all([refresh, laterLogin]);
+    expect(order).toEqual([
+      "refresh-publish-start",
+      "refresh-publish-end",
+      "later-login",
+    ]);
+  });
+
+  it("compensates refresh A when login B starts during token persistence", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, "account-a");
+    const persistenceStarted = deferred<void>();
+    const releasePersistence = deferred<void>();
+    const unregisterPersistence = registerStewardTokenPersistence(
+      async (token) => {
+        persistenceStarted.resolve();
+        await releasePersistence.promise;
+        localStorage.setItem(STEWARD_TOKEN_KEY, token);
+        return async () => undefined;
+      },
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ token: "account-a-refreshed" }),
+      })),
+    );
+    const authorityEvents: Event[] = [];
+    const onAuthority = (event: Event) => authorityEvents.push(event);
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, onAuthority);
+    let loginBReceipt:
+      | ReturnType<typeof beginStewardSessionRecovery>
+      | undefined;
+
+    try {
+      const refreshA = refreshCloudStewardSession({
+        commitRefreshedSession: async (session, authority) => {
+          if (session.token) {
+            await writeStoredStewardToken(session.token, {
+              validate: authority.validate,
+            });
+          }
+        },
+      });
+      await persistenceStarted.promise;
+      loginBReceipt = beginStewardSessionRecovery("elizacloud", "provider");
+      releasePersistence.resolve();
+
+      await expect(refreshA).resolves.toBeNull();
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("account-a");
+      expect(authorityEvents).toEqual([]);
+    } finally {
+      if (loginBReceipt) rejectStewardSessionRecovery(loginBReceipt);
+      unregisterPersistence();
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, onAuthority);
+    }
+  });
+
+  it("does not dispatch a passive refresh while a durable login receipt exists", async () => {
+    const receipt = beginStewardSessionRecovery("elizacloud", "provider");
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      await expect(refreshCloudStewardSession()).resolves.toBeNull();
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      rejectStewardSessionRecovery(receipt);
+    }
+  });
+
   it("returns null when the refresh endpoint responds non-OK (no rotated cookie)", async () => {
     vi.stubGlobal(
       "fetch",
@@ -293,6 +514,179 @@ describe("refreshCloudStewardSession (web/fetch branch)", () => {
       endpoint: "https://api.elizacloud.ai/api/v1/auth/steward/refresh",
     });
     expect(result).toBeNull();
+  });
+
+  it("durably clears every bearer mirror on an explicit session_ended refresh", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, "revoked-bridged-token");
+    savePersistedActiveServer({
+      id: "cloud:dedicated-agent",
+      kind: "cloud",
+      label: "Dedicated agent",
+      apiBase: "https://dedicated-agent.example.test",
+      accessToken: "dedicated-bearer",
+    });
+    saveAgentProfileRegistry({
+      version: 1,
+      activeProfileId: "remote-profile",
+      profiles: [
+        {
+          id: "remote-profile",
+          label: "Remote agent",
+          kind: "remote",
+          apiBase: "https://remote-agent.example.test",
+          accessToken: "profile-bearer",
+          createdAt: "2026-08-30T00:00:00.000Z",
+        },
+      ],
+    });
+    const listener = vi.fn();
+    window.addEventListener("steward-token-sync", listener);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: false,
+        status: 401,
+        json: async () => ({ code: "session_ended" }),
+      })),
+    );
+
+    try {
+      await expect(refreshCloudStewardSession()).resolves.toBeNull();
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+      const activeServer = loadPersistedActiveServer();
+      expect(activeServer?.id).toBe("cloud:dedicated-agent");
+      expect(activeServer?.accessToken).toBeUndefined();
+      const [profile] = loadAgentProfileRegistry().profiles;
+      expect(profile?.id).toBe("remote-profile");
+      expect(profile?.accessToken).toBeUndefined();
+      expect(listener).toHaveBeenCalled();
+    } finally {
+      window.removeEventListener("steward-token-sync", listener);
+    }
+  });
+
+  it("clears cookie-only bearer mirrors on an explicit session_ended refresh", async () => {
+    savePersistedActiveServer({
+      id: "cloud:cookie-only-agent",
+      kind: "cloud",
+      label: "Cookie-only agent",
+      apiBase: "https://cookie-only-agent.example.test",
+      accessToken: "dedicated-cookie-only-bearer",
+    });
+    saveAgentProfileRegistry({
+      version: 1,
+      activeProfileId: "cookie-only-profile",
+      profiles: [
+        {
+          id: "cookie-only-profile",
+          label: "Cookie-only profile",
+          kind: "remote",
+          apiBase: "https://cookie-only-profile.example.test",
+          accessToken: "profile-cookie-only-bearer",
+          createdAt: "2026-08-30T00:00:00.000Z",
+        },
+      ],
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: false,
+        status: 401,
+        json: async () => ({ code: "session_ended" }),
+      })),
+    );
+
+    await expect(refreshCloudStewardSession()).resolves.toBeNull();
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(loadPersistedActiveServer()?.accessToken).toBeUndefined();
+    expect(loadAgentProfileRegistry().profiles[0]?.accessToken).toBeUndefined();
+  });
+
+  it("preserves cookie-only account B while its durable receipt supersedes session_ended A", async () => {
+    savePersistedActiveServer({
+      id: "cloud:account-b-agent",
+      kind: "cloud",
+      label: "Account B agent",
+      apiBase: "https://account-b-agent.example.test",
+      accessToken: "account-b-agent-token",
+    });
+    const response = deferred<{
+      ok: boolean;
+      status: number;
+      json: () => Promise<{ code: string }>;
+    }>();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => response.promise),
+    );
+
+    const refreshA = refreshCloudStewardSession();
+    await vi.waitFor(() => expect(globalThis.fetch).toHaveBeenCalledOnce());
+    const loginBReceipt = beginStewardSessionRecovery("elizacloud", "provider");
+    response.resolve({
+      ok: false,
+      status: 401,
+      json: async () => ({ code: "session_ended" }),
+    });
+
+    try {
+      await expect(refreshA).resolves.toBeNull();
+      expect(loadPersistedActiveServer()?.accessToken).toBe(
+        "account-b-agent-token",
+      );
+    } finally {
+      rejectStewardSessionRecovery(loginBReceipt);
+    }
+  });
+
+  it("does not let account A's session_ended response clear a newer account B", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, "account-a");
+    savePersistedActiveServer({
+      id: "cloud:account-b-agent",
+      kind: "cloud",
+      label: "Account B agent",
+      apiBase: "https://account-b-agent.example.test",
+      accessToken: "account-b-agent-token",
+    });
+    const response = deferred<{
+      ok: boolean;
+      status: number;
+      json: () => Promise<{ code: string }>;
+    }>();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => response.promise),
+    );
+
+    const refreshA = refreshCloudStewardSession();
+    await vi.waitFor(() => expect(globalThis.fetch).toHaveBeenCalledOnce());
+    localStorage.setItem(STEWARD_TOKEN_KEY, "account-b");
+    response.resolve({
+      ok: false,
+      status: 401,
+      json: async () => ({ code: "session_ended" }),
+    });
+
+    await expect(refreshA).resolves.toBeNull();
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("account-b");
+    expect(loadPersistedActiveServer()?.accessToken).toBe(
+      "account-b-agent-token",
+    );
+  });
+
+  it("preserves a still-valid local token on a bare invalid_token refresh", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, "still-valid-token");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: false,
+        status: 401,
+        json: async () => ({ code: "invalid_token" }),
+      })),
+    );
+
+    await expect(refreshCloudStewardSession()).resolves.toBeNull();
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("still-valid-token");
   });
 
   it("surfaces a typed transient failure when the caller must preserve auth state", async () => {
@@ -379,6 +773,19 @@ describe("refreshCloudStewardSession timeouts (portable fallback, fake timers)",
   const TIMEOUT_MS = 30_000;
   let originalTimeout: unknown;
 
+  async function waitForMutationAdmission(
+    fetchMock: ReturnType<typeof vi.fn>,
+  ): Promise<void> {
+    // refresh is admitted through both the module-local tail and the shared
+    // test-origin queue before fetch dispatches. Drain only promise jobs here;
+    // advancing fake time before admission would start the 30 s clock late and
+    // weaken the timeout assertion this block exists to prove.
+    for (let turn = 0; turn < 16 && fetchMock.mock.calls.length === 0; turn++) {
+      await Promise.resolve();
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  }
+
   beforeEach(() => {
     // Force the AbortController+setTimeout fallback so fake timers control the
     // timeout deterministically. Native AbortSignal.timeout uses an internal
@@ -436,9 +843,8 @@ describe("refreshCloudStewardSession timeouts (portable fallback, fake timers)",
         settled = true;
       },
     );
-    await Promise.resolve();
+    await waitForMutationAdmission(fetchMock);
     expect(settled).toBe(false);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
     const signal = (fetchMock.mock.calls[0]?.[1] as RequestInit | undefined)
       ?.signal as AbortSignal | undefined;
     expect(signal).toBeInstanceOf(AbortSignal);
@@ -467,6 +873,7 @@ describe("refreshCloudStewardSession timeouts (portable fallback, fake timers)",
     );
     vi.stubGlobal("fetch", fetchMock);
     const pending = refreshCloudStewardSession({ endpoint: ENDPOINT });
+    await waitForMutationAdmission(fetchMock);
     await vi.advanceTimersByTimeAsync(TIMEOUT_MS);
     await expect(pending).resolves.toBeNull();
     expect(vi.getTimerCount()).toBe(0);
@@ -502,7 +909,7 @@ describe("refreshCloudStewardSession timeouts (portable fallback, fake timers)",
     });
 
     // Let the fetch resolve headers (microtask) but json stays pending.
-    await Promise.resolve();
+    await waitForMutationAdmission(fetchMock);
     await Promise.resolve();
     // Still pending before timeout.
     let settled = false;

@@ -113,6 +113,8 @@ export async function syncStewardSessionCookie(
     signal?: AbortSignal;
     verifiedPhone?: string;
     mutationLease?: StewardSessionMutationLease;
+    /** Exact caller authority that must remain live through local publish. */
+    validate?: () => boolean;
   },
 ): Promise<void> {
   if (!options?.mutationLease) {
@@ -151,6 +153,7 @@ export async function syncStewardSessionCookie(
   // (BFCache restoration, cancellation, or unmount). Never publish its token
   // after the caller revokes the owning intent.
   options?.signal?.throwIfAborted();
+  if (options?.validate?.() === false) return;
 
   if (typeof window !== "undefined") {
     // The server cookie is authoritative at this endpoint now. Record this
@@ -163,8 +166,15 @@ export async function syncStewardSessionCookie(
     // the login page already persisted the same token. Canonical storage is
     // idempotent, so both paths publish one authority transition in total.
     options?.signal?.throwIfAborted();
-    await writeStoredStewardToken(token, { signal: options?.signal });
+    await writeStoredStewardToken(token, {
+      signal: options?.signal,
+      validate: options?.validate,
+    });
     options?.signal?.throwIfAborted();
+    if (options?.validate?.() === false || readStoredStewardToken() !== token) {
+      invalidateStewardServerCookieSyncMarker();
+      return;
+    }
     window.dispatchEvent(
       new CustomEvent("steward-token-sync", { detail: { token } }),
     );
@@ -253,7 +263,11 @@ export async function confirmTelegramAccountClaim(
     }
 
     if (typeof window !== "undefined") {
-      await writeStoredStewardToken(token);
+      await writeStoredStewardToken(token, {
+        validate: () =>
+          isStewardSessionRecoveryReceiptLive(recovery) &&
+          readStoredStewardToken() === token,
+      });
       if (
         !isStewardSessionRecoveryReceiptLive(recovery) ||
         readStoredStewardToken() !== token
@@ -560,6 +574,15 @@ export async function recoverStewardEmailSessionViaCookie(
   const timeoutMs = options.timeoutMs ?? EMAIL_SESSION_RECOVERY_TIMEOUT_MS;
   const tenantId = options.tenantId ?? STEWARD_TENANT_ID;
   const deadline = Date.now() + timeoutMs;
+  // This generation belongs to the whole polling operation, not one fetch.
+  // Re-snapshotting after a newer login plants receipt B would adopt B as A's
+  // baseline on the next poll and eventually let A publish under B's intent.
+  const recoverySnapshot = readStewardSessionRecovery(tenantId);
+  if (!recoverySnapshot.storageAvailable) {
+    throw new StewardSessionRecoveryStorageError(
+      "Email session recovery is blocked because durable recovery storage cannot be read.",
+    );
+  }
 
   // One composed controller bounds every network attempt: a caller abort or
   // the recovery deadline must cancel an in-flight fetch, not merely stop the
@@ -573,12 +596,7 @@ export async function recoverStewardEmailSessionViaCookie(
 
   const recoverAttempt = () =>
     enqueueStewardSessionMutation(async (mutationLease) => {
-      const recoverySnapshot = readStewardSessionRecovery(tenantId);
-      if (!recoverySnapshot.storageAvailable) {
-        throw new StewardSessionRecoveryStorageError(
-          "Email session recovery is blocked because durable recovery storage cannot be read.",
-        );
-      }
+      if (!isStewardSessionRecoverySnapshotLive(recoverySnapshot)) return null;
       const session = await refreshStewardSessionViaCookie({
         signal: attempt.signal,
         mutationLease,
@@ -588,10 +606,11 @@ export async function recoverStewardEmailSessionViaCookie(
       if (normalizedEmail(claims?.email) !== expected || !session.token) {
         return null;
       }
-      if (
-        recoverySnapshot.receipts.length > 0 &&
-        !isStewardSessionRecoverySnapshotLive(recoverySnapshot)
-      ) {
+      // Snapshot equality is meaningful even for zero receipts: a login B can
+      // plant its durable intent while refresh A is in flight. The old subset
+      // check passed vacuously for an empty snapshot and let A overwrite B's
+      // pending authority locally.
+      if (!isStewardSessionRecoverySnapshotLive(recoverySnapshot)) {
         return null;
       }
 
@@ -599,14 +618,20 @@ export async function recoverStewardEmailSessionViaCookie(
       // exact ambiguity reconciliation remain inside one origin-wide lease.
       // Callers receive an already-committed outcome and must never write the
       // raw token after this promise resolves.
-      await writeStoredStewardToken(session.token, { signal: attempt.signal });
-      if (attempt.signal.aborted) return null;
+      await writeStoredStewardToken(session.token, {
+        signal: attempt.signal,
+        validate: () => isStewardSessionRecoverySnapshotLive(recoverySnapshot),
+      });
+      if (
+        attempt.signal.aborted ||
+        !isStewardSessionRecoverySnapshotLive(recoverySnapshot)
+      ) {
+        return null;
+      }
       if (typeof window !== "undefined") {
         window.dispatchEvent(new CustomEvent("steward-token-sync"));
       }
-      if (recoverySnapshot.receipts.length > 0) {
-        completeStewardSessionRecoverySnapshot(recoverySnapshot);
-      }
+      completeStewardSessionRecoverySnapshot(recoverySnapshot);
       return session;
     });
 
@@ -619,6 +644,9 @@ export async function recoverStewardEmailSessionViaCookie(
         // session the caller already stopped waiting for.
         if (attempt.signal.aborted || Date.now() >= deadline) return null;
         if (session) return session;
+        if (!isStewardSessionRecoverySnapshotLive(recoverySnapshot)) {
+          return null;
+        }
       } catch (error) {
         // error-policy:J4 a cancelled attempt resolves to the explicit null
         // "not recovered" state and an expected 401 keeps polling until the

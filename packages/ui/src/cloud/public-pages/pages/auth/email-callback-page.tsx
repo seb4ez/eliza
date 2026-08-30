@@ -15,6 +15,13 @@ import {
   readStoredAppAuthorizeReturnTo,
 } from "../../../../cloud-ui/components/auth/authorize-return";
 import { Button } from "../../../../components/primitives";
+import { enqueueStewardSessionMutation } from "../../../lib/steward-session-mutation-queue";
+import {
+  beginStewardSessionRecovery,
+  completeStewardSessionRecovery,
+  isStewardSessionRecoveryReceiptLive,
+  rejectStewardSessionRecovery,
+} from "../../../lib/steward-session-recovery-marker";
 import { useCloudT } from "../../../shell/CloudI18nProvider";
 import {
   LocalStewardAuthContext,
@@ -79,6 +86,7 @@ const pendingEmailVerifications = new Map<
   string,
   Promise<EmailVerificationResult>
 >();
+const pendingEmailSessionCommits = new Map<string, Promise<void>>();
 
 function verifyEmailCallbackSingleFlight(
   verify: (token: string, email: string) => Promise<EmailVerificationResult>,
@@ -101,6 +109,85 @@ function verifyEmailCallbackSingleFlight(
     });
   pendingEmailVerifications.set(key, verification);
   return verification;
+}
+
+function isDefiniteSessionMutationRejection(error: unknown): boolean {
+  const status =
+    error !== null && typeof error === "object" && "status" in error
+      ? Reflect.get(error, "status")
+      : undefined;
+  return (
+    typeof status === "number" &&
+    status >= 400 &&
+    status < 500 &&
+    status !== 408
+  );
+}
+
+/**
+ * StrictMode/provider remounts share the complete one-time-link transaction,
+ * not just its upstream verification. The durable receipt is planted before
+ * the first cookie mutation, and the origin lock remains held through
+ * canonical token publication and exact receipt completion.
+ */
+function commitEmailCallbackSessionSingleFlight(
+  verify: (token: string, email: string) => Promise<EmailVerificationResult>,
+  token: string,
+  email: string,
+): Promise<void> {
+  const key = `${email}\0${token}`;
+  const pending = pendingEmailSessionCommits.get(key);
+  if (pending) return pending;
+
+  const commit = verifyEmailCallbackSingleFlight(verify, token, email)
+    .then(async (result) => {
+      // This synchronous, fail-closed write must precede the cookie POST. If
+      // localStorage is unavailable, the one-time verification may have been
+      // consumed but no browser/server session mutation is dispatched.
+      const recoveryReceipt = beginStewardSessionRecovery(
+        STEWARD_TENANT_ID,
+        "provider",
+      );
+      try {
+        const committed = await enqueueStewardSessionMutation(
+          async (mutationLease) => {
+            if (!isStewardSessionRecoveryReceiptLive(recoveryReceipt)) {
+              return false;
+            }
+            await syncStewardSessionCookie(result.token, result.refreshToken, {
+              mutationLease,
+              validate: () =>
+                isStewardSessionRecoveryReceiptLive(recoveryReceipt),
+            });
+            if (!isStewardSessionRecoveryReceiptLive(recoveryReceipt)) {
+              return false;
+            }
+            completeStewardSessionRecovery(recoveryReceipt);
+            return true;
+          },
+        );
+        if (!committed) {
+          throw new Error(
+            "A newer sign-in superseded this email callback. Restore the latest browser session before continuing.",
+          );
+        }
+      } catch (error) {
+        // A transport error, 5xx, or interrupted continuation cannot prove
+        // that cookies were not committed. Keep the receipt for cookie-first
+        // recovery; only an explicit 4xx rejection retires this exact intent.
+        if (isDefiniteSessionMutationRejection(error)) {
+          rejectStewardSessionRecovery(recoveryReceipt);
+        }
+        throw error;
+      }
+    })
+    .finally(() => {
+      if (pendingEmailSessionCommits.get(key) === commit) {
+        pendingEmailSessionCommits.delete(key);
+      }
+    });
+  pendingEmailSessionCommits.set(key, commit);
+  return commit;
 }
 
 function describeVerificationError(
@@ -219,12 +306,11 @@ function EmailCallbackContent() {
         // The module-level single-flight survives StrictMode/provider remounts;
         // a component-local ref does not, and two concurrent POSTs can consume
         // the same one-time link before either mount observes authentication.
-        const result = await verifyEmailCallbackSingleFlight(
+        await commitEmailCallbackSessionSingleFlight(
           auth.verifyEmailCallback,
           token,
           callbackEmail,
         );
-        await syncStewardSessionCookie(result.token, result.refreshToken);
         finishSuccess();
       } catch (err) {
         // error-policy:J4 expected rejected/expired one-time links render a

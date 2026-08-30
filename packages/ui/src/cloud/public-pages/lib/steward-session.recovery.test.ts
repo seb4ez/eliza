@@ -6,10 +6,18 @@
 // @vitest-environment jsdom
 
 import {
+  registerStewardTokenPersistence,
   registerStewardTokenRemoval,
+  STEWARD_SESSION_CHANGE_EVENT,
   STEWARD_TOKEN_KEY,
+  writeStoredStewardToken,
 } from "@elizaos/shared/steward-session-client";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { enqueueStewardSessionMutation } from "../../lib/steward-session-mutation-queue";
+import {
+  beginStewardSessionRecovery,
+  completeStewardSessionRecovery,
+} from "../../lib/steward-session-recovery-marker";
 import {
   recoverStewardEmailSessionViaCookie,
   recoverStewardSessionViaCookie,
@@ -17,6 +25,35 @@ import {
 } from "./steward-session";
 
 const originalFetch = globalThis.fetch;
+
+function createMemoryStorage(): Storage {
+  const values = new Map<string, string>();
+  return {
+    get length() {
+      return values.size;
+    },
+    clear: () => values.clear(),
+    getItem: (key) => values.get(key) ?? null,
+    key: (index) => [...values.keys()][index] ?? null,
+    removeItem: (key) => {
+      values.delete(key);
+    },
+    setItem: (key, value) => {
+      values.set(key, String(value));
+    },
+  };
+}
+
+let storage: Storage;
+
+beforeEach(() => {
+  storage = createMemoryStorage();
+  vi.stubGlobal("localStorage", storage);
+  Object.defineProperty(window, "localStorage", {
+    configurable: true,
+    value: storage,
+  });
+});
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -33,10 +70,19 @@ function tokenForEmail(email: string): string {
   return `header.${payload}.signature`;
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
 describe("recoverStewardEmailSessionViaCookie", () => {
   afterEach(() => {
     globalThis.fetch = originalFetch;
-    window.localStorage.clear();
+    storage.clear();
+    vi.unstubAllGlobals();
     vi.useRealTimers();
   });
 
@@ -119,6 +165,7 @@ describe("recoverStewardEmailSessionViaCookie", () => {
       timeoutMs: 10_000,
     });
 
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
     controller.abort();
 
     await expect(recovery).resolves.toBeNull();
@@ -189,6 +236,7 @@ describe("recoverStewardEmailSessionViaCookie", () => {
       timeoutMs: 10_000,
     });
 
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
     controller.abort();
     releaseFetch?.(
       jsonResponse({ ok: true, token: tokenForEmail("person@example.com") }),
@@ -216,12 +264,98 @@ describe("recoverStewardEmailSessionViaCookie", () => {
     await expect(recovery).resolves.toEqual({ ok: true, token: expectedToken });
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
+
+  it("never writes or announces recovery A when login B starts during its refresh", async () => {
+    const accountA = tokenForEmail("person@example.com");
+    const accountB = tokenForEmail("other@example.com");
+    const serverRefresh = deferred<Response>();
+    const fetchMock = vi.fn(() => serverRefresh.promise);
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const tokenWrites = vi.spyOn(storage, "setItem");
+    const syncEvents: Event[] = [];
+    const onSync = (event: Event) => syncEvents.push(event);
+    window.addEventListener("steward-token-sync", onSync);
+
+    const recoveryA = recoverStewardEmailSessionViaCookie(
+      "person@example.com",
+      { intervalMs: 10_000, timeoutMs: 20_000 },
+    );
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+
+    const loginBReceipt = beginStewardSessionRecovery("elizacloud", "provider");
+    const loginB = enqueueStewardSessionMutation(async () => {
+      await writeStoredStewardToken(accountB);
+      completeStewardSessionRecovery(loginBReceipt);
+    });
+
+    serverRefresh.resolve(jsonResponse({ ok: true, token: accountA }));
+    await loginB;
+    try {
+      await expect(recoveryA).resolves.toBeNull();
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(tokenWrites).not.toHaveBeenCalledWith(STEWARD_TOKEN_KEY, accountA);
+      expect(syncEvents).toEqual([]);
+      expect(storage.getItem(STEWARD_TOKEN_KEY)).toBe(accountB);
+    } finally {
+      window.removeEventListener("steward-token-sync", onSync);
+    }
+  });
+
+  it("compensates recovery A when login B starts during durable token persistence", async () => {
+    const accountA = tokenForEmail("person@example.com");
+    const persistenceStarted = deferred<void>();
+    const releasePersistence = deferred<void>();
+    const unregisterPersistence = registerStewardTokenPersistence(
+      async (token) => {
+        if (token === accountA) {
+          persistenceStarted.resolve();
+          await releasePersistence.promise;
+        }
+        storage.setItem(STEWARD_TOKEN_KEY, token);
+        return async () => undefined;
+      },
+    );
+    globalThis.fetch = vi.fn(async () =>
+      jsonResponse({ ok: true, token: accountA }),
+    ) as unknown as typeof fetch;
+    const authorityEvents: Event[] = [];
+    const syncEvents: Event[] = [];
+    const onAuthority = (event: Event) => authorityEvents.push(event);
+    const onSync = (event: Event) => syncEvents.push(event);
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, onAuthority);
+    window.addEventListener("steward-token-sync", onSync);
+
+    let loginBReceipt:
+      | ReturnType<typeof beginStewardSessionRecovery>
+      | undefined;
+    try {
+      const recoveryA = recoverStewardEmailSessionViaCookie(
+        "person@example.com",
+        { intervalMs: 10_000, timeoutMs: 20_000 },
+      );
+      await persistenceStarted.promise;
+
+      loginBReceipt = beginStewardSessionRecovery("elizacloud", "provider");
+      releasePersistence.resolve();
+
+      await expect(recoveryA).resolves.toBeNull();
+      expect(storage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+      expect(authorityEvents).toEqual([]);
+      expect(syncEvents).toEqual([]);
+    } finally {
+      if (loginBReceipt) completeStewardSessionRecovery(loginBReceipt);
+      unregisterPersistence();
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, onAuthority);
+      window.removeEventListener("steward-token-sync", onSync);
+    }
+  });
 });
 
 describe("recoverStewardSessionViaCookie", () => {
   afterEach(() => {
     globalThis.fetch = originalFetch;
-    window.localStorage.clear();
+    storage.clear();
+    vi.unstubAllGlobals();
     vi.useRealTimers();
   });
 
@@ -313,6 +447,31 @@ describe("recoverStewardSessionViaCookie", () => {
       credentials: "include",
       headers: expect.objectContaining({ "X-Eliza-CSRF": "1" }),
     });
+  });
+
+  it("preserves the browser token while an ambiguity receipt is reconciled", async () => {
+    const rejected = () =>
+      jsonResponse(
+        { error: "Refresh token rejected", code: "missing_token" },
+        401,
+      );
+    const fetchMock = vi.fn(
+      async (_input: RequestInfo | URL, _init?: RequestInit) => rejected(),
+    );
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    window.localStorage.setItem(STEWARD_TOKEN_KEY, "previous-account-token");
+
+    await expect(
+      recoverStewardSessionViaCookie({ rejectedSession: "preserve" }),
+    ).resolves.toBeNull();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(
+      fetchMock.mock.calls.every(([, init]) => init?.method === "POST"),
+    ).toBe(true);
+    expect(window.localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(
+      "previous-account-token",
+    );
   });
 
   it("finishes durable token removal when lifecycle aborts after DELETE dispatch", async () => {
@@ -408,6 +567,7 @@ describe("recoverStewardSessionViaCookie", () => {
 describe("refreshStewardSessionViaCookie", () => {
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    vi.unstubAllGlobals();
   });
 
   it("still exposes a rejected token as a typed failure to non-recovery callers", async () => {

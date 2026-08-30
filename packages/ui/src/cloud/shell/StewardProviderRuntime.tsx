@@ -335,7 +335,22 @@ function AuthTokenSync({
               ) {
                 return;
               }
-              await writeStoredStewardToken(body.token);
+              const refreshedTokenStillOwnsAuthority = () => {
+                const currentToken = readStoredToken();
+                return (
+                  !hasStewardSessionRecovery(tenantId) &&
+                  (currentToken === token || currentToken === body.token)
+                );
+              };
+              await writeStoredStewardToken(body.token, {
+                validate: refreshedTokenStillOwnsAuthority,
+              });
+              if (
+                !refreshedTokenStillOwnsAuthority() ||
+                readStoredToken() !== body.token
+              ) {
+                return;
+              }
               lastSyncedToken.current = body.token;
               wasAuthenticated.current = true;
             }

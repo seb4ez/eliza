@@ -381,6 +381,15 @@ describe("StewardLoginSection email magic-link companion code", () => {
     fireEvent(window, historyRestore);
 
     expect(commitSignal.aborted).toBe(true);
+    // Recovery is itself a cookie mutation and must wait for the ambiguously
+    // committed POST to settle. Abort cannot prove that the server ignored the
+    // request, so dispatching refresh before this continuation releases the
+    // shared lease would reintroduce the account A/B ordering race.
+    expect(sessionSpies.recover).not.toHaveBeenCalled();
+    await act(async () => {
+      finishSessionSync?.();
+      await Promise.resolve();
+    });
     await waitFor(() => expect(sessionSpies.recover).toHaveBeenCalledOnce());
     expect(
       sessionSpies.sync.mock.calls.some(
@@ -393,10 +402,6 @@ describe("StewardLoginSection email magic-link companion code", () => {
       ),
     );
 
-    await act(async () => {
-      finishSessionSync?.();
-      await Promise.resolve();
-    });
     expect(
       sessionSpies.sync.mock.calls.some(
         ([token]) => token === "previous-account-token",
@@ -437,10 +442,12 @@ describe("StewardLoginSection email magic-link companion code", () => {
 
   it("binds consumed-link recovery to the challenged email", async () => {
     emailLoginSpies.poll.mockResolvedValue("consumed");
-    let finishRecovery: ((value: { ok: true }) => void) | undefined;
+    let finishRecovery:
+      | ((value: { ok: true; token?: string }) => void)
+      | undefined;
     sessionSpies.recoverEmail.mockImplementation(
       () =>
-        new Promise<{ ok: true }>((resolve) => {
+        new Promise<{ ok: true; token?: string }>((resolve) => {
           finishRecovery = resolve;
         }),
     );
@@ -458,7 +465,7 @@ describe("StewardLoginSection email magic-link companion code", () => {
     expect(screen.getByLabelText("Six-digit code")).toBeTruthy();
 
     await act(async () => {
-      finishRecovery?.({ ok: true });
+      finishRecovery?.({ ok: true, token: "must-not-publish-after-poll" });
     });
 
     expect(await screen.findByText("Signed in")).toBeTruthy();
@@ -469,6 +476,9 @@ describe("StewardLoginSection email magic-link companion code", () => {
     ).toBeTruthy();
     expect(sessionSpies.recoverEmail).toHaveBeenCalledOnce();
     expect(sessionSpies.sync).not.toHaveBeenCalled();
+    expect(localStorage.getItem("steward_session_token")).not.toBe(
+      "must-not-publish-after-poll",
+    );
     expect(screen.queryByLabelText("Six-digit code")).toBeNull();
   });
 
@@ -595,10 +605,12 @@ describe("StewardLoginSection email magic-link companion code", () => {
   });
 
   it("keeps the waiting form live until advisory recovery is account-bound", async () => {
-    let finishRecovery: ((value: { ok: true }) => void) | undefined;
+    let finishRecovery:
+      | ((value: { ok: true; token?: string }) => void)
+      | undefined;
     sessionSpies.recoverEmail.mockImplementation(
       () =>
-        new Promise<{ ok: true }>((resolve) => {
+        new Promise<{ ok: true; token?: string }>((resolve) => {
           finishRecovery = resolve;
         }),
     );
@@ -619,11 +631,17 @@ describe("StewardLoginSection email magic-link companion code", () => {
     expect(screen.getByLabelText("Six-digit code")).toBeTruthy();
 
     await act(async () => {
-      finishRecovery?.({ ok: true });
+      finishRecovery?.({
+        ok: true,
+        token: "must-not-publish-after-broadcast",
+      });
     });
 
     expect(await screen.findByText("Signed in")).toBeTruthy();
     expect(sessionSpies.recoverEmail).toHaveBeenCalledOnce();
+    expect(localStorage.getItem("steward_session_token")).not.toBe(
+      "must-not-publish-after-broadcast",
+    );
   });
 
   it("shows expired and replay guidance for a rejected code", async () => {

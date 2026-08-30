@@ -27,6 +27,10 @@ import {
 } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  completeStewardSessionRecoverySnapshot,
+  readStewardSessionRecovery,
+} from "../../../lib/steward-session-recovery-marker";
 
 const harness = vi.hoisted(() => {
   const providerDeferreds: Promise<unknown>[] = [];
@@ -224,11 +228,19 @@ describe("StewardLoginSection — session-cached provider fast path (#18256)", (
     harness.hasCallback = false;
     harness.code = null;
     harness.useSdkLikeCache = false;
+    completeStewardSessionRecoverySnapshot(
+      readStewardSessionRecovery("elizacloud"),
+    );
+    window.localStorage.clear();
     window.sessionStorage.clear();
   });
 
   afterEach(() => {
     cleanup();
+    completeStewardSessionRecoverySnapshot(
+      readStewardSessionRecovery("elizacloud"),
+    );
+    window.localStorage.clear();
     window.sessionStorage.clear();
     vi.clearAllMocks();
   });

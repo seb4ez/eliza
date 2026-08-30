@@ -11,15 +11,15 @@ import {
 } from "@elizaos/shared/steward-session-client";
 import { createContext } from "react";
 import { client } from "../../api";
-import {
-  removeManagedSharedCloudAgentProfiles,
-  scrubPersistedAgentProfileTokens,
-} from "../../state/agent-profiles";
-import { scrubPersistedActiveServerToken } from "../../state/persistence";
-import { clearSharedCloudAccountBinding } from "../../state/shared-cloud-account-binding";
+import { clearManagedSharedCloudProfilesAndTokensDurably } from "../../state/agent-profiles";
+import { clearSharedOrScrubActiveServerTokenDurably } from "../../state/persistence";
 import { clearElizaApiToken } from "../../utils/eliza-globals";
 import { decodeJwtPayload } from "../lib/jwt";
 import { invalidateStewardServerCookieSyncMarker } from "../lib/steward-session-cookie-sync-marker";
+import {
+  enqueueStewardSessionMutation,
+  type StewardSessionMutationLease,
+} from "../lib/steward-session-mutation-queue";
 import { ELIZA_CLOUD_DIRECT_API_BY_HOST } from "./steward-url";
 
 export function isPlaceholderValue(value: string | undefined): boolean {
@@ -123,19 +123,51 @@ function stewardSessionClearUrls(): string[] {
   return [...urls];
 }
 
-export function clearServerStewardSessionCookies(): void {
+const STEWARD_COOKIE_CLEAR_TIMEOUT_MS = 10_000;
+
+async function clearStewardSessionCookieAt(url: string): Promise<void> {
+  const controller = new AbortController();
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<void>((resolve) => {
+    timeout = setTimeout(() => {
+      controller.abort();
+      resolve();
+    }, STEWARD_COOKIE_CLEAR_TIMEOUT_MS);
+  });
+  // Attach both handlers before racing so an adapter which ignores abort can
+  // settle later without producing an unhandled rejection. The timeout itself
+  // remains the authority that releases the origin-wide mutation lease.
+  const requestSettled = fetch(url, {
+    method: "DELETE",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    signal: controller.signal,
+  }).then(
+    () => undefined,
+    () => undefined,
+  );
+  try {
+    await Promise.race([requestSettled, timedOut]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+}
+
+export async function clearServerStewardSessionCookies(
+  mutationLease?: StewardSessionMutationLease,
+): Promise<void> {
+  if (!mutationLease) {
+    return enqueueStewardSessionMutation((lease) =>
+      clearServerStewardSessionCookies(lease),
+    );
+  }
   // Invalidate before issuing any best-effort DELETE: a rejected request must
   // never leave a proof that can suppress a later session-establishing POST.
   invalidateStewardServerCookieSyncMarker();
-  for (const url of stewardSessionClearUrls()) {
-    // error-policy:J6 best-effort sign-out cookie clear across session hosts;
-    // the local token is already cleared and an expired cookie self-heals.
-    fetch(url, {
-      method: "DELETE",
-      credentials: "include",
-      headers: { "Content-Type": "application/json" },
-    }).catch(() => undefined);
-  }
+  // Hosts are independent and this is best-effort teardown after canonical
+  // credential invalidation. Bound them concurrently so one stalled adapter
+  // cannot strand every later login/refresh behind the origin mutation lease.
+  await Promise.all(stewardSessionClearUrls().map(clearStewardSessionCookieAt));
 }
 
 export function readStoredToken(): string | null {
@@ -167,15 +199,35 @@ export function tokenSecsRemaining(token: string): number | null {
   return payload.exp - Date.now() / 1000;
 }
 
-export async function clearStaleStewardSession(): Promise<void> {
-  if (typeof window === "undefined") return;
-  // This is deliberately before protected-storage removal. That operation can
-  // reject and abort the rest of teardown, but an attempted session clear must
-  // still retire any unconsumed proof from the previous authority epoch.
-  invalidateStewardServerCookieSyncMarker();
+export async function clearStaleStewardSession(
+  mutationLease?: StewardSessionMutationLease,
+  authority?: {
+    expectedToken: string | null;
+    validate: () => boolean;
+  },
+): Promise<boolean> {
+  if (typeof window === "undefined") return false;
+  if (!mutationLease) {
+    return enqueueStewardSessionMutation((lease) =>
+      clearStaleStewardSession(lease, authority),
+    );
+  }
+  if (authority?.validate() === false) return false;
+  // Unconditional sign-out retires its module-local proof before fallible
+  // storage. A terminal-response clear waits for exact CAS success so a stale
+  // A response cannot invalidate account B's newer cookie-sync proof.
+  if (!authority) invalidateStewardServerCookieSyncMarker();
   let storedTokenClearError: unknown;
   try {
-    await clearStoredStewardToken();
+    const cleared = await clearStoredStewardToken(
+      authority
+        ? {
+            expectedToken: authority.expectedToken,
+            validate: authority.validate,
+          }
+        : undefined,
+    );
+    if (!cleared) return false;
   } catch (error) {
     if (error instanceof StewardTokenRemovalError) throw error;
     // error-policy:J2 canonical invalidation may already have succeeded before
@@ -183,38 +235,44 @@ export async function clearStaleStewardSession(): Promise<void> {
     // then rethrow the original storage error with its stack intact.
     storedTokenClearError = error;
   }
+  if (authority) invalidateStewardServerCookieSyncMarker();
   // `ElizaClient` mirrors its live bearer into boot config, while native and
   // desktop hosts can independently inject the same owner key through the
   // window-scoped API token. Both are canonical request-authority sources and
   // must end in the same teardown transaction as the Steward JWT. Clearing
   // only persisted profiles would leave the running renderer authenticated
   // until reload (and native Cloud calls could keep using the injected key).
-  client.setToken(null);
+  client.clearTokenSilently();
   clearElizaApiToken();
-  // Every shared-agent profile belongs to the ending Steward account, even
-  // when a dedicated or self-hosted target happens to be active at sign-out.
-  removeManagedSharedCloudAgentProfiles();
   // SECURITY: also scrub the persisted accessToken mirrors so the secondary
   // sign-out / 401-self-heal paths that route through here (native apps-studio
   // signOut, the authorize-content edge, StewardProviderRuntime 401 clears) don't
-  // leave a usable cloud bearer/API-key at rest in localStorage.
-  if (clearSharedCloudAccountBinding()) {
-    // Shared runtime authorization is the Steward account itself. Once that
-    // account session ends, retaining its selected agent id can bind the next
-    // login to an agent outside the newly authenticated organization. Remove
-    // the selection so the normal post-login flow resolves the current
-    // account's organization-scoped agent list before mounting chat.
-  } else {
-    // Dedicated/self-hosted targets have an independent agent-local recovery
-    // path, so preserve their selection while removing the rejected bearer.
-    scrubPersistedActiveServerToken();
-  }
-  scrubPersistedAgentProfileTokens();
-  clearServerStewardSessionCookies();
-  try {
-    window.dispatchEvent(new CustomEvent("steward-token-sync"));
-  } catch {
-    // error-policy:J6 best-effort sync notification after credentials are scrubbed.
+  // leave a usable cloud bearer/API-key at rest in protected host storage.
+  // These awaited helpers publish only after the native/desktop authority has
+  // durably acknowledged each rewrite; the legacy synchronous facades are
+  // deliberately only optimistic on those hosts.
+  const terminalStorageOptions = authority
+    ? {
+        // A is already terminal. If B starts while an awaited scrub settles,
+        // keep A absent instead of compensating the revoked bearer back in.
+        compensateOnValidationFailure: false,
+      }
+    : undefined;
+  // Each helper snapshots its record once and performs one exact host CAS.
+  // Shared selections are deleted while dedicated/self-hosted selections are
+  // retained without their rejected bearer; profiles use one combined
+  // remove-shared-and-scrub-retained transform. A lost CAS never falls through
+  // to a second read that could target account B.
+  await clearSharedOrScrubActiveServerTokenDurably(terminalStorageOptions);
+  await clearManagedSharedCloudProfilesAndTokensDurably(terminalStorageOptions);
+  await clearServerStewardSessionCookies(mutationLease);
+  if (authority?.validate() !== false) {
+    try {
+      window.dispatchEvent(new CustomEvent("steward-token-sync"));
+    } catch {
+      // error-policy:J6 best-effort sync notification after credentials are scrubbed.
+    }
   }
   if (storedTokenClearError !== undefined) throw storedTokenClearError;
+  return true;
 }

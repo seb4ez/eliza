@@ -15,6 +15,7 @@ import {
 } from "../lib/steward-session-cookie-sync-marker";
 import {
   beginStewardSessionLogout,
+  beginStewardSessionRecovery,
   completeStewardSessionLogout,
   readStewardSessionLogoutIntents,
   readStewardSessionRecovery,
@@ -466,6 +467,36 @@ describe("performSsoExchange", () => {
     responseBody.resolve({ ok: true, token: liveToken() });
     await expect(exchange).resolves.toEqual({ ok: true });
     expect(readStewardSessionRecovery("elizacloud").receipts).toHaveLength(0);
+  });
+
+  it("never publishes exchange A when login B starts during the cookie POST", async () => {
+    const tokenA = liveToken();
+    const cookieResponse = deferred<Response>();
+    const calls: FetchCall[] = [];
+    const fn = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (url.includes("/sso-bridge/exchange")) {
+        return Promise.resolve(json(200, { ok: true, token: tokenA }));
+      }
+      return cookieResponse.promise;
+    }) as typeof fetch;
+
+    const exchangeA = performSsoExchange(CODE, VERIFIER, "cloud.eliza.app", fn);
+    await vi.waitFor(() => expect(calls).toHaveLength(2));
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+
+    const recoveryB = beginStewardSessionRecovery("elizacloud", "provider");
+    cookieResponse.resolve(json(200, { ok: true }));
+
+    await expect(exchangeA).resolves.toEqual({
+      ok: false,
+      error: "SSO exchange was superseded",
+    });
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(readStewardSessionRecovery("elizacloud").receipts).toContain(
+      recoveryB.receipt,
+    );
   });
 
   it("establishes bridged auth without sending or consuming a Telegram claim", async () => {
