@@ -8,6 +8,7 @@ import {
   exchangeStewardCode,
   hasStewardAuthedCookie,
   readStoredStewardToken,
+  registerStewardTokenCompareAndRestore,
   registerStewardTokenPersistence,
   registerStewardTokenRemoval,
   replaceStoredStewardTokenIfCurrent,
@@ -29,6 +30,34 @@ function jsonResponse(body: unknown, status = 200): Response {
     status,
     headers: { "content-type": "application/json" },
   });
+}
+
+function installLocalStorageOverride(
+  overrides: Partial<
+    Pick<Storage, "clear" | "getItem" | "key" | "removeItem" | "setItem">
+  >,
+): () => void {
+  const original = window.localStorage;
+  const replacement = {
+    clear: overrides.clear ?? original.clear.bind(original),
+    getItem: overrides.getItem ?? original.getItem.bind(original),
+    key: overrides.key ?? original.key.bind(original),
+    get length() {
+      return original.length;
+    },
+    removeItem: overrides.removeItem ?? original.removeItem.bind(original),
+    setItem: overrides.setItem ?? original.setItem.bind(original),
+  } satisfies Storage;
+  Object.defineProperty(window, "localStorage", {
+    configurable: true,
+    value: replacement,
+  });
+  return () => {
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      value: original,
+    });
+  };
 }
 
 describe("Steward session client CSRF marker header", () => {
@@ -197,6 +226,139 @@ describe("Steward session storage transitions", () => {
     }
   });
 
+  it("restores the exact previous token and scope when scope publication fails after durable persistence", async () => {
+    setLocalCloudTarget("https://api.eliza.app");
+    await writeStoredStewardToken("production-token");
+    setLocalCloudTarget("https://api-staging.eliza.app");
+    const commit = vi.fn(async () => undefined);
+    const unregister = registerStewardTokenPersistence(async (token) => {
+      window.localStorage.setItem(STEWARD_TOKEN_KEY, token);
+      return commit;
+    });
+    const originalStorage = window.localStorage;
+    let rejectedNewScope = false;
+    const failingStorage = {
+      clear: originalStorage.clear.bind(originalStorage),
+      getItem: originalStorage.getItem.bind(originalStorage),
+      key: originalStorage.key.bind(originalStorage),
+      get length() {
+        return originalStorage.length;
+      },
+      removeItem: originalStorage.removeItem.bind(originalStorage),
+      setItem(key: string, value: string) {
+        if (
+          key === STEWARD_TOKEN_SCOPE_KEY &&
+          value === "eliza-cloud:staging" &&
+          !rejectedNewScope
+        ) {
+          rejectedNewScope = true;
+          originalStorage.setItem(key, value);
+          throw new Error("scope storage unavailable");
+        }
+        originalStorage.setItem(key, value);
+      },
+    } satisfies Storage;
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      value: failingStorage,
+    });
+    const transitions: StewardSessionChangeDetail[] = [];
+    const listener = (event: Event) => {
+      transitions.push(
+        (event as CustomEvent<StewardSessionChangeDetail>).detail,
+      );
+    };
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+
+    try {
+      await expect(
+        writeStoredStewardToken("staging-token"),
+      ).rejects.toMatchObject({ name: "StewardTokenPersistenceError" });
+    } finally {
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+      Object.defineProperty(window, "localStorage", {
+        configurable: true,
+        value: originalStorage,
+      });
+      unregister();
+    }
+
+    expect(commit).not.toHaveBeenCalled();
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("production-token");
+    expect(localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY)).toBe(
+      "eliza-cloud:production",
+    );
+    expect(readStoredStewardToken()).toBeNull();
+    expect(transitions).toEqual([]);
+  });
+
+  it("preserves a newer renderer token and scope when the failed writer loses its rollback CAS", async () => {
+    setLocalCloudTarget("https://api.eliza.app");
+    await writeStoredStewardToken("production-token");
+    setLocalCloudTarget("https://api-staging.eliza.app");
+    const unregisterPersistence = registerStewardTokenPersistence(
+      async (token) => {
+        window.localStorage.setItem(STEWARD_TOKEN_KEY, token);
+      },
+    );
+    const unregisterCompare = registerStewardTokenCompareAndRestore(
+      async () => {
+        // Renderer B wins while A is unwinding its failed scope publication.
+        window.localStorage.setItem(STEWARD_TOKEN_KEY, "newer-token-b");
+        window.localStorage.setItem(
+          STEWARD_TOKEN_SCOPE_KEY,
+          "eliza-cloud:staging",
+        );
+        return false;
+      },
+    );
+    const originalStorage = window.localStorage;
+    let rejectedAttemptScope = false;
+    const failingStorage = {
+      clear: originalStorage.clear.bind(originalStorage),
+      getItem: originalStorage.getItem.bind(originalStorage),
+      key: originalStorage.key.bind(originalStorage),
+      get length() {
+        return originalStorage.length;
+      },
+      removeItem: originalStorage.removeItem.bind(originalStorage),
+      setItem(key: string, value: string) {
+        if (
+          key === STEWARD_TOKEN_SCOPE_KEY &&
+          value === "eliza-cloud:staging" &&
+          !rejectedAttemptScope
+        ) {
+          rejectedAttemptScope = true;
+          originalStorage.setItem(key, value);
+          throw new Error("scope storage unavailable");
+        }
+        originalStorage.setItem(key, value);
+      },
+    } satisfies Storage;
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      value: failingStorage,
+    });
+
+    try {
+      await expect(writeStoredStewardToken("attempt-token-a")).rejects.toMatchObject(
+        { name: "StewardTokenPersistenceError" },
+      );
+    } finally {
+      Object.defineProperty(window, "localStorage", {
+        configurable: true,
+        value: originalStorage,
+      });
+      unregisterCompare();
+      unregisterPersistence();
+    }
+
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("newer-token-b");
+    expect(localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY)).toBe(
+      "eliza-cloud:staging",
+    );
+  });
+
   it("publishes ordered typed transitions after canonical writes and clears", async () => {
     const transitions: StewardSessionChangeDetail[] = [];
     const listener = (event: Event) => {
@@ -273,13 +435,13 @@ describe("Steward session storage transitions", () => {
     localStorage.setItem(STEWARD_TOKEN_KEY, "steward-token");
     localStorage.setItem(STEWARD_REFRESH_TOKEN_KEY, "legacy-refresh-token");
     const storageFailure = new Error("legacy refresh storage unavailable");
-    const originalRemoveItem = Storage.prototype.removeItem;
-    const removeItem = vi
-      .spyOn(Storage.prototype, "removeItem")
-      .mockImplementation(function (this: Storage, key: string) {
+    const originalStorage = window.localStorage;
+    const restoreStorage = installLocalStorageOverride({
+      removeItem(key) {
         if (key === STEWARD_REFRESH_TOKEN_KEY) throw storageFailure;
-        return Reflect.apply(originalRemoveItem, this, [key]);
-      });
+        originalStorage.removeItem(key);
+      },
+    });
     const transitions: StewardSessionChangeDetail[] = [];
     const listener = (event: Event) => {
       transitions.push(
@@ -292,7 +454,7 @@ describe("Steward session storage transitions", () => {
       await expect(clearStoredStewardToken()).rejects.toThrow(storageFailure);
     } finally {
       window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
-      removeItem.mockRestore();
+      restoreStorage();
     }
 
     expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
@@ -311,11 +473,11 @@ describe("Steward session storage transitions", () => {
       );
     };
     window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
-    const setItem = vi
-      .spyOn(Storage.prototype, "setItem")
-      .mockImplementation(() => {
+    const restoreSetFailure = installLocalStorageOverride({
+      setItem() {
         throw storageFailure;
-      });
+      },
+    });
 
     try {
       await expect(
@@ -326,14 +488,14 @@ describe("Steward session storage transitions", () => {
         cause: storageFailure,
       });
     } finally {
-      setItem.mockRestore();
+      restoreSetFailure();
     }
 
-    const removeItem = vi
-      .spyOn(Storage.prototype, "removeItem")
-      .mockImplementation(() => {
+    const restoreRemoveFailure = installLocalStorageOverride({
+      removeItem() {
         throw storageFailure;
-      });
+      },
+    });
     try {
       await expect(clearStoredStewardToken()).rejects.toMatchObject({
         name: "StewardTokenRemovalError",
@@ -341,7 +503,7 @@ describe("Steward session storage transitions", () => {
         cause: storageFailure,
       });
     } finally {
-      removeItem.mockRestore();
+      restoreRemoveFailure();
       window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
     }
 
@@ -353,7 +515,15 @@ describe("Steward session storage transitions", () => {
     const persistence = new Promise<void>((resolve) => {
       releasePersistence = resolve;
     });
-    const unregister = registerStewardTokenPersistence(() => persistence);
+    let releaseCommit: () => void = () => {};
+    const commitWait = new Promise<void>((resolve) => {
+      releaseCommit = resolve;
+    });
+    const commit = vi.fn(() => commitWait);
+    const unregister = registerStewardTokenPersistence(async () => {
+      await persistence;
+      return commit;
+    });
     const transitions: StewardSessionChangeDetail[] = [];
     const listener = (event: Event) => {
       transitions.push(
@@ -367,6 +537,9 @@ describe("Steward session storage transitions", () => {
       await Promise.resolve();
       expect(transitions).toEqual([]);
       releasePersistence();
+      await vi.waitFor(() => expect(commit).toHaveBeenCalledOnce());
+      expect(transitions).toEqual([]);
+      releaseCommit();
       await write;
       expect(transitions.map(({ state }) => state)).toEqual(["present"]);
     } finally {
@@ -389,11 +562,13 @@ describe("Steward session storage transitions", () => {
       const persistenceWait = new Promise<void>((resolve) => {
         releasePersistence = resolve;
       });
+      const commit = vi.fn(async () => undefined);
       const unregisterPersistence = registerStewardTokenPersistence(
         async (token) => {
           markPersistenceStarted();
           await persistenceWait;
           localStorage.setItem(STEWARD_TOKEN_KEY, token);
+          return commit;
         },
       );
       const transitions: StewardSessionChangeDetail[] = [];
@@ -414,6 +589,7 @@ describe("Steward session storage transitions", () => {
         releasePersistence();
 
         await expect(write).rejects.toMatchObject({ name: "AbortError" });
+        expect(commit).not.toHaveBeenCalled();
         expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(previousToken);
         expect(transitions).toEqual([]);
       } finally {
@@ -545,16 +721,16 @@ describe("Steward session storage transitions", () => {
 
   it("does not disguise a failed canonical read as a missing session", () => {
     const storageFailure = new Error("canonical storage unavailable");
-    const getItem = vi
-      .spyOn(Storage.prototype, "getItem")
-      .mockImplementation(() => {
+    const restoreStorage = installLocalStorageOverride({
+      getItem() {
         throw storageFailure;
-      });
+      },
+    });
 
     try {
       expect(() => readStoredStewardToken()).toThrow(storageFailure);
     } finally {
-      getItem.mockRestore();
+      restoreStorage();
     }
   });
 });

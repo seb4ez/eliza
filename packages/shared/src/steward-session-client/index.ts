@@ -44,7 +44,10 @@ let sessionEpoch = 0;
 let stewardTokenMutationTail: Promise<void> = Promise.resolve();
 
 type StewardTokenRemoval = () => Promise<void>;
-type StewardTokenPersistence = (token: string) => Promise<void>;
+type StewardTokenPersistenceCommit = () => Promise<void>;
+type StewardTokenPersistence = (
+  token: string,
+) => Promise<void> | Promise<StewardTokenPersistenceCommit>;
 type StewardTokenCompareAndRestore = (
   expectedToken: string,
   restoreToken: string | null,
@@ -412,25 +415,81 @@ export function readStoredStewardToken(): string | null {
 async function persistStoredStewardToken(
   token: string,
   requiredScope: string | null,
-): Promise<void> {
+  previousToken: string | null,
+  previousScope: string | null,
+): Promise<StewardTokenPersistenceCommit | null> {
+  let tokenPersisted = false;
   try {
+    let commit: StewardTokenPersistenceCommit | null = null;
     if (stewardTokenPersistence) {
-      await stewardTokenPersistence(token);
+      commit = (await stewardTokenPersistence(token)) ?? null;
     } else {
       window.localStorage.setItem(STEWARD_TOKEN_KEY, token);
     }
+    tokenPersisted = true;
     // Publish the scope only after the new token is durable. During an awaited
     // protected-store write, the previous scope therefore keeps both the old
     // token and any early secure-store mirror of the new token quarantined.
-    // If this write fails, the previous scope remains intact and the newly
-    // persisted token stays unreadable rather than inheriting false authority.
+    // If this write fails after the token became durable, the catch path below
+    // rolls both token and scope back before returning the failure; the commit
+    // closure remains deliberately unacknowledged.
     if (
       requiredScope &&
       window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY) !== requiredScope
     ) {
       window.localStorage.setItem(STEWARD_TOKEN_SCOPE_KEY, requiredScope);
     }
+    return commit;
   } catch (error) {
+    if (tokenPersisted) {
+      const rollbackFailures: unknown[] = [];
+      let tokenRestored = false;
+      try {
+        tokenRestored = await compareAndRestoreStoredStewardToken(
+          token,
+          previousToken,
+        );
+        if (!tokenRestored) {
+          rollbackFailures.push(
+            new Error("Protected Steward token rollback lost authority."),
+          );
+        }
+      } catch (rollbackError) {
+        rollbackFailures.push(rollbackError);
+      }
+      // Scope is subordinate to the exact token CAS above. If another
+      // renderer replaced A with account B while A's scope publication was
+      // failing, A must not roll B's scope back to its own predecessor. Even
+      // after a successful host CAS, re-check both browser mirrors so a newer
+      // writer that published between the awaited CAS and this continuation
+      // keeps authority.
+      if (
+        tokenRestored &&
+        window.localStorage.getItem(STEWARD_TOKEN_KEY) === previousToken &&
+        window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY) === requiredScope
+      ) {
+        try {
+          if (previousScope === null) {
+            window.localStorage.removeItem(STEWARD_TOKEN_SCOPE_KEY);
+          } else {
+            window.localStorage.setItem(
+              STEWARD_TOKEN_SCOPE_KEY,
+              previousScope,
+            );
+          }
+        } catch (scopeRollbackError) {
+          rollbackFailures.push(scopeRollbackError);
+        }
+      }
+      if (rollbackFailures.length > 0) {
+        throw new StewardTokenPersistenceError(
+          new AggregateError(
+            [error, ...rollbackFailures],
+            "Could not restore the previous Steward token transaction.",
+          ),
+        );
+      }
+    }
     // error-policy:J2 callers must not publish authenticated state after a
     // failed durable write on a protected host.
     throw new StewardTokenPersistenceError(error);
@@ -478,7 +537,12 @@ export async function writeStoredStewardToken(
       previousToken === token &&
       (!requiredScope || previousScope === requiredScope);
     if (!stewardTokenPersistence && wasCurrent) return;
-    await persistStoredStewardToken(token, requiredScope);
+    const commit = await persistStoredStewardToken(
+      token,
+      requiredScope,
+      previousToken,
+      previousScope,
+    );
     if (options?.signal?.aborted) {
       try {
         const restored = await compareAndRestoreStoredStewardToken(
@@ -501,6 +565,11 @@ export async function writeStoredStewardToken(
       }
       options.signal.throwIfAborted();
     }
+    try {
+      await commit?.();
+    } catch (error) {
+      throw new StewardTokenPersistenceError(error);
+    }
     if (!wasCurrent) dispatchStewardSessionChange("present");
   });
 }
@@ -518,7 +587,19 @@ export async function replaceStoredStewardTokenIfCurrent(
   return serializeStewardTokenMutation(async () => {
     const current = readStoredStewardToken();
     if (current !== expectedToken) return false;
-    await persistStoredStewardToken(token, configuredLoopbackStewardScope());
+    const previousToken = window.localStorage.getItem(STEWARD_TOKEN_KEY);
+    const previousScope = window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY);
+    const commit = await persistStoredStewardToken(
+      token,
+      configuredLoopbackStewardScope(),
+      previousToken,
+      previousScope,
+    );
+    try {
+      await commit?.();
+    } catch (error) {
+      throw new StewardTokenPersistenceError(error);
+    }
     if (current !== token) dispatchStewardSessionChange("present");
     return true;
   });
