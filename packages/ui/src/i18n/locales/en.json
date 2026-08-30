@@ -8594,6 +8594,7 @@
   "cloud.login.providerDiscovery.noMethodsTitle": "No sign-in methods are available",
   "cloud.login.providerDiscovery.retry": "Retry sign-in options",
   "cloud.login.providerDiscovery.title": "Sign-in options couldn't load",
+  "cloud.login.sessionRecovery.retry": "Retry session recovery",
   "cloud.login.otp.createPasskey": "Create passkey",
   "cloud.login.otp.recoveryLabel": "Other passkey options",
   "cloud.login.otp.recoveryMessage": "Already saved this passkey? Sign in with it, or use a Magic Link.",

@@ -1019,11 +1019,12 @@ export class AndroidCloudClient {
     return id;
   }
 
-  async signOut(): Promise<void> {
-    const validatePendingLoginAuthority =
-      this.pendingLoginAuthority.captureMutationValidator();
+  async signOut(expectedToken?: string): Promise<void> {
     const token = await this.readToken();
     if (!token) return;
+    if (expectedToken !== undefined && token !== expectedToken) {
+      throw new Error("Cloud session changed before sign-out.");
+    }
     const response = await this.fetchImpl(
       `${this.apiBase}/api/v1/api-keys/current`,
       {
@@ -1040,10 +1041,12 @@ export class AndroidCloudClient {
         ),
       );
     }
-    await this.credentialStore.clear({
+    const cleared = await this.credentialStore.clear({
       expectedToken: token,
-      validate: validatePendingLoginAuthority,
     });
+    if (!cleared) {
+      throw new Error("Cloud session changed during sign-out.");
+    }
   }
 
   async getConversationMessages(

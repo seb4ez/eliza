@@ -9,9 +9,14 @@ import {
   CLOUD_PAIR_LOCAL_OWNER_HINT_KEY,
   cloudPairTokenKeyForAgent,
 } from "@elizaos/shared/contracts";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { persistCloudPairApiToken } from "../components/auth/CloudPairRelay";
+import { shellLocalStorage } from "../surface-realm-channel";
+import { withRuntimeConnectionPersistenceLock } from "./agent-profiles";
 import {
+  captureCloudPairApiTokenClearAuthority,
   clearCloudPairApiToken,
+  clearCloudPairApiTokenIfCurrent,
   clearStalePairCredentialsForAgent,
 } from "./cloud-pair-token";
 
@@ -160,6 +165,72 @@ describe("clearCloudPairApiToken", () => {
     expect(relay.cloudPairTokenKeyForAgent("agent-a")).toBe(
       "eliza:cloud-pair:api-token:agent-a",
     );
+  });
+
+  it.each([
+    [
+      "account-a-pair-token",
+      "account-b-pair-token",
+      null,
+      "account-b-pair-token",
+    ],
+    [
+      "account-b-pair-token",
+      "account-a-pair-token",
+      "account-b-pair-token",
+      null,
+    ],
+  ])(
+    "clears only A's legacy channel when local/session owners differ",
+    async (localValue, sessionValue, expectedLocal, expectedSession) => {
+      localStorage.setItem(LEGACY_KEY, localValue);
+      sessionStorage.setItem(LEGACY_KEY, sessionValue);
+      const authority = captureCloudPairApiTokenClearAuthority(
+        [],
+        ["account-a-pair-token"],
+      );
+
+      await withRuntimeConnectionPersistenceLock(async (lease) => {
+        clearCloudPairApiTokenIfCurrent(authority, lease);
+      });
+
+      expect(localStorage.getItem(LEGACY_KEY)).toBe(expectedLocal);
+      expect(sessionStorage.getItem(LEGACY_KEY)).toBe(expectedSession);
+    },
+  );
+
+  it("keeps B when its writer starts between A's comparison and removal", async () => {
+    const agentKey = cloudPairTokenKeyForAgent("agent-a");
+    localStorage.setItem(agentKey, "account-a-pair-token");
+    sessionStorage.setItem(agentKey, "account-a-pair-token");
+    const authority = captureCloudPairApiTokenClearAuthority(
+      ["agent-a"],
+      ["account-a-pair-token"],
+    );
+    const realRemove = shellLocalStorage.removeItem.bind(shellLocalStorage);
+    let writeB: Promise<void> | null = null;
+    const removeSpy = vi
+      .spyOn(shellLocalStorage, "removeItem")
+      .mockImplementation((key) => {
+        if (key === agentKey && writeB === null) {
+          // The writer is invoked after clear observed A but before its local
+          // remove. Its shared lock queues B until A's exact clear completes.
+          writeB = persistCloudPairApiToken("account-b-pair-token", "agent-a");
+        }
+        realRemove(key);
+      });
+
+    try {
+      await withRuntimeConnectionPersistenceLock(async (lease) => {
+        clearCloudPairApiTokenIfCurrent(authority, lease);
+      });
+      await writeB;
+    } finally {
+      removeSpy.mockRestore();
+    }
+
+    expect(localStorage.getItem(agentKey)).toBe("account-b-pair-token");
+    expect(sessionStorage.getItem(agentKey)).toBe("account-b-pair-token");
   });
 });
 

@@ -65,7 +65,9 @@ import {
   completeStewardSessionRecovery,
   isStewardSessionLogoutIntentLive,
   isStewardSessionRecoveryReceiptLive,
+  readStewardSessionGeneration,
   readStewardSessionLogoutIntents,
+  rejectStewardSessionLogout,
   rejectStewardSessionRecovery,
   type StewardSessionLogoutIntent,
 } from "../lib/steward-session-recovery-marker";
@@ -684,10 +686,53 @@ export function burnSsoBridgeCode(
  * failure rejects so explicit sign-out cannot claim success over a server
  * session that may still be live.
  */
+export interface SsoLogoutCompletion {
+  sessionGeneration: string;
+}
+
+interface SsoLogoutOptions {
+  expectedToken?: string;
+  expectedSessionGeneration?: string | null;
+}
+
 export async function signOutFromSsoBridgedHost(
   hostname: string = window.location.hostname,
   fetchFn: typeof fetch = fetch,
-): Promise<void> {
+  options: SsoLogoutOptions = {},
+): Promise<SsoLogoutCompletion> {
+  if (options.expectedToken !== undefined) {
+    return enqueueStewardSessionMutation(async (mutationLease) => {
+      const generation = readStewardSessionGeneration(STEWARD_TENANT_ID);
+      if (
+        !generation.storageAvailable ||
+        ("expectedSessionGeneration" in options &&
+          generation.generation !== options.expectedSessionGeneration)
+      ) {
+        throw new Error("Cloud session changed before sign-out.");
+      }
+      if (readStoredStewardToken() !== options.expectedToken) {
+        throw new Error("Cloud session changed before sign-out.");
+      }
+      // Account A may create its logout intent only after it owns the same
+      // origin-wide session boundary as login B. Otherwise a stale A action
+      // could overwrite B's newer generation before noticing B's token.
+      const intent = beginStewardSessionLogout(
+        STEWARD_TENANT_ID,
+        "logout",
+        hostname,
+      );
+      invalidateStewardServerCookieSyncMarker();
+      markSsoLoggedOut();
+      await executeSsoLogoutIntentWithLease(
+        intent,
+        fetchFn,
+        options,
+        mutationLease,
+      );
+      return { sessionGeneration: intent.receipt };
+    });
+  }
+
   // Persist before waiting for the origin lock. If this document closes while
   // an older login owns that lock, pageshow/online replay below will issue the
   // same idempotent logout before any passive writer can reuse the token.
@@ -698,7 +743,8 @@ export async function signOutFromSsoBridgedHost(
   );
   invalidateStewardServerCookieSyncMarker();
   markSsoLoggedOut();
-  await executeSsoLogoutIntent(intent, fetchFn);
+  await executeSsoLogoutIntent(intent, fetchFn, options);
+  return { sessionGeneration: intent.receipt };
 }
 
 /**
@@ -724,54 +770,99 @@ export async function prepareSsoAccountSwitch(
 async function executeSsoLogoutIntent(
   intent: StewardSessionLogoutIntent,
   fetchFn: typeof fetch,
+  options: SsoLogoutOptions = {},
 ): Promise<void> {
-  await enqueueStewardSessionMutation(async (mutationLease) => {
-    if (!isStewardSessionLogoutIntentLive(intent)) return;
-    invalidateStewardServerCookieSyncMarker();
-    markSsoLoggedOut();
+  await enqueueStewardSessionMutation((mutationLease) =>
+    executeSsoLogoutIntentWithLease(intent, fetchFn, options, mutationLease),
+  );
+}
 
-    const base = apiBaseForHostname(intent.targetHostname);
-    if (!base && intent.kind === "account-switch") {
-      throw new Error(
-        "Eliza Cloud account switching is unavailable on this host.",
-      );
-    }
-    let stewardToken: string | null = null;
-    try {
-      stewardToken = readStoredStewardToken();
-    } catch {
-      // Cookies can still authorize an idempotent replay. The durable intent,
-      // not an optional plaintext token copy, remains the retry authority.
-    }
-    if (base) {
-      const response = await fetchFn(`${base}/api/auth/logout`, {
-        method: "POST",
-        credentials: "include",
-        keepalive: true,
-        headers: {
-          "Content-Type": "application/json",
-          "X-Eliza-CSRF": "1",
-          ...(stewardToken ? { Authorization: `Bearer ${stewardToken}` } : {}),
-        },
-      });
-      if (!response.ok) {
-        const action =
-          intent.kind === "account-switch"
-            ? "end the previous browser session"
-            : "end the browser session";
-        throw new Error(
-          `Eliza Cloud could not ${action} (${response.status}).`,
-        );
-      }
-    }
+async function executeSsoLogoutIntentWithLease(
+  intent: StewardSessionLogoutIntent,
+  fetchFn: typeof fetch,
+  options: SsoLogoutOptions,
+  mutationLease: StewardSessionMutationLease,
+): Promise<void> {
+  if (!isStewardSessionLogoutIntentLive(intent)) {
+    rejectStewardSessionLogout(intent);
+    return;
+  }
+  invalidateStewardServerCookieSyncMarker();
+  markSsoLoggedOut();
 
-    // Keep the protected token quarantined until the server acknowledges the
-    // logout. If the tab closes before that ack, reload still has enough cookie
-    // or bearer authority to replay; keepalive alone cannot provide this proof.
-    if (!isStewardSessionLogoutIntentLive(intent)) return;
-    await clearStaleStewardSession(mutationLease);
+  const base = apiBaseForHostname(intent.targetHostname);
+  if (!base && intent.kind === "account-switch") {
+    throw new Error(
+      "Eliza Cloud account switching is unavailable on this host.",
+    );
+  }
+  let stewardToken: string | null = null;
+  try {
+    stewardToken = readStoredStewardToken();
+  } catch {
+    // Cookies can still authorize an idempotent replay. The durable intent,
+    // not an optional plaintext token copy, remains the retry authority.
+  }
+  if (
+    options.expectedToken !== undefined &&
+    stewardToken !== options.expectedToken
+  ) {
+    throw new Error("Cloud session changed before sign-out.");
+  }
+  const exactToken = options.expectedToken ?? stewardToken;
+  if (base) {
+    const response = await fetchFn(`${base}/api/auth/logout`, {
+      method: "POST",
+      // An exact bearer owns only its own server session. Omitting ambient
+      // cookies also makes the browser ignore Set-Cookie deletion headers,
+      // so a paired-origin account B cannot be signed out by account A's
+      // acknowledged response.
+      credentials: options.expectedToken ? "omit" : "include",
+      keepalive: true,
+      headers: {
+        "Content-Type": "application/json",
+        "X-Eliza-CSRF": "1",
+        ...(exactToken ? { Authorization: `Bearer ${exactToken}` } : {}),
+      },
+    });
+    if (!response.ok) {
+      const action =
+        intent.kind === "account-switch"
+          ? "end the previous browser session"
+          : "end the browser session";
+      throw new Error(`Eliza Cloud could not ${action} (${response.status}).`);
+    }
+  }
+
+  // Keep the protected token quarantined until the server acknowledges the
+  // logout. If the tab closes before that ack, reload still has enough cookie
+  // or bearer authority to replay; keepalive alone cannot provide this proof.
+  if (!isStewardSessionLogoutIntentLive(intent)) {
     completeStewardSessionLogout(intent);
-  });
+    throw new Error("Cloud session changed during sign-out.");
+  }
+  if (
+    options.expectedToken !== undefined &&
+    readStoredStewardToken() !== options.expectedToken
+  ) {
+    completeStewardSessionLogout(intent);
+    throw new Error("Cloud session changed during sign-out.");
+  }
+  const cleared = await clearStaleStewardSession(
+    mutationLease,
+    options.expectedToken === undefined
+      ? undefined
+      : {
+          expectedToken: options.expectedToken,
+          preserveAmbientCookies: true,
+          validate: () => isStewardSessionLogoutIntentLive(intent),
+        },
+  );
+  if (!cleared) {
+    completeStewardSessionLogout(intent);
+    throw new Error("Cloud session changed during sign-out.");
+  }
+  completeStewardSessionLogout(intent);
 }
 
 /** Replay durable logout intents after reload/BFCache/online restoration. */

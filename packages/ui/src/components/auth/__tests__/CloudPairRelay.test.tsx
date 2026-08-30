@@ -211,8 +211,8 @@ describe("CloudPairRelay", () => {
     });
   });
 
-  it("persists the paired API key into the per-agent storage keys", () => {
-    persistCloudPairApiToken(" agent-key ", "agent-123");
+  it("persists the paired API key into the per-agent storage keys", async () => {
+    await persistCloudPairApiToken(" agent-key ", "agent-123");
 
     expect(getBootConfig().apiToken).toBe("agent-key");
     expect(getElizaApiToken()).toBe("agent-key");
@@ -234,13 +234,13 @@ describe("CloudPairRelay", () => {
     ).toEqual(expect.objectContaining({ apiToken: "agent-key" }));
   });
 
-  it("refuses to persist a token without an owning agent id", () => {
-    expect(() => persistCloudPairApiToken("agent-key", "  ")).toThrow(
+  it("refuses to persist a token without an owning agent id", async () => {
+    await expect(persistCloudPairApiToken("agent-key", "  ")).rejects.toThrow(
       /owner agent id/,
     );
   });
 
-  it("keeps a legacy global token when BOTH scoped writes fail", () => {
+  it("keeps a legacy global token when BOTH scoped writes fail", async () => {
     window.localStorage.setItem(CLOUD_PAIR_LOCAL_STORAGE_KEY, "legacy-key");
     window.sessionStorage.setItem(CLOUD_PAIR_SESSION_STORAGE_KEY, "legacy-key");
     // jsdom's Storage getters hand back a fresh proxy per access, so spying on
@@ -269,9 +269,9 @@ describe("CloudPairRelay", () => {
     try {
       // Neither storage channel accepted the write, so persistence fails
       // loudly (pre-existing contract) and the legacy key is never touched.
-      expect(() => persistCloudPairApiToken("agent-key", "agent-123")).toThrow(
-        /could not be stored/,
-      );
+      await expect(
+        persistCloudPairApiToken("agent-key", "agent-123"),
+      ).rejects.toThrow(/could not be stored/);
     } finally {
       Object.defineProperty(window, "localStorage", {
         configurable: true,

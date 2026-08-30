@@ -1337,6 +1337,25 @@ describe("AndroidCloudClient", () => {
     expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
   });
 
+  it("refuses to adopt and revoke account B when logout owns exact token A", async () => {
+    const credentials = memoryCredentialStore("token-b");
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(json(200, { success: true }));
+    const client = new AndroidCloudClient({
+      credentialStore: credentials.store,
+      fetchImpl,
+    });
+
+    await expect(client.signOut("token-a")).rejects.toThrow(
+      "Cloud session changed before sign-out",
+    );
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(credentials.getValue()).toBe("token-b");
+    expect(credentials.store.clear).not.toHaveBeenCalled();
+  });
+
   it("does not let logout A clear login B after remote revocation", async () => {
     let pendingLogin: string | null = null;
     const pendingLoginStore = {
@@ -1373,20 +1392,70 @@ describe("AndroidCloudClient", () => {
       ),
     });
 
-    const signOut = logoutClient.signOut();
+    const signOut = logoutClient.signOut("token-a");
     await revocationStarted.promise;
     const attemptB = await loginClient.beginLogin();
     credentials.setValue("token-b");
     revokeResponse.resolve(json(200, { success: true }));
 
+    await expect(signOut).rejects.toThrow(
+      "Cloud session changed during sign-out",
+    );
+    expect(credentials.store.clear).toHaveBeenCalledWith({
+      expectedToken: "token-a",
+    });
+    expect(credentials.getValue()).toBe("token-b");
+    expect(JSON.parse(pendingLogin ?? "null")).toMatchObject({
+      state: attemptB.state,
+    });
+  });
+
+  it("clears revoked A when pending login B has not published a credential", async () => {
+    let pendingLogin: string | null = null;
+    const pendingLoginStore = {
+      read: vi.fn(async () => pendingLogin),
+      write: vi.fn(async (value: string) => {
+        pendingLogin = value;
+      }),
+      clear: vi.fn(async () => {
+        pendingLogin = null;
+      }),
+    };
+    const credentials = memoryCredentialStore("token-a");
+    const revokeResponse = deferred<Response>();
+    const revocationStarted = deferred<void>();
+    const logoutClient = new AndroidCloudClient({
+      credentialStore: credentials.store,
+      pendingLoginStore,
+      fetchImpl: vi.fn<typeof fetch>(async () => {
+        revocationStarted.resolve();
+        return revokeResponse.promise;
+      }),
+    });
+    const loginClient = new AndroidCloudClient({
+      credentialStore: credentials.store,
+      pendingLoginStore,
+      fetchImpl: vi.fn<typeof fetch>().mockResolvedValueOnce(
+        json(200, {
+          success: true,
+          clientId: "ai.elizaos.app",
+          environment: "production",
+          redirectUri: "https://eliza.app/auth/callback",
+          codeChallengeMethod: "S256",
+        }),
+      ),
+    });
+
+    const signOut = logoutClient.signOut("token-a");
+    await revocationStarted.promise;
+    const attemptB = await loginClient.beginLogin();
+    revokeResponse.resolve(json(200, { success: true }));
+
     await expect(signOut).resolves.toBeUndefined();
     expect(credentials.store.clear).toHaveBeenCalledWith({
       expectedToken: "token-a",
-      validate: expect.any(Function),
     });
-    const clearOptions = credentials.store.clear.mock.calls[0]?.[0];
-    expect(clearOptions?.validate?.()).toBe(false);
-    expect(credentials.getValue()).toBe("token-b");
+    expect(credentials.getValue()).toBeNull();
     expect(JSON.parse(pendingLogin ?? "null")).toMatchObject({
       state: attemptB.state,
     });

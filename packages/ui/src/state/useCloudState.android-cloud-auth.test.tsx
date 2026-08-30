@@ -33,6 +33,7 @@ vi.mock("@capacitor/core", () => ({
   Capacitor: {
     getPlatform: () => "android",
     isNativePlatform: () => true,
+    registerPlugin: vi.fn(() => ({})),
   },
   CapacitorHttp: {
     request: harness.directCloudRequest,

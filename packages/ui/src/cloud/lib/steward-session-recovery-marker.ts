@@ -100,6 +100,14 @@ function readGeneration(tenantId: string): {
   }
 }
 
+/** Read the monotonic session generation without treating a logout as unavailable. */
+export function readStewardSessionGeneration(tenantId: string): {
+  generation: string | null;
+  storageAvailable: boolean;
+} {
+  return readGeneration(tenantId);
+}
+
 function persistGeneration(
   tenantId: string,
   generation: string,
@@ -502,10 +510,30 @@ export function isStewardSessionLogoutIntentLive(
   intent: Pick<StewardSessionLogoutIntent, "tenantId" | "receipt">,
 ): boolean {
   const current = readLogoutMarkers(intent.tenantId);
+  const generation = readGeneration(intent.tenantId);
   return (
     current.storageAvailable &&
+    generation.storageAvailable &&
+    generation.generation === intent.receipt &&
     current.intents.some(({ receipt }) => receipt === intent.receipt)
   );
+}
+
+/** Retire only a superseded logout marker without touching newer login proof. */
+export function rejectStewardSessionLogout(
+  intent: Pick<StewardSessionLogoutIntent, "tenantId" | "receipt">,
+): void {
+  if (typeof window !== "undefined") {
+    try {
+      window.localStorage.removeItem(
+        logoutMarkerKey(intent.tenantId, intent.receipt),
+      );
+    } catch (error) {
+      // A retained marker fails passive recovery closed and can be retried.
+      void error;
+    }
+  }
+  notifyRecoveryChange();
 }
 
 /** Complete only the logout snapshot owned when this attempt began. */

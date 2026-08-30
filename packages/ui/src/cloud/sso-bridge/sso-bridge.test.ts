@@ -17,6 +17,7 @@ import {
   beginStewardSessionLogout,
   beginStewardSessionRecovery,
   completeStewardSessionLogout,
+  completeStewardSessionRecovery,
   readStewardSessionLogoutIntents,
   readStewardSessionRecovery,
 } from "../lib/steward-session-recovery-marker";
@@ -689,12 +690,14 @@ describe("signOutFromSsoBridgedHost", () => {
         );
         return json(200, { success: true });
       });
-      await signOutFromSsoBridgedHost("cloud.eliza.app", fn);
+      await signOutFromSsoBridgedHost("cloud.eliza.app", fn, {
+        expectedToken: token,
+      });
       expect(isSsoLoggedOut()).toBe(true);
       expect(calls[0].url).toBe("https://cloud.eliza.app/api/auth/logout");
       expect(calls[0].init).toMatchObject({
         method: "POST",
-        credentials: "include",
+        credentials: "omit",
         keepalive: true,
       });
       expect(new Headers(calls[0].init?.headers).get("content-type")).toBe(
@@ -706,9 +709,80 @@ describe("signOutFromSsoBridgedHost", () => {
       expect(new Headers(calls[0].init?.headers).get("x-eliza-csrf")).toBe("1");
       expect(proofAtServerLogoutIssue).toBe(false);
       expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+      expect(globalCalls).toEqual([]);
     } finally {
       globalThis.fetch = realFetch;
     }
+  });
+
+  it("refuses to adopt account B when logout owns exact token A", async () => {
+    const tokenA = liveToken();
+    const tokenB = jwt({
+      userId: "u2",
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    });
+    localStorage.setItem(STEWARD_TOKEN_KEY, tokenB);
+    const { fn, calls } = fetchStub(() => json(200, { success: true }));
+
+    await expect(
+      signOutFromSsoBridgedHost("cloud.eliza.app", fn, {
+        expectedToken: tokenA,
+      }),
+    ).rejects.toThrow("Cloud session changed before sign-out");
+
+    expect(calls).toEqual([]);
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(tokenB);
+    expect(readStewardSessionLogoutIntents("elizacloud").intents).toEqual([]);
+  });
+
+  it("does not let stale logout A overwrite login B's newer generation", async () => {
+    const tokenA = liveToken();
+    localStorage.setItem(STEWARD_TOKEN_KEY, tokenA);
+    const recoveryA = beginStewardSessionRecovery("elizacloud", "provider");
+    completeStewardSessionRecovery(recoveryA);
+    const recoveryB = beginStewardSessionRecovery("elizacloud", "provider");
+    const { fn, calls } = fetchStub(() => json(200, { success: true }));
+
+    await expect(
+      signOutFromSsoBridgedHost("cloud.eliza.app", fn, {
+        expectedSessionGeneration: recoveryA.receipt,
+        expectedToken: tokenA,
+      }),
+    ).rejects.toThrow("Cloud session changed before sign-out");
+
+    expect(calls).toEqual([]);
+    expect(readStewardSessionRecovery("elizacloud").generation).toBe(
+      recoveryB.receipt,
+    );
+    expect(readStewardSessionLogoutIntents("elizacloud").intents).toEqual([]);
+  });
+
+  it("does not continue logout A after login B begins during remote revocation", async () => {
+    const tokenA = liveToken();
+    const tokenB = jwt({
+      userId: "u2",
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    });
+    localStorage.setItem(STEWARD_TOKEN_KEY, tokenA);
+    const response = deferred<Response>();
+    const issued = deferred<void>();
+    const fn = vi.fn<typeof fetch>(async () => {
+      issued.resolve();
+      return response.promise;
+    });
+
+    const logout = signOutFromSsoBridgedHost("cloud.eliza.app", fn, {
+      expectedToken: tokenA,
+    });
+    await issued.promise;
+    localStorage.setItem(STEWARD_TOKEN_KEY, tokenB);
+    response.resolve(json(200, { success: true }));
+
+    await expect(logout).rejects.toThrow(
+      "Cloud session changed during sign-out",
+    );
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(tokenB);
+    expect(readStewardSessionLogoutIntents("elizacloud").intents).toEqual([]);
   });
 
   it("rejects when the hosted session cannot be ended", async () => {
@@ -806,7 +880,9 @@ describe("signOutFromSsoBridgedHost", () => {
         ok: false,
         error: "SSO exchange was superseded",
       });
-      await expect(logout).resolves.toBeUndefined();
+      await expect(logout).resolves.toEqual({
+        sessionGeneration: expect.any(String),
+      });
 
       expect(order).toEqual(["login:exchange", "logout:server"]);
       expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
@@ -859,7 +935,9 @@ describe("signOutFromSsoBridgedHost", () => {
       await expect(login).resolves.toMatchObject({ ok: false });
 
       logoutResponse.resolve(json(200, { success: true }));
-      await expect(logout).resolves.toBeUndefined();
+      await expect(logout).resolves.toEqual({
+        sessionGeneration: expect.any(String),
+      });
       const retry = performSsoExchange(
         CODE,
         VERIFIER,

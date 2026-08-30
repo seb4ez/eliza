@@ -976,6 +976,19 @@ describe("durable agent-profile compensation", () => {
     );
   });
 
+  it("refuses account A before capture when the host already owns account B", async () => {
+    mocks.getStorageValue.mockImplementation(async (key: string) =>
+      key === STEWARD_TOKEN_KEY ? "token-b" : localStorage.getItem(key),
+    );
+
+    await expect(
+      captureCloudRuntimeAuthorityLeaseDurably("token-a"),
+    ).rejects.toThrow("Cloud account authority changed before it was captured");
+
+    expect(mocks.setStorageValueIfCurrent).not.toHaveBeenCalled();
+    expect(mocks.removeStorageValueIfCurrent).not.toHaveBeenCalled();
+  });
+
   it("finishes account A teardown before a queued account B connection publishes", async () => {
     installBrowserStorageWriter();
     const sharedBaseA =

@@ -17,6 +17,7 @@ import {
   CLOUD_PAIR_SESSION_STORAGE_KEY,
 } from "../components/auth/CloudPairRelay";
 import { shellLocalStorage } from "../surface-realm-channel";
+import type { RuntimeConnectionPersistenceLease } from "./agent-profiles";
 import {
   type AgentProfile,
   loadAgentProfileRegistry,
@@ -99,6 +100,129 @@ function clearLocalOwnerHintForAgent(agentId: string): void {
 
 /** Prefix for all per-agent cloud-pair token keys */
 const CLOUD_PAIR_SCOPED_PREFIX = "eliza:cloud-pair:api-token:";
+
+interface CloudPairStorageSnapshot {
+  key: string;
+  localValue: string | null;
+  sessionValue: string | null;
+}
+
+export interface CloudPairApiTokenClearAuthority {
+  entries: readonly CloudPairStorageSnapshot[];
+  ownerHint: CloudPairStorageSnapshot;
+}
+
+function readStorageValue(storage: Storage, key: string): string | null {
+  try {
+    return storage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Snapshot only pair credentials proven to belong to account A's agent ids.
+ * The legacy unscoped key is included only when its bytes equal an A bearer.
+ */
+export function captureCloudPairApiTokenClearAuthority(
+  agentIds: readonly string[],
+  ownedTokens: readonly string[],
+): CloudPairApiTokenClearAuthority {
+  const owners = [...new Set(agentIds.map((id) => id.trim()).filter(Boolean))];
+  const entries = owners.map((owner) => {
+    const key = cloudPairTokenKeyForAgent(owner);
+    return {
+      key,
+      localValue: readStorageValue(window.localStorage, key),
+      sessionValue: readStorageValue(window.sessionStorage, key),
+    };
+  });
+  const legacyLocal = readStorageValue(
+    window.localStorage,
+    CLOUD_PAIR_LOCAL_STORAGE_KEY,
+  );
+  const legacySession = readStorageValue(
+    window.sessionStorage,
+    CLOUD_PAIR_SESSION_STORAGE_KEY,
+  );
+  const tokenSet = new Set(
+    ownedTokens.map((token) => token.trim()).filter(Boolean),
+  );
+  if (
+    (legacyLocal !== null && tokenSet.has(legacyLocal)) ||
+    (legacySession !== null && tokenSet.has(legacySession))
+  ) {
+    entries.push({
+      key: CLOUD_PAIR_LOCAL_STORAGE_KEY,
+      localValue:
+        legacyLocal !== null && tokenSet.has(legacyLocal) ? legacyLocal : null,
+      sessionValue:
+        legacySession !== null && tokenSet.has(legacySession)
+          ? legacySession
+          : null,
+    });
+  }
+  return {
+    entries,
+    ownerHint: {
+      key: CLOUD_PAIR_LOCAL_OWNER_HINT_KEY,
+      localValue: owners.includes(
+        readStorageValue(
+          window.localStorage,
+          CLOUD_PAIR_LOCAL_OWNER_HINT_KEY,
+        ) ?? "",
+      )
+        ? readStorageValue(window.localStorage, CLOUD_PAIR_LOCAL_OWNER_HINT_KEY)
+        : null,
+      sessionValue: owners.includes(
+        readStorageValue(
+          window.sessionStorage,
+          CLOUD_PAIR_LOCAL_OWNER_HINT_KEY,
+        ) ?? "",
+      )
+        ? readStorageValue(
+            window.sessionStorage,
+            CLOUD_PAIR_LOCAL_OWNER_HINT_KEY,
+          )
+        : null,
+    },
+  };
+}
+
+function removeSnapshotValueIfCurrent(
+  storage: Storage,
+  key: string,
+  expected: string | null,
+  remove: () => void,
+): void {
+  if (expected === null) return;
+  try {
+    if (storage.getItem(key) === expected) remove();
+  } catch {
+    // error-policy:J6 an unreadable channel is preserved rather than guessing.
+  }
+}
+
+/** Remove only exact A bytes; a replacement B value or newly-created key wins. */
+export function clearCloudPairApiTokenIfCurrent(
+  authority: CloudPairApiTokenClearAuthority,
+  _lease: RuntimeConnectionPersistenceLease,
+): void {
+  for (const entry of [...authority.entries, authority.ownerHint]) {
+    removeSnapshotValueIfCurrent(
+      window.localStorage,
+      entry.key,
+      entry.localValue,
+      () => shellLocalStorage.removeItem(entry.key),
+    );
+    removeSnapshotValueIfCurrent(
+      window.sessionStorage,
+      entry.key,
+      entry.sessionValue,
+      () => window.sessionStorage.removeItem(entry.key),
+    );
+  }
+}
 
 /**
  * Remove all scoped cloud-pair token keys from localStorage.

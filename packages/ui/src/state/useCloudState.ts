@@ -60,6 +60,7 @@ import {
   beginStewardSessionRecovery,
   commitStewardSessionRecoveryForPublication,
   isStewardSessionRecoveryReceiptLive,
+  readStewardSessionGeneration,
   readStewardSessionRecovery,
   rejectStewardSessionRecovery,
   type StewardSessionRecoveryReceipt,
@@ -113,7 +114,6 @@ import {
 
 import {
   loadPersistedActiveServer,
-  savePersistedFirstRunComplete,
   scrubPersistedActiveServerToken,
 } from "./persistence";
 import { isPrivateNetworkHost } from "./private-network-host";
@@ -742,12 +742,22 @@ export function useCloudState({
   const elizaCloudLoginBusyRef = useRef(false);
   /** Tracks whether the auth-rejected notice has already been sent for the current rejection. */
   const elizaCloudAuthNoticeSentRef = useRef(false);
+  /** Exact credential/generation which produced the currently displayed account. */
+  const verifiedCloudAccountAuthorityRef = useRef<{
+    sessionGeneration: string | null;
+    stewardToken: string;
+    userId: string;
+  } | null>(null);
 
   // ── Callbacks ──────────────────────────────────────────────────────
 
   async function runCloudPoll(
     intent: PollIntent = "ambient",
   ): Promise<boolean> {
+    const pollToken = getCloudAuthToken(client);
+    const pollGeneration = readStewardSessionGeneration(
+      configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID),
+    );
     const buildPinnedRemoteApiBase = getBuildConfiguredRemoteApiBaseUrl();
     if (intent === "ambient" && !canPollCloudStatus()) {
       if (elizaCloudPollInterval.current) {
@@ -791,6 +801,17 @@ export function useCloudState({
     if (!cloudStatus) {
       return lastElizaCloudPollConnectedRef.current;
     }
+    const currentGeneration = readStewardSessionGeneration(
+      configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID),
+    );
+    if (
+      getCloudAuthToken(client) !== pollToken ||
+      !pollGeneration.storageAvailable ||
+      !currentGeneration.storageAvailable ||
+      currentGeneration.generation !== pollGeneration.generation
+    ) {
+      return lastElizaCloudPollConnectedRef.current;
+    }
     const enabled = Boolean(cloudStatus.enabled ?? false);
     const cloudVoiceProxyAvailable = Boolean(
       cloudStatus.cloudVoiceProxyAvailable ?? false,
@@ -798,6 +819,15 @@ export function useCloudState({
     const hasPersistedApiKey = Boolean(cloudStatus.hasApiKey);
     // Trust `connected` from the server snapshot (it already folds in API key + CLOUD_AUTH).
     const isConnected = Boolean(cloudStatus.connected);
+    if (isConnected && cloudStatus.userId && pollToken) {
+      verifiedCloudAccountAuthorityRef.current = {
+        sessionGeneration: pollGeneration.generation,
+        stewardToken: pollToken,
+        userId: cloudStatus.userId,
+      };
+    } else if (!isConnected) {
+      verifiedCloudAccountAuthorityRef.current = null;
+    }
     if (isConnected && elizaCloudPreferDisconnectedUntilLoginRef.current) {
       publishElizaCloudVoiceSnapshot(setElizaCloudHasPersistedKey, {
         apiConnected: isConnected,
@@ -2373,28 +2403,47 @@ export function useCloudState({
       // Steward bearer. A different renderer may publish account B while the
       // network request is in flight; the terminal transaction must then
       // reject instead of targeting whichever host records are current.
+      const verifiedAuthority = verifiedCloudAccountAuthorityRef.current;
+      if (
+        !verifiedAuthority ||
+        verifiedAuthority.userId !== cloudLoginUiStateRef.current.userId
+      ) {
+        throw new Error("Cloud session changed before sign-out.");
+      }
       const runtimeAuthority =
-        await captureManagedCloudAccountBindingAuthority();
+        await captureManagedCloudAccountBindingAuthority(verifiedAuthority);
+      if (!runtimeAuthority.stewardToken) {
+        throw new Error("Cloud session changed before sign-out.");
+      }
       // Hosted Cloud runs inside the normal agent shell now, so it no longer
       // inherits the retired console's sign-out menu. Preserve the hardened
       // cross-origin teardown here: synchronously suppress auto-bridging,
       // revoke the server session, then scrub the local Steward session.
       const nativeAndroidCloud =
         isAndroidCloudBuild() && Capacitor.isNativePlatform();
+      let terminalGeneration = runtimeAuthority.sessionGeneration;
       if (nativeAndroidCloud) {
         const cloudApiBase =
           getBootConfig().cloudApiBase ?? DEFAULT_DIRECT_CLOUD_BASE_URL;
-        await signOutAndroidCloud(cloudApiBase);
+        await signOutAndroidCloud(cloudApiBase, runtimeAuthority.stewardToken);
         markAndroidCloudAccountSwitchPending();
       } else {
-        await signOutFromSsoBridgedHost();
+        const completion = await signOutFromSsoBridgedHost(
+          window.location.hostname,
+          fetch,
+          {
+            expectedSessionGeneration: runtimeAuthority.sessionGeneration,
+            expectedToken: runtimeAuthority.stewardToken,
+          },
+        );
+        terminalGeneration = completion.sessionGeneration;
       }
       // A managed agent selection is scoped to the account that proved
       // ownership. Account switching must not restore that target under the
       // next account or strand the cloud-only app in backend-unreachable.
-      await clearManagedCloudAccountBinding(runtimeAuthority);
-      clearCloudPairApiToken();
-      savePersistedFirstRunComplete(false);
+      await clearManagedCloudAccountBinding(runtimeAuthority, {
+        sessionGeneration: terminalGeneration,
+      });
       setElizaCloudEnabled(false);
       setElizaCloudConnected(false);
       publishElizaCloudVoiceSnapshot(setElizaCloudHasPersistedKey, {
@@ -2409,6 +2458,7 @@ export function useCloudState({
       setElizaCloudCreditsCritical(false);
       setElizaCloudAuthRejected(false);
       setElizaCloudCreditsError(null);
+      verifiedCloudAccountAuthorityRef.current = null;
       setElizaCloudUserId(null);
       setElizaCloudStatusReason(null);
       setElizaCloudLoginError(null);

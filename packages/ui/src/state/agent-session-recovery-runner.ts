@@ -86,7 +86,10 @@ export interface RunAgentSessionRecoveryDeps {
     },
   ) => Promise<CloudPairRelaySession>;
   /** Injected API-key persistence (tests). Defaults to CloudPairRelay's persistence. */
-  persistPairApiToken?: (apiToken: string, agentId: string) => void;
+  persistPairApiToken?: (
+    apiToken: string,
+    agentId: string,
+  ) => void | Promise<void>;
   /**
    * OPT-IN purge for terminal mint/exchange outcomes (#16666). Those outcomes
    * alone prove nothing about the durable agent bearer, so there is
@@ -364,7 +367,7 @@ export async function runAgentSessionRecovery(
           if (commitPairedInProcess) {
             await commitPairedInProcess(apiToken);
           } else {
-            persistPairApiToken(apiToken, agentId);
+            await persistPairApiToken(apiToken, agentId);
             await onPairedInProcess?.(apiToken);
           }
           return { ok: true, redirectUrl, mode: "in-process" };

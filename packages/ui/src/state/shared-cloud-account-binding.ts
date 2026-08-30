@@ -6,24 +6,41 @@
 import { readStoredStewardToken } from "@elizaos/shared/steward-session-client";
 import { client } from "../api";
 import type { StorageWriteValidationOptions } from "../bridge/storage-bridge";
+import { readStewardSessionGeneration } from "../cloud/lib/steward-session-recovery-marker";
+import {
+  configuredStewardTenantId,
+  DEFAULT_STEWARD_TENANT_ID,
+} from "../cloud/shell/steward-config";
 import { getBootConfig } from "../config/boot-config";
+import { isManagedCloudSharedAgentBase } from "../utils/cloud-agent-base";
 import { clearElizaApiBase, getElizaApiToken } from "../utils/eliza-globals";
+import type { AgentProfileRegistry } from "./agent-profile-types";
 import {
   type CloudRuntimeAuthorityClearOptions,
   type CloudRuntimeAuthorityClearResult,
   type CloudRuntimeAuthorityLease,
-  captureCloudRuntimeAuthorityLeaseDurably,
+  captureCloudRuntimeAuthorityWithAuxiliaryDurably,
   clearCloudRuntimeAuthorityDurably,
   removeManagedSharedCloudAgentProfiles,
 } from "./agent-profiles";
+import { dedicatedAgentIdFromApiBase } from "./agent-session-recovery";
 import {
+  type CloudPairApiTokenClearAuthority,
+  captureCloudPairApiTokenClearAuthority,
+  clearCloudPairApiTokenIfCurrent,
+} from "./cloud-pair-token";
+import {
+  captureFirstRunAccountResetAuthority,
   clearPersistedSharedCloudActiveServer,
+  type FirstRunAccountResetAuthority,
   loadPersistedActiveServer,
+  markFirstRunIncompleteForAccountIfCurrent,
+  type PersistedActiveServer,
 } from "./persistence";
 
 const STORED_API_BASE_KEY = "elizaos_api_base";
 
-interface CloudBindingCredentialSnapshot {
+export interface CloudBindingCredentialSnapshot {
   bootToken: string | null;
   stewardToken: string | null;
   windowToken: string | null;
@@ -124,9 +141,103 @@ export const sharedCloudAccountBindingInternals = {
   clearSharedCloudAccountBindingDurablyWithDependencies,
 };
 
+export interface ManagedCloudAccountBindingAuthority
+  extends CloudRuntimeAuthorityLease {
+  credentials: CloudBindingCredentialSnapshot;
+  pairTokens: CloudPairApiTokenClearAuthority;
+  firstRun: FirstRunAccountResetAuthority;
+  sessionGeneration: string | null;
+}
+
+function captureManagedPairTokenAuthority(
+  runtime: CloudRuntimeAuthorityLease,
+): CloudPairApiTokenClearAuthority {
+  const agentIds = new Set<string>();
+  const ownedTokens = new Set<string>();
+  if (runtime.stewardToken) ownedTokens.add(runtime.stewardToken);
+  try {
+    const active = runtime.activeServerRaw
+      ? (JSON.parse(runtime.activeServerRaw) as PersistedActiveServer)
+      : null;
+    if (active?.accessToken) ownedTokens.add(active.accessToken);
+    const activeAgentId = active?.apiBase
+      ? dedicatedAgentIdFromApiBase(active.apiBase)
+      : null;
+    if (activeAgentId) agentIds.add(activeAgentId);
+  } catch {
+    // Invalid runtime authority is rejected by the durable clear boundary.
+  }
+  try {
+    const registry = runtime.registryRaw
+      ? (JSON.parse(runtime.registryRaw) as AgentProfileRegistry)
+      : null;
+    for (const profile of registry?.profiles ?? []) {
+      if (
+        profile.kind !== "cloud" &&
+        !isManagedCloudSharedAgentBase(profile.apiBase)
+      ) {
+        continue;
+      }
+      if (profile.accessToken) ownedTokens.add(profile.accessToken);
+      if (profile.cloudAgentId) agentIds.add(profile.cloudAgentId);
+      const dedicatedId = dedicatedAgentIdFromApiBase(profile.apiBase);
+      if (dedicatedId) agentIds.add(dedicatedId);
+    }
+  } catch {
+    // Invalid runtime authority is rejected by the durable clear boundary.
+  }
+  return captureCloudPairApiTokenClearAuthority(
+    [...agentIds],
+    [...ownedTokens],
+  );
+}
+
 /** Capture the exact host authority before an explicit account sign-out. */
-export async function captureManagedCloudAccountBindingAuthority(): Promise<CloudRuntimeAuthorityLease> {
-  return captureCloudRuntimeAuthorityLeaseDurably();
+export async function captureManagedCloudAccountBindingAuthority(expected?: {
+  stewardToken: string;
+  sessionGeneration: string | null;
+}): Promise<ManagedCloudAccountBindingAuthority> {
+  const tenantId = configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID);
+  const generationBefore = readStewardSessionGeneration(tenantId);
+  if (
+    !generationBefore.storageAvailable ||
+    (expected && generationBefore.generation !== expected.sessionGeneration)
+  ) {
+    throw new Error("Cloud account generation changed before sign-out.");
+  }
+  const captured = await captureCloudRuntimeAuthorityWithAuxiliaryDurably(
+    expected?.stewardToken,
+    (runtime) => {
+      const credentials = captureCloudBindingCredentialSnapshot();
+      if (credentials.stewardToken !== runtime.stewardToken) {
+        throw new Error(
+          "Cloud account credential mirrors changed while sign-out was captured.",
+        );
+      }
+      return {
+        credentials,
+        firstRun: captureFirstRunAccountResetAuthority(),
+        pairTokens: captureManagedPairTokenAuthority(runtime),
+      };
+    },
+  );
+  const runtime = captured.authority;
+  const generationAfter = readStewardSessionGeneration(tenantId);
+  if (
+    !generationAfter.storageAvailable ||
+    generationAfter.generation !== generationBefore.generation
+  ) {
+    throw new Error(
+      "Cloud account generation changed while sign-out was captured.",
+    );
+  }
+  return {
+    ...runtime,
+    credentials: captured.auxiliary.credentials,
+    firstRun: captured.auxiliary.firstRun,
+    pairTokens: captured.auxiliary.pairTokens,
+    sessionGeneration: generationAfter.generation,
+  };
 }
 
 /**
@@ -134,17 +245,53 @@ export async function captureManagedCloudAccountBindingAuthority(): Promise<Clou
  * Cloud account while preserving unrelated local and self-hosted profiles.
  */
 export async function clearManagedCloudAccountBinding(
-  expectedAuthority: CloudRuntimeAuthorityLease,
+  expectedAuthority: ManagedCloudAccountBindingAuthority,
+  options: { sessionGeneration?: string | null } = {},
 ): Promise<void> {
-  const credentialSnapshot = captureCloudBindingCredentialSnapshot();
-  const validate = () => sameCloudBindingCredentialSnapshot(credentialSnapshot);
+  const tenantId = configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID);
+  const expectedGeneration =
+    options.sessionGeneration === undefined
+      ? expectedAuthority.sessionGeneration
+      : options.sessionGeneration;
+  const validate = () => {
+    const generation = readStewardSessionGeneration(tenantId);
+    const currentCredentials = captureCloudBindingCredentialSnapshot();
+    const initialCredentials = expectedAuthority.credentials;
+    const exactInitial =
+      currentCredentials.bootToken === initialCredentials.bootToken &&
+      currentCredentials.stewardToken === initialCredentials.stewardToken &&
+      currentCredentials.windowToken === initialCredentials.windowToken;
+    const exactAndroidPostRevoke =
+      currentCredentials.bootToken === initialCredentials.bootToken &&
+      currentCredentials.stewardToken === null &&
+      currentCredentials.windowToken === initialCredentials.windowToken;
+    const exactSsoPostRevoke =
+      currentCredentials.bootToken === null &&
+      currentCredentials.stewardToken === null &&
+      currentCredentials.windowToken === null;
+    return (
+      generation.storageAvailable &&
+      generation.generation === expectedGeneration &&
+      (exactInitial || exactAndroidPostRevoke || exactSsoPostRevoke)
+    );
+  };
   const result = await clearCloudRuntimeAuthorityDurably({
     expectedAuthority,
     scope: "managed",
     validate,
-    finalize: () => {
+    finalize: (_server, lease) => {
       if (!validate()) {
         throw new Error("Cloud account authority changed during teardown");
+      }
+      clearCloudPairApiTokenIfCurrent(expectedAuthority.pairTokens, lease);
+      if (
+        !markFirstRunIncompleteForAccountIfCurrent(
+          expectedAuthority.firstRun,
+          expectedGeneration ?? "pre-session-generation",
+          validate,
+        )
+      ) {
+        throw new Error("Cloud onboarding authority changed during teardown");
       }
       clearLiveSharedCloudBindingMirrors();
     },

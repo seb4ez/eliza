@@ -267,7 +267,7 @@ export function useAgentSessionRecovery(
           // One synchronous commit owns every credential mirror. A later boot
           // must not re-adopt the stale active-server/profile token after the
           // live client has already accepted the fresh paired bearer.
-          persistCloudPairApiToken(apiToken, decision.agentId);
+          await persistCloudPairApiToken(apiToken, decision.agentId);
           await persistActiveServerCredential(apiToken);
           client.setToken(apiToken);
           onRecovered?.();

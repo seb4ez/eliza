@@ -16,6 +16,7 @@ import {
 } from "@elizaos/shared/elizacloud";
 import { useEffect, useState } from "react";
 import { getBootConfig, setBootConfig } from "../../config/boot-config";
+import { withRuntimeConnectionPersistenceLock } from "../../state/agent-profiles";
 import {
   dedicatedCloudAgentIdFromBase,
   isDedicatedCloudAgentBase,
@@ -241,51 +242,53 @@ export function installCloudPairApiTokenForSession(apiToken: string): void {
  * older install that only ever wrote the global key is migrated forward
  * exactly once, and only while the pairing flow knows the true owner.
  */
-export function persistCloudPairApiToken(
+export async function persistCloudPairApiToken(
   apiToken: string,
   agentId: string,
-): void {
+): Promise<void> {
   const token = apiToken.trim();
   if (!token) throw new Error("Missing cloud pair API token.");
   const owner = agentId.trim();
   if (!owner) throw new Error("Missing cloud pair token owner agent id.");
 
-  const agentKey = cloudPairTokenKeyForAgent(owner);
-  const persistedInSession = tryPersistBrowserStorage(
-    typeof window === "undefined" ? undefined : window.sessionStorage,
-    agentKey,
-    token,
-  );
-  const persistedDurably = tryPersistBrowserStorage(
-    typeof window === "undefined" ? undefined : window.localStorage,
-    agentKey,
-    token,
-  );
-
-  installCloudPairApiTokenForSession(token);
-
-  if (persistedInSession || persistedDurably) {
-    // Legacy single-key format is now superseded by the per-agent key. Only
-    // remove it after the scoped write landed, so a failed storage channel
-    // never destroys the only credential the user has.
-    for (const storage of [
-      typeof window === "undefined" ? undefined : window.localStorage,
+  await withRuntimeConnectionPersistenceLock(async () => {
+    const agentKey = cloudPairTokenKeyForAgent(owner);
+    const persistedInSession = tryPersistBrowserStorage(
       typeof window === "undefined" ? undefined : window.sessionStorage,
-    ]) {
-      try {
-        storage?.removeItem(CLOUD_PAIR_LOCAL_STORAGE_KEY);
-      } catch (_storageError) {
-        // error-policy:J3 best-effort legacy cleanup; the per-agent key is the
-        // authority now.
+      agentKey,
+      token,
+    );
+    const persistedDurably = tryPersistBrowserStorage(
+      typeof window === "undefined" ? undefined : window.localStorage,
+      agentKey,
+      token,
+    );
+
+    installCloudPairApiTokenForSession(token);
+
+    if (persistedInSession || persistedDurably) {
+      // Legacy single-key format is now superseded by the per-agent key. Only
+      // remove it after the scoped write landed, so a failed storage channel
+      // never destroys the only credential the user has.
+      for (const storage of [
+        typeof window === "undefined" ? undefined : window.localStorage,
+        typeof window === "undefined" ? undefined : window.sessionStorage,
+      ]) {
+        try {
+          storage?.removeItem(CLOUD_PAIR_LOCAL_STORAGE_KEY);
+        } catch (_storageError) {
+          // error-policy:J3 best-effort legacy cleanup; the per-agent key is the
+          // authority now.
+        }
       }
     }
-  }
 
-  if (!(persistedInSession || persistedDurably)) {
-    throw new Error(
-      "Cloud pair API token could not be stored in this browser.",
-    );
-  }
+    if (!(persistedInSession || persistedDurably)) {
+      throw new Error(
+        "Cloud pair API token could not be stored in this browser.",
+      );
+    }
+  });
 }
 
 export function resolveCloudHostedAgentUrl(
@@ -322,7 +325,7 @@ export type CloudPairExchangeFn = (
 export interface CloudPairRelayProps {
   token: string;
   exchangeFn?: CloudPairExchangeFn;
-  persistFn?: (apiToken: string, agentId: string) => void;
+  persistFn?: (apiToken: string, agentId: string) => void | Promise<void>;
   onPaired?: () => void;
 }
 
@@ -486,7 +489,7 @@ export function CloudPairRelay({
     let active = true;
 
     exchangeFn(token, { signal: controller.signal })
-      .then(({ apiKey, agentId }) => {
+      .then(async ({ apiKey, agentId }) => {
         if (!active) return;
         const origin =
           typeof window === "undefined" ? null : window.location.origin;
@@ -500,7 +503,8 @@ export function CloudPairRelay({
             "pairing_owner_mismatch",
           );
         }
-        persistFn(apiKey, agentId);
+        await persistFn(apiKey, agentId);
+        if (!active) return;
         onPaired();
       })
       .catch((error) => {

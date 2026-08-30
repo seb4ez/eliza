@@ -6,6 +6,8 @@
  * accounts on mobile cloud/cloud-hybrid builds.
  */
 
+import { cloudPairTokenKeyForAgent } from "@elizaos/shared/contracts";
+import { STEWARD_TOKEN_KEY } from "@elizaos/shared/steward-session-client";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -114,19 +116,27 @@ describe("useCloudState — Cloud account sign-out", () => {
       critical: false,
     });
     cloudDisconnectMock.mockResolvedValue(undefined);
-    signOutFromSsoBridgedHostMock.mockResolvedValue(undefined);
+    signOutFromSsoBridgedHostMock.mockResolvedValue({
+      sessionGeneration: "logout-generation",
+    });
     signOutAndroidCloudMock.mockResolvedValue(undefined);
     captureManagedCloudAccountBindingAuthorityMock.mockResolvedValue({
       activeServerRaw: "account-a-active-server",
       registryRaw: "account-a-registry",
       stewardToken: "account-a-token",
+      sessionGeneration: null,
     });
     clearManagedCloudAccountBindingMock.mockImplementation(async () => {
       clearPersistedActiveServer();
+      localStorage.setItem(
+        "eliza:first-run-account-reset-authority:v1",
+        "test-generation",
+      );
     });
     nativePlatformState.enabled = false;
     isElizaCloudRuntimeLockedMock.mockReturnValue(true);
     isAppModeHostMock.mockReturnValue(false);
+    localStorage.setItem(STEWARD_TOKEN_KEY, "account-a-token");
   });
 
   afterEach(() => {
@@ -146,29 +156,37 @@ describe("useCloudState — Cloud account sign-out", () => {
     const params = makeParams();
     const { result } = renderHook(() => useCloudState(params));
 
-    act(() => {
-      result.current.setElizaCloudEnabled(true);
-      result.current.setElizaCloudConnected(true);
-      result.current.setElizaCloudUserId("user-before-sign-out");
-    });
+    await waitFor(() =>
+      expect(result.current.elizaCloudUserId).toBe("user-after-poll"),
+    );
 
     await act(async () => {
       await result.current.handleCloudSignOut();
     });
 
-    expect(
-      captureManagedCloudAccountBindingAuthorityMock,
-    ).toHaveBeenCalledTimes(1);
-    expect(signOutAndroidCloud).toHaveBeenCalledWith("https://eliza.app");
+    expect(captureManagedCloudAccountBindingAuthorityMock).toHaveBeenCalledWith(
+      {
+        sessionGeneration: null,
+        stewardToken: "account-a-token",
+        userId: "user-after-poll",
+      },
+    );
+    expect(signOutAndroidCloud).toHaveBeenCalledWith(
+      "https://api.eliza.app",
+      "account-a-token",
+    );
     expect(
       captureManagedCloudAccountBindingAuthorityMock.mock
         .invocationCallOrder[0],
     ).toBeLessThan(signOutAndroidCloudMock.mock.invocationCallOrder[0] ?? 0);
-    expect(clearManagedCloudAccountBindingMock).toHaveBeenCalledWith({
-      activeServerRaw: "account-a-active-server",
-      registryRaw: "account-a-registry",
-      stewardToken: "account-a-token",
-    });
+    expect(clearManagedCloudAccountBindingMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        activeServerRaw: "account-a-active-server",
+        registryRaw: "account-a-registry",
+        stewardToken: "account-a-token",
+      }),
+      { sessionGeneration: null },
+    );
     expect(signOutAndroidCloudMock.mock.invocationCallOrder[0]).toBeLessThan(
       clearManagedCloudAccountBindingMock.mock.invocationCallOrder[0] ?? 0,
     );
@@ -191,23 +209,53 @@ describe("useCloudState — Cloud account sign-out", () => {
     expect(result.current.elizaCloudConnected).toBe(false);
   });
 
+  it("does not erase a replacement pair token published during remote logout", async () => {
+    nativePlatformState.enabled = true;
+    const replacementKey = cloudPairTokenKeyForAgent("replacement-agent");
+    signOutAndroidCloudMock.mockImplementationOnce(async () => {
+      localStorage.setItem(replacementKey, "account-b-pair-token");
+      sessionStorage.setItem(replacementKey, "account-b-pair-token");
+    });
+    const { result } = renderHook(() => useCloudState(makeParams()));
+
+    await waitFor(() =>
+      expect(result.current.elizaCloudUserId).toBe("user-after-poll"),
+    );
+
+    await act(async () => {
+      await result.current.handleCloudSignOut();
+    });
+
+    expect(localStorage.getItem(replacementKey)).toBe("account-b-pair-token");
+    expect(sessionStorage.getItem(replacementKey)).toBe("account-b-pair-token");
+  });
+
   it("uses cross-host logout on the hosted Cloud app", async () => {
     isElizaCloudRuntimeLockedMock.mockReturnValue(false);
     isAppModeHostMock.mockReturnValue(true);
     const params = makeParams();
     const { result } = renderHook(() => useCloudState(params));
 
-    act(() => {
-      result.current.setElizaCloudEnabled(true);
-      result.current.setElizaCloudConnected(true);
-      result.current.setElizaCloudUserId("hosted-user-before-sign-out");
+    await act(async () => {
+      await result.current.pollCloudCredits();
     });
+
+    await waitFor(() =>
+      expect(result.current.elizaCloudUserId).toBe("user-after-poll"),
+    );
 
     await act(async () => {
       await result.current.handleCloudSignOut();
     });
 
-    expect(signOutFromSsoBridgedHost).toHaveBeenCalledTimes(1);
+    expect(signOutFromSsoBridgedHost).toHaveBeenCalledWith(
+      window.location.hostname,
+      fetch,
+      {
+        expectedSessionGeneration: null,
+        expectedToken: "account-a-token",
+      },
+    );
     expect(
       captureManagedCloudAccountBindingAuthorityMock.mock
         .invocationCallOrder[0],

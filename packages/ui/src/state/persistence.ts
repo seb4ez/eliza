@@ -520,12 +520,57 @@ function firstRunCompleteStorageKey(cloudOnly?: boolean): string {
     : FIRST_RUN_COMPLETE_STORAGE_KEY;
 }
 
+const FIRST_RUN_ACCOUNT_RESET_KEY =
+  "eliza:first-run-account-reset-authority:v1";
+
+export interface FirstRunAccountResetAuthority {
+  completeRaw: string | null;
+  resetRaw: string | null;
+}
+
+/** Snapshot the exact onboarding bytes owned by an account logout. */
+export function captureFirstRunAccountResetAuthority(): FirstRunAccountResetAuthority {
+  return {
+    completeRaw: localStorage.getItem(firstRunCompleteStorageKey()),
+    resetRaw: localStorage.getItem(FIRST_RUN_ACCOUNT_RESET_KEY),
+  };
+}
+
+/**
+ * Publish a logical first-run reset without deleting account B's completion.
+ * The durable native `1` remains intact; a later login completion removes this
+ * scoped reset marker through savePersistedFirstRunComplete(true).
+ */
+export function markFirstRunIncompleteForAccountIfCurrent(
+  authority: FirstRunAccountResetAuthority,
+  marker: string,
+  validate: () => boolean,
+): boolean {
+  if (!marker || !validate()) return false;
+  if (
+    localStorage.getItem(firstRunCompleteStorageKey()) !==
+      authority.completeRaw ||
+    localStorage.getItem(FIRST_RUN_ACCOUNT_RESET_KEY) !== authority.resetRaw
+  ) {
+    return false;
+  }
+  shellLocalStorage.setItem(FIRST_RUN_ACCOUNT_RESET_KEY, marker);
+  if (validate()) return true;
+  if (localStorage.getItem(FIRST_RUN_ACCOUNT_RESET_KEY) === marker) {
+    shellLocalStorage.removeItem(FIRST_RUN_ACCOUNT_RESET_KEY);
+  }
+  return false;
+}
+
 export function loadPersistedFirstRunComplete(cloudOnly?: boolean): boolean {
   if (typeof localStorage === "undefined") {
     return false;
   }
 
   try {
+    if (localStorage.getItem(FIRST_RUN_ACCOUNT_RESET_KEY) !== null) {
+      return false;
+    }
     return localStorage.getItem(firstRunCompleteStorageKey(cloudOnly)) === "1";
   } catch (err) {
     // error-policy:J3 an unreadable store reads as "first run not complete";
@@ -577,6 +622,7 @@ export function savePersistedFirstRunComplete(complete: boolean): void {
   }
 
   try {
+    shellLocalStorage.removeItem(FIRST_RUN_ACCOUNT_RESET_KEY);
     if (complete) {
       shellLocalStorage.setItem(storageKey, "1");
     } else {

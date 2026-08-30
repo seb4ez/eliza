@@ -81,13 +81,20 @@ export interface CloudRuntimeAuthorityClearOptions
   /** Refuse passive cleanup while any host-authoritative Steward token exists. */
   requireStewardTokenAbsent?: boolean;
   /** Publish the terminal live-client state while the runtime lock is held. */
-  finalize?: (server: PersistedActiveServer) => void | Promise<void>;
+  finalize?: (
+    server: PersistedActiveServer | null,
+    lease: RuntimeConnectionPersistenceLease,
+  ) => void | Promise<void>;
 }
 
 export interface CloudRuntimeAuthorityLease {
   activeServerRaw: string | null;
   registryRaw: string | null;
   stewardToken: string | null;
+  /** Exact active-server projection produced by clearStaleStewardSession. */
+  postSessionClearActiveServerRaw?: string | null;
+  /** Exact registry projection produced by clearStaleStewardSession. */
+  postSessionClearRegistryRaw?: string | null;
 }
 
 export type CloudRuntimeAuthorityClearResult =
@@ -122,7 +129,19 @@ const STORAGE_KEY = "elizaos:agent-profiles";
 const ACTIVE_SERVER_KEY = "elizaos:active-server";
 const RUNTIME_CONNECTION_PERSISTENCE_LOCK =
   "elizaos:runtime-connection-persistence";
+const RUNTIME_CONNECTION_PERSISTENCE_LEASE = Symbol(
+  "runtime-connection-persistence-lease",
+);
 let runtimeConnectionPersistenceTail: Promise<void> = Promise.resolve();
+
+/** Opaque proof that a synchronous side effect runs inside the runtime lock. */
+export interface RuntimeConnectionPersistenceLease {
+  readonly [RUNTIME_CONNECTION_PERSISTENCE_LEASE]: true;
+}
+
+const runtimeConnectionPersistenceLease: RuntimeConnectionPersistenceLease = {
+  [RUNTIME_CONNECTION_PERSISTENCE_LEASE]: true,
+};
 
 class RuntimeConnectionPersistenceBoundaryError extends Error {
   readonly cause: unknown;
@@ -144,7 +163,18 @@ async function runWithOriginRuntimeConnectionLock<T>(
   } catch (cause) {
     throw new RuntimeConnectionPersistenceBoundaryError(cause);
   }
-  if (!lockManager) return operation();
+  if (!lockManager) {
+    if (
+      typeof window === "undefined" ||
+      (typeof process !== "undefined" &&
+        (process.env.NODE_ENV === "test" || process.env.VITEST === "true"))
+    ) {
+      return operation();
+    }
+    throw new RuntimeConnectionPersistenceBoundaryError(
+      new Error("Web Locks is unavailable"),
+    );
+  }
 
   let entered = false;
   try {
@@ -181,6 +211,19 @@ function serializeRuntimeConnectionPersistence<T>(
     () => undefined,
   );
   return result;
+}
+
+/**
+ * Share the registry/active-server origin fence with auxiliary credential
+ * writers. This keeps pair-token publication from racing an account teardown
+ * between its exact comparison and removal.
+ */
+export function withRuntimeConnectionPersistenceLock<T>(
+  operation: (lease: RuntimeConnectionPersistenceLease) => T | Promise<T>,
+): Promise<T> {
+  return serializeRuntimeConnectionPersistence(async () =>
+    operation(runtimeConnectionPersistenceLease),
+  );
 }
 
 function warnRuntimePersistenceBoundaryUnavailable(cause: unknown): void {
@@ -322,6 +365,24 @@ function transformCloudRuntimeRegistry(
     activeProfileId: activeStillPresent ? registry.activeProfileId : null,
     profiles,
   };
+}
+
+function projectPostSessionClearActiveServerRaw(
+  raw: string | null,
+): string | null {
+  const server = parsePersistedActiveServer(raw);
+  if (server === undefined || server === null) return raw;
+  if (isManagedCloudSharedAgentBase(server.apiBase)) return null;
+  if (!server.accessToken) return raw;
+  const { accessToken: _accessToken, ...scrubbed } = server;
+  return JSON.stringify(scrubbed);
+}
+
+function projectPostSessionClearRegistryRaw(raw: string | null): string | null {
+  const registry = parseAgentProfileRegistry(raw);
+  if (!registry) return raw;
+  const projected = transformCloudRuntimeRegistry(registry, "shared");
+  return projected ? JSON.stringify(projected) : raw;
 }
 
 /** Read both migration inputs from the host authority while holding the lock. */
@@ -885,19 +946,61 @@ export function removeManagedSharedCloudAgentProfiles(): void {
  * Steward token publication uses its own protected-storage transaction; a
  * concurrent account switch must not produce a mixed A/B lease.
  */
-export async function captureCloudRuntimeAuthorityLeaseDurably(): Promise<CloudRuntimeAuthorityLease> {
+async function captureCloudRuntimeAuthorityLeaseInsideLock(
+  expectedStewardToken?: string,
+): Promise<CloudRuntimeAuthorityLease> {
+  const stewardTokenBefore = await getStorageValue(STEWARD_TOKEN_KEY);
+  if (
+    expectedStewardToken !== undefined &&
+    stewardTokenBefore !== expectedStewardToken
+  ) {
+    throw new Error("Cloud account authority changed before it was captured");
+  }
+  const activeServerRaw = await getStorageValue(ACTIVE_SERVER_KEY);
+  const registryRaw = await getStorageValue(STORAGE_KEY);
+  const stewardTokenAfter = await getStorageValue(STEWARD_TOKEN_KEY);
+  if (stewardTokenBefore !== stewardTokenAfter) {
+    throw new Error("Cloud account authority changed while it was captured");
+  }
+  if (
+    expectedStewardToken !== undefined &&
+    stewardTokenAfter !== expectedStewardToken
+  ) {
+    throw new Error("Cloud account authority changed while it was captured");
+  }
+  return {
+    activeServerRaw,
+    registryRaw,
+    stewardToken: stewardTokenAfter,
+    postSessionClearActiveServerRaw:
+      projectPostSessionClearActiveServerRaw(activeServerRaw),
+    postSessionClearRegistryRaw:
+      projectPostSessionClearRegistryRaw(registryRaw),
+  };
+}
+
+export async function captureCloudRuntimeAuthorityLeaseDurably(
+  expectedStewardToken?: string,
+): Promise<CloudRuntimeAuthorityLease> {
+  return serializeRuntimeConnectionPersistence(() =>
+    captureCloudRuntimeAuthorityLeaseInsideLock(expectedStewardToken),
+  );
+}
+
+/** Capture account-adjacent storage while the same pair writer lock is held. */
+export async function captureCloudRuntimeAuthorityWithAuxiliaryDurably<T>(
+  expectedStewardToken: string | undefined,
+  captureAuxiliary: (
+    authority: CloudRuntimeAuthorityLease,
+    lease: RuntimeConnectionPersistenceLease,
+  ) => T,
+): Promise<{ authority: CloudRuntimeAuthorityLease; auxiliary: T }> {
   return serializeRuntimeConnectionPersistence(async () => {
-    const stewardTokenBefore = await getStorageValue(STEWARD_TOKEN_KEY);
-    const activeServerRaw = await getStorageValue(ACTIVE_SERVER_KEY);
-    const registryRaw = await getStorageValue(STORAGE_KEY);
-    const stewardTokenAfter = await getStorageValue(STEWARD_TOKEN_KEY);
-    if (stewardTokenBefore !== stewardTokenAfter) {
-      throw new Error("Cloud account authority changed while it was captured");
-    }
+    const authority =
+      await captureCloudRuntimeAuthorityLeaseInsideLock(expectedStewardToken);
     return {
-      activeServerRaw,
-      registryRaw,
-      stewardToken: stewardTokenAfter,
+      authority,
+      auxiliary: captureAuxiliary(authority, runtimeConnectionPersistenceLease),
     };
   });
 }
@@ -934,8 +1037,10 @@ export async function clearCloudRuntimeAuthorityDurably(
           (expected.stewardToken !== null && stewardTokenAfter === null);
         if (
           !stewardTokenMatches ||
-          activeServerRaw !== expected.activeServerRaw ||
-          registryRaw !== expected.registryRaw
+          (activeServerRaw !== expected.activeServerRaw &&
+            activeServerRaw !== expected.postSessionClearActiveServerRaw) ||
+          (registryRaw !== expected.registryRaw &&
+            registryRaw !== expected.postSessionClearRegistryRaw)
         ) {
           return { ok: false, reason: "conflict" };
         }
@@ -996,8 +1101,12 @@ export async function clearCloudRuntimeAuthorityDurably(
         return { ok: false, reason: "authority-lost" };
       }
 
-      if (activeServerMatches && activeServer && options.finalize) {
-        await options.finalize(activeServer);
+      if (
+        options.finalize &&
+        ((activeServerMatches && activeServer !== null) ||
+          (options.scope === "managed" && options.expectedAuthority))
+      ) {
+        await options.finalize(activeServer, runtimeConnectionPersistenceLease);
       }
       return {
         ok: true,

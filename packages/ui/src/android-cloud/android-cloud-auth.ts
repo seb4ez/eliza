@@ -124,8 +124,9 @@ export async function beginAndroidCloudSignIn(
 /** Revokes the exact mobile credential before removing its local copy. */
 export async function signOutAndroidCloud(
   cloudApiBase?: string,
+  expectedToken?: string,
 ): Promise<void> {
-  await client(cloudApiBase).signOut();
+  await client(cloudApiBase).signOut(expectedToken);
 }
 
 /** Navigate the launcher WebView only to the canonical hosted login origins. */
