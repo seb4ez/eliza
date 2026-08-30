@@ -12,7 +12,13 @@ const mocks = vi.hoisted(() => ({
   repointBaseUrl: vi.fn(),
   setToken: vi.fn(),
   loadAgentProfileRegistry: vi.fn(),
-  persistAgentProfileSelection: vi.fn(() => true),
+  persistAgentProfileSelectionDurably: vi.fn(
+    async (
+      _profileId: string,
+      _server: unknown,
+      options?: { finalize?: () => Promise<boolean> },
+    ) => options?.finalize?.() ?? true,
+  ),
   activeServerIdForAgentProfile: vi.fn((profile: AgentProfile) =>
     profile.kind === "cloud" && profile.cloudAgentId
       ? `cloud:${profile.cloudAgentId}`
@@ -42,7 +48,8 @@ vi.mock("../api", () => ({
 vi.mock("./agent-profiles", () => ({
   activeServerIdForAgentProfile: mocks.activeServerIdForAgentProfile,
   loadAgentProfileRegistry: mocks.loadAgentProfileRegistry,
-  persistAgentProfileSelection: mocks.persistAgentProfileSelection,
+  persistAgentProfileSelectionDurably:
+    mocks.persistAgentProfileSelectionDurably,
 }));
 vi.mock("./persistence", () => ({
   createPersistedActiveServer: mocks.createPersistedActiveServer,
@@ -142,7 +149,9 @@ describe("switchRuntimeNonDestructive", () => {
     for (const fn of Object.values(mocks)) fn.mockClear();
     mocks.isTrustedRestoreApiBaseUrl.mockReturnValue(true);
     mocks.isTrustedCloudApiBaseUrl.mockReturnValue(true);
-    mocks.persistAgentProfileSelection.mockReturnValue(true);
+    mocks.persistAgentProfileSelectionDurably.mockImplementation(
+      async (_profileId, _server, options) => options?.finalize?.() ?? true,
+    );
     mocks.createPersistedActiveServer.mockImplementation((a) => ({ ...a }));
     mocks.getFrontendPlatform.mockReturnValue("web");
     mocks.isMobileLocalAgentIpcBase.mockReturnValue(false);
@@ -152,26 +161,27 @@ describe("switchRuntimeNonDestructive", () => {
   });
   afterEach(() => vi.restoreAllMocks());
 
-  it("returns not-found for an unknown id and touches nothing", () => {
+  it("returns not-found for an unknown id and touches nothing", async () => {
     withRegistry([LOCAL]);
-    expect(switchRuntimeNonDestructive("nope")).toEqual({
+    await expect(switchRuntimeNonDestructive("nope")).resolves.toEqual({
       ok: false,
       reason: "not-found",
     });
-    expect(mocks.persistAgentProfileSelection).not.toHaveBeenCalled();
+    expect(mocks.persistAgentProfileSelectionDurably).not.toHaveBeenCalled();
     expect(mocks.repointBaseUrl).not.toHaveBeenCalled();
   });
 
-  it("switches to a cloud runtime: persists, activates, re-points seamlessly (not setBaseUrl)", () => {
+  it("switches to a cloud runtime: persists, activates, re-points seamlessly (not setBaseUrl)", async () => {
     withRegistry([LOCAL, CLOUD]);
     const authorityPhase = vi.fn();
     const unsubscribe = subscribeRuntimeAuthoritySwitch(authorityPhase);
-    const res = switchRuntimeNonDestructive("cloud-1");
+    const res = await switchRuntimeNonDestructive("cloud-1");
     unsubscribe();
     expect(res).toEqual({ ok: true, profile: CLOUD });
-    expect(mocks.persistAgentProfileSelection).toHaveBeenCalledWith(
+    expect(mocks.persistAgentProfileSelectionDurably).toHaveBeenCalledWith(
       "cloud-1",
       expect.objectContaining({ kind: "cloud" }),
+      expect.objectContaining({ finalize: expect.any(Function) }),
     );
     expect(mocks.repointBaseUrl).toHaveBeenCalledWith(
       "https://11111111-1111-4111-8111-111111111111.elizacloud.ai",
@@ -198,13 +208,13 @@ describe("switchRuntimeNonDestructive", () => {
     expect(authorityPhase).not.toHaveBeenCalled();
   });
 
-  it("does not move the live client or clear drafts when durable selection fails", () => {
-    mocks.persistAgentProfileSelection.mockReturnValue(false);
+  it("does not move the live client or clear drafts when durable selection fails", async () => {
+    mocks.persistAgentProfileSelectionDurably.mockResolvedValue(false);
     withRegistry([LOCAL, CLOUD]);
     const authorityPhase = vi.fn();
     const unsubscribe = subscribeRuntimeAuthoritySwitch(authorityPhase);
 
-    expect(switchRuntimeNonDestructive("cloud-1")).toEqual({
+    await expect(switchRuntimeNonDestructive("cloud-1")).resolves.toEqual({
       ok: false,
       reason: "persistence-failed",
     });
@@ -218,7 +228,7 @@ describe("switchRuntimeNonDestructive", () => {
     ).not.toHaveBeenCalled();
   });
 
-  it("rejects a Cloud profile whose persisted base is outside the Cloud trust boundary", () => {
+  it("rejects a Cloud profile whose persisted base is outside the Cloud trust boundary", async () => {
     mocks.isTrustedCloudApiBaseUrl.mockReturnValue(false);
     const untrustedCloud: AgentProfile = {
       ...CLOUD,
@@ -228,7 +238,9 @@ describe("switchRuntimeNonDestructive", () => {
     const authorityPhase = vi.fn();
     const unsubscribe = subscribeRuntimeAuthoritySwitch(authorityPhase);
 
-    expect(switchRuntimeNonDestructive(untrustedCloud.id)).toEqual({
+    await expect(
+      switchRuntimeNonDestructive(untrustedCloud.id),
+    ).resolves.toEqual({
       ok: false,
       reason: "untrusted-cloud",
     });
@@ -236,10 +248,10 @@ describe("switchRuntimeNonDestructive", () => {
     expect(authorityPhase).not.toHaveBeenCalled();
     expect(mocks.setToken).not.toHaveBeenCalled();
     expect(mocks.repointBaseUrl).not.toHaveBeenCalled();
-    expect(mocks.persistAgentProfileSelection).not.toHaveBeenCalled();
+    expect(mocks.persistAgentProfileSelectionDurably).not.toHaveBeenCalled();
   });
 
-  it("switching to a tokenless Cloud profile clears the previous runtime bearer", () => {
+  it("switching to a tokenless Cloud profile clears the previous runtime bearer", async () => {
     const tokenlessCloud: AgentProfile = {
       id: "cloud-tokenless",
       label: "Tokenless Cloud agent",
@@ -250,17 +262,19 @@ describe("switchRuntimeNonDestructive", () => {
     };
     withRegistry([REMOTE, tokenlessCloud]);
 
-    expect(switchRuntimeNonDestructive(tokenlessCloud.id).ok).toBe(true);
+    expect((await switchRuntimeNonDestructive(tokenlessCloud.id)).ok).toBe(
+      true,
+    );
     expect(mocks.repointBaseUrl).toHaveBeenCalledWith(
       "https://11111111-1111-4111-8111-111111111111.elizacloud.ai",
       null,
     );
   });
 
-  it("persists a local-Docker Cloud profile with its platform agent identity", () => {
+  it("persists a local-Docker Cloud profile with its platform agent identity", async () => {
     withRegistry([LOCAL, LOCAL_DOCKER_CLOUD]);
 
-    switchRuntimeNonDestructive(LOCAL_DOCKER_CLOUD.id);
+    await switchRuntimeNonDestructive(LOCAL_DOCKER_CLOUD.id);
 
     expect(mocks.createPersistedActiveServer).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -272,13 +286,14 @@ describe("switchRuntimeNonDestructive", () => {
     );
   });
 
-  it("switches to a local runtime: persists + activates + re-points same-origin + clears the stale token", () => {
+  it("switches to a local runtime: persists + activates + re-points same-origin + clears the stale token", async () => {
     withRegistry([LOCAL, CLOUD]);
-    const res = switchRuntimeNonDestructive("local-1");
+    const res = await switchRuntimeNonDestructive("local-1");
     expect(res.ok).toBe(true);
-    expect(mocks.persistAgentProfileSelection).toHaveBeenCalledWith(
+    expect(mocks.persistAgentProfileSelectionDurably).toHaveBeenCalledWith(
       "local-1",
       expect.objectContaining({ kind: "local" }),
+      expect.objectContaining({ finalize: expect.any(Function) }),
     );
     // local is same-origin: re-point to the app host + drop any prior
     // remote/cloud bearer (regression guard for the stale-base/token bug).
@@ -287,21 +302,21 @@ describe("switchRuntimeNonDestructive", () => {
     expect(mocks.setBaseUrl).not.toHaveBeenCalled();
   });
 
-  it("rejects an untrusted remote (public URL) without switching", () => {
+  it("rejects an untrusted remote (public URL) without switching", async () => {
     mocks.isTrustedRestoreApiBaseUrl.mockReturnValue(false);
     withRegistry([LOCAL, REMOTE]);
-    expect(switchRuntimeNonDestructive("vps-1")).toEqual({
+    await expect(switchRuntimeNonDestructive("vps-1")).resolves.toEqual({
       ok: false,
       reason: "untrusted-remote",
     });
-    expect(mocks.persistAgentProfileSelection).not.toHaveBeenCalled();
+    expect(mocks.persistAgentProfileSelectionDurably).not.toHaveBeenCalled();
     expect(mocks.repointBaseUrl).not.toHaveBeenCalled();
   });
 
-  it("allows a trusted remote (tailscale/RFC1918) and re-points", () => {
+  it("allows a trusted remote (tailscale/RFC1918) and re-points", async () => {
     mocks.isTrustedRestoreApiBaseUrl.mockReturnValue(true);
     withRegistry([LOCAL, REMOTE]);
-    const res = switchRuntimeNonDestructive("vps-1");
+    const res = await switchRuntimeNonDestructive("vps-1");
     expect(res.ok).toBe(true);
     expect(mocks.repointBaseUrl).toHaveBeenCalledWith(
       "http://100.72.1.4:3000",
@@ -309,9 +324,9 @@ describe("switchRuntimeNonDestructive", () => {
     );
   });
 
-  it("allows only an exactly bound native relay pseudo-URL", () => {
+  it("allows only an exactly bound native relay pseudo-URL", async () => {
     withRegistry([LOCAL, RELAY]);
-    expect(switchRuntimeNonDestructive(RELAY.id).ok).toBe(true);
+    expect((await switchRuntimeNonDestructive(RELAY.id)).ok).toBe(true);
     expect(mocks.repointBaseUrl).toHaveBeenCalledWith(RELAY.apiBase, null);
 
     const forged = {
@@ -320,13 +335,13 @@ describe("switchRuntimeNonDestructive", () => {
       apiBase: "https://credential-sink.example.test",
     };
     withRegistry([LOCAL, forged]);
-    expect(switchRuntimeNonDestructive(forged.id)).toEqual({
+    await expect(switchRuntimeNonDestructive(forged.id)).resolves.toEqual({
       ok: false,
       reason: "untrusted-remote",
     });
   });
 
-  it("switching to a TOKENLESS remote CLEARS the token (no inherited bearer)", () => {
+  it("switching to a TOKENLESS remote CLEARS the token (no inherited bearer)", async () => {
     mocks.isTrustedRestoreApiBaseUrl.mockReturnValue(true);
     const tokenless: AgentProfile = {
       id: "vps-2",
@@ -336,7 +351,7 @@ describe("switchRuntimeNonDestructive", () => {
       createdAt: "2026-06-04T00:00:00.000Z",
     };
     withRegistry([CLOUD, tokenless]);
-    const res = switchRuntimeNonDestructive("vps-2");
+    const res = await switchRuntimeNonDestructive("vps-2");
     expect(res.ok).toBe(true);
     expect(mocks.repointBaseUrl).toHaveBeenCalledWith(
       "http://100.72.1.9:3000",
@@ -344,25 +359,25 @@ describe("switchRuntimeNonDestructive", () => {
     );
   });
 
-  it("clears chat drafts on a switch (no cross-runtime draft bleed)", () => {
+  it("clears chat drafts on a switch (no cross-runtime draft bleed)", async () => {
     withRegistry([LOCAL, CLOUD]);
-    switchRuntimeNonDestructive("cloud-1");
+    await switchRuntimeNonDestructive("cloud-1");
     expect(mocks.clearAllChatDrafts).toHaveBeenCalledTimes(1);
   });
 
-  it("on mobile, persists the runtime-mode so the switch survives a reboot", () => {
+  it("on mobile, persists the runtime-mode so the switch survives a reboot", async () => {
     mocks.getFrontendPlatform.mockReturnValue("android");
     withRegistry([LOCAL, CLOUD]);
-    switchRuntimeNonDestructive("cloud-1");
+    await switchRuntimeNonDestructive("cloud-1");
     expect(mocks.persistMobileRuntimeModeForServerTarget).toHaveBeenCalledWith(
       "elizacloud",
     );
   });
 
-  it("does NOT persist mobile runtime-mode on web", () => {
+  it("does NOT persist mobile runtime-mode on web", async () => {
     mocks.getFrontendPlatform.mockReturnValue("web");
     withRegistry([LOCAL, CLOUD]);
-    switchRuntimeNonDestructive("cloud-1");
+    await switchRuntimeNonDestructive("cloud-1");
     expect(
       mocks.persistMobileRuntimeModeForServerTarget,
     ).not.toHaveBeenCalled();

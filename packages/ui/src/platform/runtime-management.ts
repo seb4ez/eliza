@@ -13,9 +13,9 @@ import { isElectrobunRuntime } from "../bridge/electrobun-runtime";
 import {
   type AgentProfileRegistry,
   addAgentProfile,
-  clearPersistedActiveServer,
+  clearPersistedActiveServerDurably,
   loadAgentProfileRegistry,
-  removeAgentProfile,
+  removeAgentProfileDurably,
   switchRuntimeNonDestructive,
 } from "../state";
 import { isTrustedRestoreApiBaseUrl } from "../state/runtime-url-trust";
@@ -69,20 +69,33 @@ export function removeProfileWithoutStaleSelection(
   profileId: string,
   dependencies: {
     loadRegistry: () => AgentProfileRegistry;
-    switchRuntime: (profileId: string) => { ok: boolean };
-    clearRuntimeSelection: () => void;
-    removeProfile: (profileId: string) => void;
+    switchRuntime: (profileId: string) => Promise<{ ok: boolean }>;
+    clearRuntimeSelection: () => Promise<boolean | undefined>;
+    removeProfile: (profileId: string) => Promise<boolean | undefined>;
   } = {
     loadRegistry: loadAgentProfileRegistry,
     switchRuntime: switchRuntimeNonDestructive,
-    clearRuntimeSelection: () => {
-      clearPersistedActiveServer();
+    clearRuntimeSelection: async () => {
+      await clearPersistedActiveServerDurably();
       client.setToken(null);
       client.setBaseUrl(null);
+      return undefined;
     },
-    removeProfile: removeAgentProfile,
+    removeProfile: removeAgentProfileDurably,
   },
-): void {
+): Promise<void> {
+  return removeProfileWithoutStaleSelectionAsync(profileId, dependencies);
+}
+
+async function removeProfileWithoutStaleSelectionAsync(
+  profileId: string,
+  dependencies: {
+    loadRegistry: () => AgentProfileRegistry;
+    switchRuntime: (profileId: string) => Promise<{ ok: boolean }>;
+    clearRuntimeSelection: () => Promise<boolean | undefined>;
+    removeProfile: (profileId: string) => Promise<boolean | undefined>;
+  },
+): Promise<void> {
   const registry = dependencies.loadRegistry();
   if (registry.activeProfileId === profileId) {
     const fallback =
@@ -90,14 +103,22 @@ export function removeProfileWithoutStaleSelection(
         (profile) => profile.id !== profileId && profile.kind === "local",
       ) ?? registry.profiles.find((profile) => profile.id !== profileId);
     if (!fallback) {
-      dependencies.clearRuntimeSelection();
-    } else if (!dependencies.switchRuntime(fallback.id).ok) {
+      if ((await dependencies.clearRuntimeSelection()) === false) {
+        throw new Error(
+          "The runtime could not be removed because its active selection was not cleared. Try again.",
+        );
+      }
+    } else if (!(await dependencies.switchRuntime(fallback.id)).ok) {
       throw new Error(
         "The runtime could not be removed because the fallback runtime was not saved. Try again.",
       );
     }
   }
-  dependencies.removeProfile(profileId);
+  if ((await dependencies.removeProfile(profileId)) === false) {
+    throw new Error(
+      "The runtime selection changed, but the old profile could not be removed. Try again.",
+    );
+  }
 }
 
 function requiredString(value: string | undefined, field: string): string {
@@ -161,7 +182,7 @@ async function removeRuntime(profileId: string): Promise<void> {
     await removeSshRuntime(profile, SSH_DEPENDENCIES);
     return;
   }
-  removeProfileWithoutStaleSelection(profile.id);
+  await removeProfileWithoutStaleSelection(profile.id);
 }
 
 async function revokeRuntime(targetId: string): Promise<void> {
@@ -177,7 +198,7 @@ async function revokeRuntime(targetId: string): Promise<void> {
       controllerDeviceId: profile.remoteRelay.controllerDeviceId,
       sessionId: profile.remoteRelay.sessionId,
     });
-    removeProfileWithoutStaleSelection(profile.id);
+    await removeProfileWithoutStaleSelection(profile.id);
     return;
   }
 

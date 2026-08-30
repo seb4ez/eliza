@@ -169,7 +169,9 @@ describe("Devices & Runtimes reconciliation", () => {
 
   it("revokes Cloud before local cleanup and retains the profile after partial failure", async () => {
     const events: string[] = [];
-    const removeProfile = vi.fn(() => events.push("remove"));
+    const removeProfile = vi.fn(() => {
+      events.push("remove");
+    });
     await devicesRuntimesInternals.removeRuntimeWithAuthority(PROFILE, {
       revokeSession: vi.fn(async () => {
         events.push("revoke");
@@ -222,7 +224,9 @@ describe("Devices & Runtimes reconciliation", () => {
         events.push("revoke");
       }),
       clearSession: vi.fn(async () => events.push("clear")),
-      removeProfile: vi.fn(() => events.push("remove")),
+      removeProfile: vi.fn(() => {
+        events.push("remove");
+      }),
     });
     expect(events).toEqual(["revoke", "clear", "remove"]);
   });
@@ -314,57 +318,114 @@ describe("Devices & Runtimes reconciliation", () => {
     expect(targets.map((target) => target.id)).toEqual([PROFILE.id]);
   });
 
-  it("switches away from an active profile before removing it", () => {
+  it("switches away from an active profile before removing it", async () => {
     const events: string[] = [];
-    devicesRuntimesInternals.removeProfileWithoutStaleSelection(PROFILE.id, {
-      loadRegistry: () => ({
-        version: 1,
-        activeProfileId: PROFILE.id,
-        profiles: [PROFILE, LOCAL_PROFILE],
-      }),
-      switchRuntime: vi.fn((profileId) => {
-        events.push(`switch:${profileId}`);
-        return { ok: true };
-      }),
-      clearRuntimeSelection: vi.fn(),
-      removeProfile: vi.fn((profileId) => events.push(`remove:${profileId}`)),
-    });
+    await devicesRuntimesInternals.removeProfileWithoutStaleSelection(
+      PROFILE.id,
+      {
+        loadRegistry: () => ({
+          version: 1,
+          activeProfileId: PROFILE.id,
+          profiles: [PROFILE, LOCAL_PROFILE],
+        }),
+        switchRuntime: vi.fn(async (profileId) => {
+          events.push(`switch:${profileId}`);
+          return { ok: true };
+        }),
+        clearRuntimeSelection: vi.fn(async () => undefined),
+        removeProfile: vi.fn(async (profileId) => {
+          events.push(`remove:${profileId}`);
+          return undefined;
+        }),
+      },
+    );
     expect(events).toEqual([
       `switch:${LOCAL_PROFILE.id}`,
       `remove:${PROFILE.id}`,
     ]);
   });
 
-  it("does not remove the active profile when no fallback can be persisted", () => {
-    const removeProfile = vi.fn();
-    expect(() =>
+  it("does not remove the active profile when no fallback can be persisted", async () => {
+    const removeProfile = vi.fn(async () => undefined);
+    await expect(
       devicesRuntimesInternals.removeProfileWithoutStaleSelection(PROFILE.id, {
         loadRegistry: () => ({
           version: 1,
           activeProfileId: PROFILE.id,
           profiles: [PROFILE, LOCAL_PROFILE],
         }),
-        switchRuntime: vi.fn(() => ({ ok: false })),
-        clearRuntimeSelection: vi.fn(),
+        switchRuntime: vi.fn(async () => ({ ok: false })),
+        clearRuntimeSelection: vi.fn(async () => undefined),
         removeProfile,
       }),
-    ).toThrow("fallback runtime was not saved");
+    ).rejects.toThrow("fallback runtime was not saved");
     expect(removeProfile).not.toHaveBeenCalled();
   });
 
-  it("clears an only active runtime selection before removing its profile", () => {
+  it("clears an only active runtime selection before removing its profile", async () => {
     const events: string[] = [];
-    devicesRuntimesInternals.removeProfileWithoutStaleSelection(PROFILE.id, {
-      loadRegistry: () => ({
-        version: 1,
-        activeProfileId: PROFILE.id,
-        profiles: [PROFILE],
-      }),
-      switchRuntime: vi.fn(),
-      clearRuntimeSelection: vi.fn(() => events.push("clear")),
-      removeProfile: vi.fn(() => events.push("remove")),
-    });
+    await devicesRuntimesInternals.removeProfileWithoutStaleSelection(
+      PROFILE.id,
+      {
+        loadRegistry: () => ({
+          version: 1,
+          activeProfileId: PROFILE.id,
+          profiles: [PROFILE],
+        }),
+        switchRuntime: vi.fn(async () => ({ ok: true })),
+        clearRuntimeSelection: vi.fn(async () => {
+          events.push("clear");
+          return undefined;
+        }),
+        removeProfile: vi.fn(async () => {
+          events.push("remove");
+          return undefined;
+        }),
+      },
+    );
     expect(events).toEqual(["clear", "remove"]);
+  });
+
+  it("does not remove an only runtime when durable selection clear rejects", async () => {
+    const removeProfile = vi.fn(async () => undefined);
+    await expect(
+      devicesRuntimesInternals.removeProfileWithoutStaleSelection(PROFILE.id, {
+        loadRegistry: () => ({
+          version: 1,
+          activeProfileId: PROFILE.id,
+          profiles: [PROFILE],
+        }),
+        switchRuntime: vi.fn(async () => ({ ok: true })),
+        clearRuntimeSelection: vi.fn(async () => {
+          throw new Error("protected delete rejected");
+        }),
+        removeProfile,
+      }),
+    ).rejects.toThrow("protected delete rejected");
+    expect(removeProfile).not.toHaveBeenCalled();
+  });
+
+  it("reports durable profile deletion failure after switching to a fallback", async () => {
+    const events: string[] = [];
+    await expect(
+      devicesRuntimesInternals.removeProfileWithoutStaleSelection(PROFILE.id, {
+        loadRegistry: () => ({
+          version: 1,
+          activeProfileId: PROFILE.id,
+          profiles: [PROFILE, LOCAL_PROFILE],
+        }),
+        switchRuntime: vi.fn(async () => {
+          events.push("switch");
+          return { ok: true };
+        }),
+        clearRuntimeSelection: vi.fn(async () => undefined),
+        removeProfile: vi.fn(async () => {
+          events.push("remove");
+          return false;
+        }),
+      }),
+    ).rejects.toThrow("old profile could not be removed");
+    expect(events).toEqual(["switch", "remove"]);
   });
 
   it("revokes a Linux host in Cloud before native credential cleanup", async () => {

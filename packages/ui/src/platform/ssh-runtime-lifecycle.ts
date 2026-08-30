@@ -53,7 +53,7 @@ export interface SshRuntimeLifecycleDependencies {
     profile: Omit<AgentProfile, "id" | "createdAt">,
     options: { activate: false; id: string },
   ): AgentProfile;
-  removeProfile(profileId: string): void;
+  removeProfile(profileId: string): void | Promise<void>;
   loadRegistry(): AgentProfileRegistry;
 }
 
@@ -223,7 +223,7 @@ async function cleanupReceipt(
   await runStep("credential-delete", "deleteCredential", () =>
     dependencies.deleteCredentialRecord(receipt.runtimeId),
   );
-  await runStep("profile-remove", "removeProfile", () => {
+  await runStep("profile-remove", "removeProfile", async () => {
     const registry = dependencies.loadRegistry();
     const profile = registry.profiles.find(
       (candidate) => candidate.id === receipt.profileId,
@@ -232,7 +232,7 @@ async function cleanupReceipt(
     if (registry.activeProfileId === profile.id) {
       throw new Error("Switch away from the SSH runtime before removing it.");
     }
-    dependencies.removeProfile(profile.id);
+    await dependencies.removeProfile(profile.id);
     if (
       dependencies
         .loadRegistry()

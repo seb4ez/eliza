@@ -16,7 +16,7 @@ import type { AgentProfile } from "./agent-profile-types";
 import {
   activeServerIdForAgentProfile,
   loadAgentProfileRegistry,
-  persistAgentProfileSelection,
+  persistAgentProfileSelectionDurably,
 } from "./agent-profiles";
 import { clearAllChatDrafts } from "./ChatComposerContext.hooks";
 import { createPersistedActiveServer } from "./persistence";
@@ -104,9 +104,9 @@ function hasValidNativeRemoteBinding(profile: AgentProfile): boolean {
  * (`isTrustedRestoreApiBaseUrl`). This is why the cockpit "phone drives a remote
  * runtime" path expects the laptop/VPS over tailscale, not a bare public URL.
  */
-export function switchRuntimeNonDestructive(
+export async function switchRuntimeNonDestructive(
   profileId: string,
-): SwitchRuntimeResult {
+): Promise<SwitchRuntimeResult> {
   const registry = loadAgentProfileRegistry();
   const profile = registry.profiles.find((p) => p.id === profileId);
   if (!profile) return { ok: false, reason: "not-found" };
@@ -141,49 +141,40 @@ export function switchRuntimeNonDestructive(
     cloudRuntimeAgentId: profile.cloudRuntimeAgentId,
     cloudRuntime: profile.cloudRuntime,
   });
-  if (!persistAgentProfileSelection(profile.id, server)) {
-    return { ok: false, reason: "persistence-failed" };
-  }
+  const persisted = await persistAgentProfileSelectionDurably(
+    profile.id,
+    server,
+    {
+      // Keep durable selection and live publication inside the same serialized
+      // transaction. This also orders fire-and-forget WebSocket switches.
+      finalize: async () => {
+        notifyRuntimeAuthoritySwitch("before");
 
-  // Persistence made the authority switch durable. Purge authority-local
-  // caches now, before the live client can repoint or hydrate colliding ids.
-  notifyRuntimeAuthoritySwitch("before");
+        if (profile.apiBase) {
+          client.repointBaseUrl(profile.apiBase, profile.accessToken ?? null);
+        } else if (typeof window !== "undefined") {
+          client.setToken(null);
+          client.repointBaseUrl(window.location.origin);
+        }
 
-  // Cloud / remote runtimes get the seamless in-place base + token swap.
-  // Local runtimes are same-origin: re-point back to the app's own host and
-  // CLEAR any prior remote/cloud bearer token — otherwise cloud→local leaves
-  // the live client stuck on the stale remote base + token for the rest of the
-  // session (it only self-heals on reboot).
-  if (profile.apiBase) {
-    client.repointBaseUrl(profile.apiBase, profile.accessToken ?? null);
-  } else if (typeof window !== "undefined") {
-    client.setToken(null);
-    client.repointBaseUrl(window.location.origin);
-  }
+        clearAllChatDrafts();
 
-  // A runtime change is an account change → clear per-conversation composer
-  // drafts so a draft doesn't bleed across runtimes (the canonical
-  // switchAgentProfile clears them too).
-  clearAllChatDrafts();
+        const platform = getFrontendPlatform();
+        if (platform === "android" || platform === "ios") {
+          const target =
+            profile.kind === "local" ||
+            isMobileLocalAgentIpcBase(profile.apiBase)
+              ? "local"
+              : activeServerKindToFirstRunRuntimeTarget(profile.kind);
+          persistMobileRuntimeModeForServerTarget(target);
+        }
 
-  // On mobile, persist the runtime mode so the switch SURVIVES A REBOOT —
-  // otherwise reconcileMobileRestoredActiveServer wipes the active server on the
-  // next boot when the mode disagrees. Mirrors AppContext.switchAgentProfile's
-  // mobile branch exactly (the on-device agent is a `remote` profile on a local
-  // IPC base, so treat that as "local").
-  const platform = getFrontendPlatform();
-  if (platform === "android" || platform === "ios") {
-    const target =
-      profile.kind === "local" || isMobileLocalAgentIpcBase(profile.apiBase)
-        ? "local"
-        : activeServerKindToFirstRunRuntimeTarget(profile.kind);
-    persistMobileRuntimeModeForServerTarget(target);
-  }
-
-  // The live client now points at the new authority and every synchronous
-  // switch mutation has completed. Consumers may safely hydrate that
-  // authority's conversation list and initial transcript.
-  notifyRuntimeAuthoritySwitch("after");
+        notifyRuntimeAuthoritySwitch("after");
+        return true;
+      },
+    },
+  );
+  if (!persisted) return { ok: false, reason: "persistence-failed" };
 
   return { ok: true, profile };
 }

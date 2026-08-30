@@ -17,6 +17,7 @@ import { shellLocalStorage } from "../surface-realm-channel";
 import { isManagedCloudSharedAgentBase } from "../utils/cloud-agent-base";
 import type { AgentProfile, AgentProfileRegistry } from "./agent-profile-types";
 import {
+  isPersistedActiveServerAllowedByBuildTarget,
   type PersistedActiveServer,
   savePersistedActiveServer,
 } from "./persistence";
@@ -37,6 +38,74 @@ export interface AgentProfileConnectionPersistenceOptions
 
 const STORAGE_KEY = "elizaos:agent-profiles";
 const ACTIVE_SERVER_KEY = "elizaos:active-server";
+const RUNTIME_CONNECTION_PERSISTENCE_LOCK =
+  "elizaos:runtime-connection-persistence";
+let runtimeConnectionPersistenceTail: Promise<void> = Promise.resolve();
+
+class RuntimeConnectionPersistenceBoundaryError extends Error {
+  readonly cause: unknown;
+
+  constructor(cause: unknown) {
+    super("The origin-wide runtime persistence lock is unavailable");
+    this.name = "RuntimeConnectionPersistenceBoundaryError";
+    this.cause = cause;
+  }
+}
+
+async function runWithOriginRuntimeConnectionLock<T>(
+  operation: () => Promise<T>,
+): Promise<T> {
+  let lockManager: LockManager | undefined;
+  try {
+    lockManager =
+      typeof navigator === "undefined" ? undefined : navigator.locks;
+  } catch (cause) {
+    throw new RuntimeConnectionPersistenceBoundaryError(cause);
+  }
+  if (!lockManager) return operation();
+
+  let entered = false;
+  try {
+    return await lockManager.request(
+      RUNTIME_CONNECTION_PERSISTENCE_LOCK,
+      { mode: "exclusive" },
+      async () => {
+        entered = true;
+        return operation();
+      },
+    );
+  } catch (cause) {
+    // Callback failures are transaction failures, not lock-acquisition
+    // failures. Only a boundary that was never entered is translated into the
+    // fail-closed sentinel handled by public persistence APIs.
+    if (entered) throw cause;
+    throw new RuntimeConnectionPersistenceBoundaryError(cause);
+  }
+}
+
+/**
+ * Serialize every registry + active-server transaction in this realm, then
+ * extend that exclusion origin-wide through Web Locks when the runtime offers
+ * them. A rejected origin lock never falls back to an unsafe unlocked write.
+ */
+function serializeRuntimeConnectionPersistence<T>(
+  operation: () => Promise<T>,
+): Promise<T> {
+  const result = runtimeConnectionPersistenceTail
+    .catch(() => undefined)
+    .then(() => runWithOriginRuntimeConnectionLock(operation));
+  runtimeConnectionPersistenceTail = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
+function warnRuntimePersistenceBoundaryUnavailable(cause: unknown): void {
+  logger.warn(
+    `[agent-profiles] refused an unlocked runtime persistence transaction: ${describePersistenceError(cause)}`,
+  );
+}
 
 function tryLocalStorage<T>(fn: () => T, fallback: T): T {
   try {
@@ -254,17 +323,27 @@ export function persistAgentProfileSelection(
 export async function persistAgentProfileSelectionDurably(
   profileId: string,
   server: PersistedActiveServer,
-  options: StorageWriteValidationOptions = {},
+  options: AgentProfileConnectionPersistenceOptions = {},
 ): Promise<boolean> {
-  const registry = loadAgentProfileRegistry();
-  if (!registry.profiles.some((profile) => profile.id === profileId)) {
-    return false;
+  try {
+    return await serializeRuntimeConnectionPersistence(async () => {
+      const registry = loadAgentProfileRegistry();
+      if (!registry.profiles.some((profile) => profile.id === profileId)) {
+        return false;
+      }
+      const nextRegistry: AgentProfileRegistry = {
+        ...registry,
+        activeProfileId: profileId,
+      };
+      return persistRegistryAndServerDurably(nextRegistry, server, options);
+    });
+  } catch (cause) {
+    if (cause instanceof RuntimeConnectionPersistenceBoundaryError) {
+      warnRuntimePersistenceBoundaryUnavailable(cause.cause);
+      return false;
+    }
+    throw cause;
   }
-  const nextRegistry: AgentProfileRegistry = {
-    ...registry,
-    activeProfileId: profileId,
-  };
-  return persistRegistryAndServerDurably(nextRegistry, server, options);
 }
 
 async function persistRegistryAndServerDurably(
@@ -272,11 +351,28 @@ async function persistRegistryAndServerDurably(
   server: PersistedActiveServer,
   options: AgentProfileConnectionPersistenceOptions,
 ): Promise<boolean> {
-  const registryWrite = await setStorageValueWithCompensation(
-    STORAGE_KEY,
-    JSON.stringify(registry),
-    options,
-  );
+  if (options.validate?.() === false) return false;
+  if (!isPersistedActiveServerAllowedByBuildTarget(server)) {
+    logger.warn(
+      "[agent-profiles] rejected registry transaction outside the build-pinned remote target",
+    );
+    return false;
+  }
+  let registryWrite: Awaited<
+    ReturnType<typeof setStorageValueWithCompensation>
+  > = null;
+  try {
+    registryWrite = await setStorageValueWithCompensation(
+      STORAGE_KEY,
+      JSON.stringify(registry),
+      options,
+    );
+  } catch (cause) {
+    logger.warn(
+      `[agent-profiles] failed to durably save registry transaction: ${describePersistenceError(cause)}`,
+    );
+    return false;
+  }
   if (!registryWrite) return false;
 
   let serverWrite: Awaited<ReturnType<typeof setStorageValueWithCompensation>> =
@@ -403,19 +499,31 @@ export async function addAgentProfileDurably(
   profile: Omit<AgentProfile, "id" | "createdAt">,
   options: { activate?: boolean; id?: string } = {},
 ): Promise<AgentProfile | null> {
-  const registry = loadAgentProfileRegistry();
-  const full: AgentProfile = {
-    ...profile,
-    id: options.id ?? generateId(),
-    createdAt: new Date().toISOString(),
-  };
-  const nextRegistry: AgentProfileRegistry = {
-    ...registry,
-    profiles: [...registry.profiles, full],
-    activeProfileId:
-      options.activate === false ? registry.activeProfileId : full.id,
-  };
-  return (await saveAgentProfileRegistryDurably(nextRegistry)) ? full : null;
+  try {
+    return await serializeRuntimeConnectionPersistence(async () => {
+      const registry = loadAgentProfileRegistry();
+      const full: AgentProfile = {
+        ...profile,
+        id: options.id ?? generateId(),
+        createdAt: new Date().toISOString(),
+      };
+      const nextRegistry: AgentProfileRegistry = {
+        ...registry,
+        profiles: [...registry.profiles, full],
+        activeProfileId:
+          options.activate === false ? registry.activeProfileId : full.id,
+      };
+      return (await saveAgentProfileRegistryDurably(nextRegistry))
+        ? full
+        : null;
+    });
+  } catch (cause) {
+    if (cause instanceof RuntimeConnectionPersistenceBoundaryError) {
+      warnRuntimePersistenceBoundaryUnavailable(cause.cause);
+      return null;
+    }
+    throw cause;
+  }
 }
 
 /** Trailing-slash-insensitive apiBase compare (both sides may be normalized differently). */
@@ -504,11 +612,21 @@ export function upsertAndActivateAgentProfile(
 export async function upsertAndActivateAgentProfileDurably(
   profile: Omit<AgentProfile, "id" | "createdAt">,
 ): Promise<AgentProfile | null> {
-  const registry = loadAgentProfileRegistry();
-  const upserted = upsertAgentProfileRegistry(registry, profile);
-  return (await saveAgentProfileRegistryDurably(upserted.registry))
-    ? upserted.profile
-    : null;
+  try {
+    return await serializeRuntimeConnectionPersistence(async () => {
+      const registry = loadAgentProfileRegistry();
+      const upserted = upsertAgentProfileRegistry(registry, profile);
+      return (await saveAgentProfileRegistryDurably(upserted.registry))
+        ? upserted.profile
+        : null;
+    });
+  } catch (cause) {
+    if (cause instanceof RuntimeConnectionPersistenceBoundaryError) {
+      warnRuntimePersistenceBoundaryUnavailable(cause.cause);
+      return null;
+    }
+    throw cause;
+  }
 }
 
 /**
@@ -523,15 +641,28 @@ export async function persistAgentProfileConnectionDurably(
   options: AgentProfileConnectionPersistenceOptions = {},
 ): Promise<AgentProfile | null> {
   if (options.validate?.() === false) return null;
-  const registry = loadAgentProfileRegistry();
-  const upserted = upsertAgentProfileRegistry(registry, profile);
-  return (await persistRegistryAndServerDurably(
-    upserted.registry,
-    server,
-    options,
-  ))
-    ? upserted.profile
-    : null;
+  try {
+    return await serializeRuntimeConnectionPersistence(async () => {
+      // Re-read and upsert only after the transaction owns the cross-key
+      // boundary. A queued B connection must include A's committed registry
+      // row instead of publishing a stale pre-lock snapshot over it.
+      const registry = loadAgentProfileRegistry();
+      const upserted = upsertAgentProfileRegistry(registry, profile);
+      return (await persistRegistryAndServerDurably(
+        upserted.registry,
+        server,
+        options,
+      ))
+        ? upserted.profile
+        : null;
+    });
+  } catch (cause) {
+    if (cause instanceof RuntimeConnectionPersistenceBoundaryError) {
+      warnRuntimePersistenceBoundaryUnavailable(cause.cause);
+      return null;
+    }
+    throw cause;
+  }
 }
 
 /** Preserve a cloud agent's platform identity when a profile becomes active. */
@@ -676,6 +807,34 @@ export function removeAgentProfile(id: string): void {
     registry.activeProfileId = registry.profiles[0]?.id ?? null;
   }
   saveAgentProfileRegistry(registry);
+}
+
+/** Remove a profile only after its protected registry rewrite commits. */
+export async function removeAgentProfileDurably(
+  id: string,
+  options: StorageWriteValidationOptions = {},
+): Promise<boolean> {
+  try {
+    return await serializeRuntimeConnectionPersistence(async () => {
+      const registry = loadAgentProfileRegistry();
+      if (!registry.profiles.some((profile) => profile.id === id)) return true;
+      const profiles = registry.profiles.filter((profile) => profile.id !== id);
+      const activeProfileId =
+        registry.activeProfileId === id
+          ? (profiles[0]?.id ?? null)
+          : registry.activeProfileId;
+      return saveAgentProfileRegistryDurably(
+        { ...registry, activeProfileId, profiles },
+        options,
+      );
+    });
+  } catch (cause) {
+    if (cause instanceof RuntimeConnectionPersistenceBoundaryError) {
+      warnRuntimePersistenceBoundaryUnavailable(cause.cause);
+      return false;
+    }
+    throw cause;
+  }
 }
 
 /**

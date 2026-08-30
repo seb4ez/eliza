@@ -1226,6 +1226,29 @@ export interface PersistedActiveServer {
 
 const ACTIVE_SERVER_STORAGE_KEY = "elizaos:active-server";
 
+/**
+ * A build-pinned client has exactly one boot authority. Keep this predicate
+ * shared by the single-record writer and the registry + server transaction so
+ * the latter cannot mutate the profile registry before discovering that its
+ * server target is forbidden.
+ */
+export function isPersistedActiveServerAllowedByBuildTarget(
+  server: PersistedActiveServer,
+): boolean {
+  const pinnedRemoteApiBase = getBuildConfiguredRemoteApiBaseUrl();
+  return (
+    !pinnedRemoteApiBase ||
+    (server.kind === "remote" &&
+      server.apiBase?.replace(/\/+$/, "") === pinnedRemoteApiBase)
+  );
+}
+
+function warnRejectedBuildPinnedActiveServer(): void {
+  logger.warn(
+    "[persistence] rejected active-server change outside the build-pinned remote target",
+  );
+}
+
 function trimPersistedValue(value: unknown): string | undefined {
   if (typeof value !== "string") {
     return undefined;
@@ -1414,15 +1437,8 @@ export function savePersistedActiveServer(
     return false;
   }
 
-  const pinnedRemoteApiBase = getBuildConfiguredRemoteApiBaseUrl();
-  if (
-    pinnedRemoteApiBase &&
-    (server.kind !== "remote" ||
-      server.apiBase?.replace(/\/+$/, "") !== pinnedRemoteApiBase)
-  ) {
-    logger.warn(
-      "[persistence] rejected active-server change outside the build-pinned remote target",
-    );
+  if (!isPersistedActiveServerAllowedByBuildTarget(server)) {
+    warnRejectedBuildPinnedActiveServer();
     return false;
   }
 
@@ -1455,15 +1471,8 @@ export async function savePersistedActiveServerDurably(
 ): Promise<boolean> {
   if (typeof localStorage === "undefined") return false;
 
-  const pinnedRemoteApiBase = getBuildConfiguredRemoteApiBaseUrl();
-  if (
-    pinnedRemoteApiBase &&
-    (server.kind !== "remote" ||
-      server.apiBase?.replace(/\/+$/, "") !== pinnedRemoteApiBase)
-  ) {
-    logger.warn(
-      "[persistence] rejected active-server change outside the build-pinned remote target",
-    );
+  if (!isPersistedActiveServerAllowedByBuildTarget(server)) {
+    warnRejectedBuildPinnedActiveServer();
     return false;
   }
 

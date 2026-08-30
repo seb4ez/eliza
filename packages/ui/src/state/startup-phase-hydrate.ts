@@ -609,7 +609,7 @@ export function bindReadyPhase(
   // repoints the live client to a different backend.
   const unbindSwitchAgent = client.onWsEvent(
     "shell:switch-agent",
-    (data: Record<string, unknown>) => {
+    async (data: Record<string, unknown>) => {
       const requestId =
         typeof data.requestId === "string" ? data.requestId : null;
       const query = typeof data.profile === "string" ? data.profile : "";
@@ -642,7 +642,7 @@ export function bindReadyPhase(
         return;
       }
 
-      const result = switchRuntimeNonDestructive(profile.id);
+      const result = await switchRuntimeNonDestructive(profile.id);
       if (!result.ok) {
         reportResult({ ok: false, reason: result.reason });
         if (result.reason === "untrusted-remote") {

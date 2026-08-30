@@ -13,12 +13,12 @@ import type { AgentProfile } from "../../state/agent-profile-types";
 
 const mocks = vi.hoisted(() => ({
   loadAgentProfileRegistry: vi.fn(),
-  addAgentProfile: vi.fn(),
+  addAgentProfileDurably: vi.fn(),
   // The container only reads `ok` + `reason`; type the mock to the subset it
   // consumes so both success and the untrusted-remote case are assignable.
-  switchRuntimeNonDestructive: vi.fn((): { ok: boolean; reason?: string } => ({
-    ok: true,
-  })),
+  switchRuntimeNonDestructive: vi.fn(
+    async (): Promise<{ ok: boolean; reason?: string }> => ({ ok: true }),
+  ),
   isTrustedRestoreApiBaseUrl: vi.fn(() => true),
   isStoreBuild: vi.fn(() => false),
   isAndroidCloudBuild: vi.fn(() => false),
@@ -26,7 +26,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("../../state", () => ({
   loadAgentProfileRegistry: mocks.loadAgentProfileRegistry,
-  addAgentProfile: mocks.addAgentProfile,
+  addAgentProfileDurably: mocks.addAgentProfileDurably,
   switchRuntimeNonDestructive: mocks.switchRuntimeNonDestructive,
 }));
 vi.mock("../../state/runtime-url-trust", () => ({
@@ -68,11 +68,11 @@ describe("MyRuntimesContainer", () => {
   beforeEach(() => {
     for (const f of Object.values(mocks)) f.mockClear();
     mocks.loadAgentProfileRegistry.mockReturnValue(REG);
-    mocks.switchRuntimeNonDestructive.mockReturnValue({ ok: true });
+    mocks.switchRuntimeNonDestructive.mockResolvedValue({ ok: true });
     mocks.isTrustedRestoreApiBaseUrl.mockReturnValue(true);
     mocks.isStoreBuild.mockReturnValue(false);
     mocks.isAndroidCloudBuild.mockReturnValue(false);
-    mocks.addAgentProfile.mockReturnValue({
+    mocks.addAgentProfileDurably.mockResolvedValue({
       id: "new-1",
       label: "Laptop",
       kind: "remote",
@@ -137,7 +137,7 @@ describe("MyRuntimesContainer", () => {
 
   it("surfaces an error when switching to an untrusted remote", async () => {
     const user = userEvent.setup();
-    mocks.switchRuntimeNonDestructive.mockReturnValue({
+    mocks.switchRuntimeNonDestructive.mockResolvedValue({
       ok: false,
       reason: "untrusted-remote",
     });
@@ -150,7 +150,7 @@ describe("MyRuntimesContainer", () => {
 
   it("surfaces an error when the runtime selection cannot be persisted", async () => {
     const user = userEvent.setup();
-    mocks.switchRuntimeNonDestructive.mockReturnValue({
+    mocks.switchRuntimeNonDestructive.mockResolvedValue({
       ok: false,
       reason: "persistence-failed",
     });
@@ -170,7 +170,7 @@ describe("MyRuntimesContainer", () => {
       "http://100.72.1.9:3000",
     );
     await user.click(screen.getByTestId("add-remote-submit"));
-    expect(mocks.addAgentProfile).toHaveBeenCalledWith(
+    expect(mocks.addAgentProfileDurably).toHaveBeenCalledWith(
       expect.objectContaining({
         kind: "remote",
         label: "Laptop",
@@ -184,7 +184,7 @@ describe("MyRuntimesContainer", () => {
 
   it("does not pre-activate a new remote and surfaces a failed durable switch", async () => {
     const user = userEvent.setup();
-    mocks.switchRuntimeNonDestructive.mockReturnValue({
+    mocks.switchRuntimeNonDestructive.mockResolvedValue({
       ok: false,
       reason: "persistence-failed",
     });
@@ -196,9 +196,10 @@ describe("MyRuntimesContainer", () => {
     );
     await user.click(screen.getByTestId("add-remote-submit"));
 
-    expect(mocks.addAgentProfile).toHaveBeenCalledWith(expect.any(Object), {
-      activate: false,
-    });
+    expect(mocks.addAgentProfileDurably).toHaveBeenCalledWith(
+      expect.any(Object),
+      { activate: false },
+    );
     expect(screen.getByTestId("my-runtimes-error").textContent).toMatch(
       /couldn't be saved/i,
     );
@@ -217,7 +218,7 @@ describe("MyRuntimesContainer", () => {
     expect(screen.getByTestId("my-runtimes-error").textContent).toMatch(
       /trusted/i,
     );
-    expect(mocks.addAgentProfile).not.toHaveBeenCalled();
+    expect(mocks.addAgentProfileDurably).not.toHaveBeenCalled();
     expect(mocks.switchRuntimeNonDestructive).not.toHaveBeenCalled();
   });
 });

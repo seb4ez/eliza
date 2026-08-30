@@ -8,20 +8,27 @@
 // fetch (the result callback transport) are doubled.
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { rememberCsrfTokenForUrl } from "../api/auth/csrf-cookie";
 import { setBootConfig } from "../config/boot-config";
-import { shellLocalStorage } from "../surface-realm-channel";
-import { addAgentProfile } from "./agent-profiles";
+import { addAgentProfile, loadAgentProfileRegistry } from "./agent-profiles";
+import { loadPersistedActiveServer } from "./persistence";
 import { bindReadyPhase, type ReadyPhaseDeps } from "./startup-phase-hydrate";
 
 const clientMock = vi.hoisted(() => {
-  const handlers = new Map<string, (data: Record<string, unknown>) => void>();
+  const handlers = new Map<
+    string,
+    (data: Record<string, unknown>) => void | Promise<void>
+  >();
   return {
     connectWs: vi.fn(),
     disconnectWs: vi.fn(),
     getCodingAgentStatus: vi.fn(async () => ({ tasks: [] })),
     handlers,
     onWsEvent: vi.fn(
-      (event: string, handler: (data: Record<string, unknown>) => void) => {
+      (
+        event: string,
+        handler: (data: Record<string, unknown>) => void | Promise<void>,
+      ) => {
         handlers.set(event, handler);
         return () => {
           handlers.delete(event);
@@ -99,7 +106,7 @@ describe("bindReadyPhase shell:switch-agent handler", () => {
     );
   });
 
-  it("refuses an untrusted remote profile and never repoints the client", () => {
+  it("refuses an untrusted remote profile and never repoints the client", async () => {
     addAgentProfile({
       label: "My VPS",
       kind: "remote",
@@ -107,7 +114,7 @@ describe("bindReadyPhase shell:switch-agent handler", () => {
     });
     const cleanup = bindReadyPhase({ current: makeDeps() });
 
-    clientMock.handlers.get("shell:switch-agent")?.({
+    await clientMock.handlers.get("shell:switch-agent")?.({
       requestId: "req-untrusted",
       profile: "My VPS",
     });
@@ -130,7 +137,7 @@ describe("bindReadyPhase shell:switch-agent handler", () => {
     expect(clientMock.handlers.has("shell:switch-agent")).toBe(false);
   });
 
-  it("refuses a Cloud profile whose kind masks an untrusted public host", () => {
+  it("refuses a Cloud profile whose kind masks an untrusted public host", async () => {
     addAgentProfile({
       label: "Tampered Cloud agent",
       kind: "cloud",
@@ -139,7 +146,7 @@ describe("bindReadyPhase shell:switch-agent handler", () => {
     });
     const cleanup = bindReadyPhase({ current: makeDeps() });
 
-    clientMock.handlers.get("shell:switch-agent")?.({
+    await clientMock.handlers.get("shell:switch-agent")?.({
       requestId: "req-untrusted-cloud",
       profile: "Tampered Cloud agent",
     });
@@ -159,7 +166,7 @@ describe("bindReadyPhase shell:switch-agent handler", () => {
     cleanup();
   });
 
-  it("applies a trusted local profile and reports success", () => {
+  it("applies a trusted local profile and reports success", async () => {
     const laptop = addAgentProfile({
       label: "Laptop",
       kind: "local",
@@ -167,7 +174,7 @@ describe("bindReadyPhase shell:switch-agent handler", () => {
     });
     const cleanup = bindReadyPhase({ current: makeDeps() });
 
-    clientMock.handlers.get("shell:switch-agent")?.({
+    await clientMock.handlers.get("shell:switch-agent")?.({
       requestId: "req-local",
       profile: "Laptop",
     });
@@ -190,15 +197,15 @@ describe("bindReadyPhase shell:switch-agent handler", () => {
     cleanup();
   });
 
-  it("reports persistence failure without repointing or announcing success", () => {
+  it("reports persistence failure without repointing or announcing success", async () => {
     addAgentProfile({
       label: "Laptop",
       kind: "local",
       apiBase: "",
     });
-    const setItem = shellLocalStorage.setItem.bind(shellLocalStorage);
+    const setItem = window.localStorage.setItem.bind(window.localStorage);
     const writeSpy = vi
-      .spyOn(shellLocalStorage, "setItem")
+      .spyOn(window.localStorage, "setItem")
       .mockImplementation((key, value) => {
         if (key === "elizaos:agent-profiles") {
           throw new DOMException("blocked", "SecurityError");
@@ -208,7 +215,7 @@ describe("bindReadyPhase shell:switch-agent handler", () => {
     const cleanup = bindReadyPhase({ current: makeDeps() });
 
     try {
-      clientMock.handlers.get("shell:switch-agent")?.({
+      await clientMock.handlers.get("shell:switch-agent")?.({
         requestId: "req-storage-failed",
         profile: "Laptop",
       });
@@ -234,10 +241,10 @@ describe("bindReadyPhase shell:switch-agent handler", () => {
     }
   });
 
-  it("reports not-found for an unknown profile query", () => {
+  it("reports not-found for an unknown profile query", async () => {
     const cleanup = bindReadyPhase({ current: makeDeps() });
 
-    clientMock.handlers.get("shell:switch-agent")?.({
+    await clientMock.handlers.get("shell:switch-agent")?.({
       requestId: "req-ghost",
       profile: "does-not-exist",
     });
@@ -252,13 +259,45 @@ describe("bindReadyPhase shell:switch-agent handler", () => {
     cleanup();
   });
 
-  it("ignores a switch-agent event with no requestId", () => {
+  it("ignores a switch-agent event with no requestId", async () => {
     const cleanup = bindReadyPhase({ current: makeDeps() });
 
-    clientMock.handlers.get("shell:switch-agent")?.({ profile: "Laptop" });
+    await clientMock.handlers.get("shell:switch-agent")?.({
+      profile: "Laptop",
+    });
 
     expect(globalThis.fetch).not.toHaveBeenCalled();
     expect(clientMock.repointBaseUrl).not.toHaveBeenCalled();
+
+    cleanup();
+  });
+
+  it("orders back-to-back non-awaited WS switches through durable and live state", async () => {
+    const runtimeA = addAgentProfile({
+      label: "Runtime A",
+      kind: "local",
+      apiBase: "",
+    });
+    const runtimeB = addAgentProfile({
+      label: "Runtime B",
+      kind: "remote",
+      apiBase: "http://100.72.1.9:3000",
+    });
+    const cleanup = bindReadyPhase({ current: makeDeps() });
+    const handler = clientMock.handlers.get("shell:switch-agent");
+    if (!handler) throw new Error("switch handler was not bound");
+
+    const pendingA = handler({ requestId: "req-a", profile: runtimeA.id });
+    const pendingB = handler({ requestId: "req-b", profile: runtimeB.id });
+
+    await Promise.all([pendingA, pendingB]);
+    expect(clientMock.repointBaseUrl).toHaveBeenCalledTimes(2);
+    expect(loadAgentProfileRegistry().activeProfileId).toBe(runtimeB.id);
+    expect(loadPersistedActiveServer()?.id).toBe(`remote:${runtimeB.apiBase}`);
+    expect(clientMock.repointBaseUrl.mock.calls.at(-1)).toEqual([
+      runtimeB.apiBase,
+      null,
+    ]);
 
     cleanup();
   });
@@ -272,6 +311,7 @@ describe("bindReadyPhase shell:manage-runtime handler", () => {
     setBootConfig({ branding: {}, apiToken: "runtime-owner-token" });
     // biome-ignore lint/suspicious/noDocumentCookie: jsdom has no Cookie Store API.
     document.cookie = "eliza_csrf=runtime-csrf-token; path=/";
+    rememberCsrfTokenForUrl(clientMock.getBaseUrl(), "runtime-csrf-token");
   });
 
   it("claims before executing and reports the exact result", async () => {

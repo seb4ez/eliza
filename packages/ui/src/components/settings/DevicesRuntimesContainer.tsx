@@ -400,7 +400,7 @@ async function revokeRelayAuthorityWithCleanup(
       controllerDeviceId: string;
       sessionId: string;
     }) => Promise<unknown>;
-    removeProfile: (profileId: string) => void;
+    removeProfile: (profileId: string) => void | Promise<void>;
   },
 ): Promise<void> {
   await dependencies.revokeSession(authority.sessionId);
@@ -409,7 +409,7 @@ async function revokeRelayAuthorityWithCleanup(
     controllerDeviceId: authority.controllerDeviceId,
     sessionId: authority.sessionId,
   });
-  if (authority.profile) dependencies.removeProfile(authority.profile.id);
+  if (authority.profile) await dependencies.removeProfile(authority.profile.id);
 }
 
 interface RuntimeRemovalDependencies {
@@ -421,7 +421,7 @@ interface RuntimeRemovalDependencies {
   }) => Promise<unknown>;
   stopSsh: (runtimeId: string) => Promise<unknown>;
   deleteCredential: (runtimeId: string) => Promise<unknown>;
-  removeProfile: (profileId: string) => void;
+  removeProfile: (profileId: string) => void | Promise<void>;
 }
 
 async function removeRuntimeWithAuthority(
@@ -437,7 +437,7 @@ async function removeRuntimeWithAuthority(
     await dependencies.stopSsh(profile.id);
     await dependencies.deleteCredential(profile.credentialRef ?? profile.id);
   }
-  dependencies.removeProfile(profile.id);
+  await dependencies.removeProfile(profile.id);
 }
 
 async function revokeLinuxHostCloudFirst(
@@ -601,7 +601,7 @@ export function DevicesRuntimesContainer({
 
   const onSelect = (id: string) =>
     run(async () => {
-      const result = switchRuntimeNonDestructive(id);
+      const result = await switchRuntimeNonDestructive(id);
       if (!result.ok)
         throw new Error(
           "That runtime could not be selected. Check its connection and try again.",

@@ -55,7 +55,7 @@ import {
   activeServerIdForAgentProfile,
   getActiveProfile,
   loadAgentProfileRegistry,
-  persistAgentProfileSelection,
+  persistAgentProfileSelectionDurably,
 } from "./agent-profiles";
 import { publishAppValue, seedAppValue } from "./app-store";
 import {
@@ -1548,7 +1548,7 @@ function AppProviderInner({
   );
 
   const switchAgentProfile = useCallback(
-    (profileId: string) => {
+    async (profileId: string) => {
       const profile = loadAgentProfileRegistry().profiles.find(
         (p) => p.id === profileId,
       );
@@ -1583,53 +1583,52 @@ function AppProviderInner({
         cloudRuntimeAgentId: profile.cloudRuntimeAgentId,
         cloudRuntime: profile.cloudRuntime,
       });
-      if (!persistAgentProfileSelection(profileId, server)) {
+      const persisted = await persistAgentProfileSelectionDurably(
+        profileId,
+        server,
+        {
+          // The finalizer runs while the registry + active-server transaction
+          // still owns the runtime boundary, so a queued B selection cannot
+          // commit before A finishes repointing the live app authority.
+          finalize: async () => {
+            // Conversation ids are authority-local. Purge both canonical
+            // snapshots and optimistic overlays before the live client moves.
+            discardConversationMessageState();
+            clearAllChatDrafts();
+
+            const frontendPlatform = getFrontendPlatform();
+            if (frontendPlatform === "android" || frontendPlatform === "ios") {
+              const runtimeTarget: FirstRunRuntimeTarget =
+                server.kind === "local" ||
+                isMobileLocalAgentIpcBase(server.apiBase)
+                  ? "local"
+                  : activeServerKindToFirstRunRuntimeTarget(server.kind);
+              persistMobileRuntimeModeForServerTarget(runtimeTarget);
+            }
+
+            applyAgentProfileConnection(profile, client);
+
+            const target =
+              profile.kind === "cloud"
+                ? "cloud-managed"
+                : profile.kind === "remote"
+                  ? "remote-backend"
+                  : "embedded-local";
+            startupCoordinatorDispatch({
+              type: "SWITCH_AGENT",
+              target: target as RuntimeTarget,
+            });
+            return true;
+          },
+        },
+      );
+      if (!persisted) {
         setActionNotice(
           "Couldn't switch agents because browser storage is unavailable.",
           "error",
         );
         return;
       }
-
-      // Conversation ids are authority-local. Purge both canonical snapshots
-      // and optimistic overlays before the live client can repoint or hydrate
-      // the same id from another profile/account.
-      discardConversationMessageState();
-
-      // Conversation ids are per-account, so saved drafts from the old
-      // profile would re-attach to whatever conversation happens to land
-      // on the same id after the switch. Wipe them only after the durable
-      // selection succeeds.
-      clearAllChatDrafts();
-
-      // On mobile the boot-time reconcile (reconcileMobileRestoredActiveServer)
-      // CLEARS the active server whenever the persisted runtime mode disagrees
-      // with it (`mobileLocal && mode !== "local"` → null). So a profile switch
-      // only survives a reboot if we ALSO persist the matching runtime mode —
-      // otherwise switching to the on-device agent reverts to cloud next boot.
-      // The on-device agent is a `remote` profile whose apiBase is the local IPC
-      // base, so detect that and treat it as "local".
-      const frontendPlatform = getFrontendPlatform();
-      if (frontendPlatform === "android" || frontendPlatform === "ios") {
-        const runtimeTarget: FirstRunRuntimeTarget =
-          server.kind === "local" || isMobileLocalAgentIpcBase(server.apiBase)
-            ? "local"
-            : activeServerKindToFirstRunRuntimeTarget(server.kind);
-        persistMobileRuntimeModeForServerTarget(runtimeTarget);
-      }
-
-      applyAgentProfileConnection(profile, client);
-
-      const target =
-        profile.kind === "cloud"
-          ? "cloud-managed"
-          : profile.kind === "remote"
-            ? "remote-backend"
-            : "embedded-local";
-      startupCoordinatorDispatch({
-        type: "SWITCH_AGENT",
-        target: target as RuntimeTarget,
-      });
     },
     [
       discardConversationMessageState,

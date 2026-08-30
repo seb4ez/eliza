@@ -7,7 +7,7 @@ import { useCallback, useState } from "react";
 import { isStoreBuild } from "../../build-variant";
 import { isAndroidCloudBuild } from "../../platform/android-runtime";
 import {
-  addAgentProfile,
+  addAgentProfileDurably,
   loadAgentProfileRegistry,
   switchRuntimeNonDestructive,
 } from "../../state";
@@ -62,7 +62,7 @@ export function MyRuntimesContainer({ className }: MyRuntimesContainerProps) {
   }, []);
 
   const onSwitch = useCallback(
-    (id: string) => {
+    async (id: string) => {
       setBusy(true);
       setError(null);
       try {
@@ -77,7 +77,7 @@ export function MyRuntimesContainer({ className }: MyRuntimesContainerProps) {
             return;
           }
         }
-        const res = switchRuntimeNonDestructive(id);
+        const res = await switchRuntimeNonDestructive(id);
         if (!res.ok) {
           setError(switchFailureMessage(res.reason));
         }
@@ -90,7 +90,7 @@ export function MyRuntimesContainer({ className }: MyRuntimesContainerProps) {
   );
 
   const onAddRemote = useCallback(
-    (entry: { label: string; apiBase: string; accessToken?: string }) => {
+    async (entry: { label: string; apiBase: string; accessToken?: string }) => {
       setBusy(true);
       setError(null);
       try {
@@ -103,7 +103,7 @@ export function MyRuntimesContainer({ className }: MyRuntimesContainerProps) {
           );
           return;
         }
-        const profile = addAgentProfile(
+        const profile = await addAgentProfileDurably(
           {
             kind: "remote",
             label: entry.label,
@@ -112,7 +112,11 @@ export function MyRuntimesContainer({ className }: MyRuntimesContainerProps) {
           },
           { activate: false },
         );
-        const result = switchRuntimeNonDestructive(profile.id);
+        if (!profile) {
+          setError(switchFailureMessage("persistence-failed"));
+          return;
+        }
+        const result = await switchRuntimeNonDestructive(profile.id);
         if (!result.ok) setError(switchFailureMessage(result.reason));
       } finally {
         refresh();
