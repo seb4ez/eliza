@@ -52,13 +52,19 @@ it("publishes exactly one present transition across login persistence and cookie
 
 it("does not publish credentials when the owning intent aborts during session sync", async () => {
   let resolveSessionPost: ((response: Response) => void) | undefined;
+  let markSessionPostStarted: () => void = () => {};
+  const sessionPostStarted = new Promise<void>((resolve) => {
+    markSessionPostStarted = resolve;
+  });
   const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
     () =>
       new Promise<Response>((resolve) => {
         resolveSessionPost = resolve;
+        markSessionPostStarted();
       }),
   );
   const controller = new AbortController();
+  let sync: Promise<void> | undefined;
   const sessionChanges: StewardSessionChangeDetail[] = [];
   const tokenSyncs: Event[] = [];
   const sessionListener = (event: Event) => {
@@ -71,9 +77,11 @@ it("does not publish credentials when the owning intent aborts during session sy
   window.addEventListener("steward-token-sync", tokenSyncListener);
 
   try {
-    const sync = syncStewardSessionCookie("revoked-token", null, {
+    sync = syncStewardSessionCookie("revoked-token", null, {
       signal: controller.signal,
     });
+    await sessionPostStarted;
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
     expect(fetchSpy.mock.calls[0]?.[1]).toMatchObject({
       signal: controller.signal,
     });
@@ -88,6 +96,14 @@ it("does not publish credentials when the owning intent aborts during session sy
 
     await expect(sync).rejects.toMatchObject({ name: "AbortError" });
   } finally {
+    controller.abort();
+    resolveSessionPost?.(
+      new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    await sync?.catch(() => undefined);
     window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, sessionListener);
     window.removeEventListener("steward-token-sync", tokenSyncListener);
   }
