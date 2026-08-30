@@ -188,6 +188,7 @@ async function hydrateAndCache(
     walletChain?: "ethereum" | "solana";
   },
   persistDecision: boolean,
+  executionCtx?: { waitUntil(promise: Promise<unknown>): void },
 ): Promise<InferenceSessionAuthDecision> {
   const authoritative = await hydrateAuthoritativeDecision(params);
   const decision =
@@ -197,7 +198,24 @@ async function hydrateAndCache(
           admission: await loadInferenceAdmissionSnapshot(authoritative.orgId),
         }
       : authoritative;
-  if (persistDecision) await writeInferenceSessionAuthDecision(decision);
+  if (persistDecision) {
+    const write = writeInferenceSessionAuthDecision(decision);
+    if (executionCtx) {
+      // Origin authorization is complete. Retain the projection write under the
+      // Worker lifetime without making the one-shot continuation wait for KV.
+      executionCtx.waitUntil(
+        write.then((outcome) => {
+          if (outcome.kind !== "written") {
+            logger.warn("[InferenceSessionAuth] Decision cache write failed", {
+              cacheWrite: outcome.kind,
+            });
+          }
+        }),
+      );
+    } else {
+      await write;
+    }
+  }
   return decision;
 }
 
@@ -211,11 +229,12 @@ function getOrCreateHydration(
     walletChain?: "ethereum" | "solana";
   },
   persistDecision: boolean,
+  executionCtx?: { waitUntil(promise: Promise<unknown>): void },
 ): Promise<InferenceSessionAuthDecision> {
   const existing = sessionHydrations.get(params.stewardUserId);
   if (existing) return existing;
 
-  const hydration = hydrateAndCache(params, persistDecision);
+  const hydration = hydrateAndCache(params, persistDecision, executionCtx);
   sessionHydrations.set(params.stewardUserId, hydration);
   const clear = () => {
     if (sessionHydrations.get(params.stewardUserId) === hydration) {
@@ -321,6 +340,7 @@ export async function resolveInferenceSessionAuthContext(
             walletChain: claims.walletChain,
           },
           true,
+          options.executionCtx,
         )
           .then(() => undefined)
           .catch((error) => {
@@ -346,6 +366,7 @@ export async function resolveInferenceSessionAuthContext(
           walletChain: claims.walletChain,
         },
         true,
+        options.executionCtx,
       );
       const observed = hydrationDecision
         .then(() => undefined)
@@ -398,6 +419,7 @@ export async function resolveInferenceSessionAuthContext(
       walletChain: claims.walletChain,
     },
     options.useAuthCache === true,
+    options.executionCtx,
   );
   const resolved = await enforceStrongSessionBoundary(
     decision,
