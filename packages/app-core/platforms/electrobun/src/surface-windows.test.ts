@@ -75,6 +75,7 @@ function createFixture(
   options: {
     boundsStore?: BoundsStore;
     resolveRendererUrl?: () => Promise<string>;
+    resolveNavigationRules?: (configuredRendererUrl: string) => string;
   } = {},
 ) {
   const created: FakeManagedWindow[] = [];
@@ -82,6 +83,11 @@ function createFixture(
   const focused = vi.fn();
   const wired = vi.fn();
   const injected = vi.fn();
+  const resolveNavigationRules = vi.fn(
+    options.resolveNavigationRules ??
+      ((configuredRendererUrl: string) =>
+        JSON.stringify(["^*", `${new URL(configuredRendererUrl).origin}/*`])),
+  );
   const manager = new SurfaceWindowManager({
     createWindow: (windowOptions) => {
       const window = new FakeManagedWindow(windowOptions);
@@ -91,6 +97,7 @@ function createFixture(
     resolveRendererUrl:
       options.resolveRendererUrl ??
       (async () => "http://127.0.0.1:5173/?boot=1#old"),
+    resolveNavigationRules,
     readPreload: () => "// preload",
     wireRpc: wired,
     injectApiBase: injected,
@@ -98,7 +105,15 @@ function createFixture(
     onRegistryChanged: registryChanged,
     boundsStore: options.boundsStore,
   });
-  return { created, focused, injected, manager, registryChanged, wired };
+  return {
+    created,
+    focused,
+    injected,
+    manager,
+    registryChanged,
+    resolveNavigationRules,
+    wired,
+  };
 }
 
 describe("SurfaceWindowManager app windows", () => {
@@ -268,9 +283,16 @@ describe("SurfaceWindowManager app windows", () => {
       title: "Remote Ledger",
       preload: "// preload",
       url: "http://127.0.0.1:5173/?boot=1&appWindow=1#/apps/remote-ledger",
+      navigationRules: JSON.stringify(["^*", "http://127.0.0.1:5173/*"]),
     });
     expect(fixture.created[0]?.setAlwaysOnTop).toHaveBeenCalledWith(true);
-    expect(fixture.wired).toHaveBeenCalledWith(fixture.created[0]);
+    expect(fixture.resolveNavigationRules).toHaveBeenCalledWith(
+      "http://127.0.0.1:5173/?boot=1&appWindow=1#/apps/remote-ledger",
+    );
+    expect(fixture.wired).toHaveBeenCalledWith(
+      fixture.created[0],
+      "http://127.0.0.1:5173/?boot=1&appWindow=1#/apps/remote-ledger",
+    );
     expect(fixture.focused).toHaveBeenCalledWith(fixture.created[0]);
 
     fixture.created[0]?.emit("dom-ready");

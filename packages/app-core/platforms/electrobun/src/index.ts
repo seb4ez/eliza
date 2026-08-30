@@ -42,7 +42,6 @@ import {
   resolveRendererUrlFromEnv,
 } from "./brand-env-reads";
 import { startBrowserWorkspaceBridgeServer } from "./browser-workspace-bridge-server";
-import { readNavigationEventUrl } from "./cloud-auth-window";
 import { hydrateCloudOnlyEnv } from "./cloud-only-boot";
 import {
   appendChatOverlayShellModeParam,
@@ -58,6 +57,7 @@ import {
   createDesktopRpc,
   type ElizaDesktopRpc,
   quitAfterDesktopCleanup,
+  serializePrivilegedRendererNavigationRules,
 } from "./desktop-rpc";
 import { startDesktopTestBridgeServer } from "./desktop-test-bridge-server";
 import {
@@ -813,6 +813,16 @@ async function openBrowserDevtoolsFallback(
   });
 }
 
+function openBlockedRendererNavigationExternally(url: string): void {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return;
+    Utils.openExternal(parsed.href);
+  } catch {
+    // error-policy:J3 malformed blocked navigation stays blocked (fail closed)
+  }
+}
+
 function sendToActiveRenderer(message: string, payload?: unknown): void {
   currentSendToWebview?.(message, payload);
   if (!currentSendToWebview) {
@@ -1147,14 +1157,18 @@ function resolveBottomBarFrame(): {
   return computeBottomBarFrame(workArea);
 }
 
-async function createMainWindow(rpc: ElizaDesktopRpc): Promise<BrowserWindow> {
+async function createMainWindow(
+  rpc: ElizaDesktopRpc,
+  rendererUrl: string,
+): Promise<BrowserWindow> {
   const presentation = resolveDesktopShellWindowPresentation();
   const kiosk = presentation.mode === "kiosk";
   // Chromeless bottom-bar shell (#9953): a frameless, transparent, always-on-top
   // bar pinned to the screen bottom that renders the chat-overlay shell only.
   // Opt-in and mutually exclusive with kiosk.
   const bottomBar = presentation.mode === "bottom-bar";
-  const rendererUrl = await resolveMainWindowRendererUrl();
+  const navigationRules =
+    serializePrivilegedRendererNavigationRules(rendererUrl);
   const buildInfo = await BuildConfig.get();
   const mainWindowPartition = resolveMainWindowPartition(process.env, {
     platform: process.platform,
@@ -1254,6 +1268,7 @@ async function createMainWindow(rpc: ElizaDesktopRpc): Promise<BrowserWindow> {
         height: windowFrame.height,
       },
       windowId: win.id,
+      navigationRules,
       rpc,
       // Keep the isolated view consistent with the owning BrowserWindow. In
       // particular, the launcher must not enter Electrobun's offscreen mirror
@@ -1274,6 +1289,7 @@ async function createMainWindow(rpc: ElizaDesktopRpc): Promise<BrowserWindow> {
       titleBarStyle,
       transparent,
       passthrough,
+      navigationRules,
       rpc,
       ...(mainWindowPartition ? { partition: mainWindowPartition } : {}),
     });
@@ -1368,6 +1384,7 @@ function attachMainWindow(
   win: BrowserWindow,
   rpc: ElizaDesktopRpc,
   sendToWebview: SendToWebview,
+  configuredRendererUrl: string,
   bindRendererLifecycle: ReturnType<
     typeof createDesktopRpc
   >["bindRendererLifecycle"],
@@ -1389,48 +1406,14 @@ function attachMainWindow(
   getDesktopManager().setMainWindowFullWindow(
     presentation.mode !== "bottom-bar",
   );
-  bindRendererLifecycle(win.webview);
+  bindRendererLifecycle(
+    win.webview,
+    configuredRendererUrl,
+    openBlockedRendererNavigationExternally,
+  );
 
   win.webview.on("dom-ready", () => {
     injectApiBase(win);
-  });
-
-  // Prevent the main webview from navigating to external URLs.
-  // The renderer is always served from localhost — any other navigation
-  // (e.g. from a compromised plugin) should open in the default browser.
-  win.webview.on("will-navigate", (event: unknown) => {
-    const e = event as {
-      url?: string;
-      data?: { detail?: string };
-      preventDefault?: () => void;
-    };
-    const url = readNavigationEventUrl(e);
-    try {
-      const parsed = new URL(url);
-      const isAllowed =
-        parsed.protocol === "file:" ||
-        parsed.hostname === "localhost" ||
-        parsed.hostname === "127.0.0.1" ||
-        parsed.protocol === "views:";
-      if (!isAllowed) {
-        e.preventDefault?.();
-        void import("electrobun/bun")
-          .then(({ Utils }) => {
-            try {
-              Utils.openExternal(url);
-            } catch {
-              // error-policy:J6 best-effort hand-off of a blocked URL to the OS
-              // browser; the in-app navigation is already blocked either way.
-            }
-          })
-          // error-policy:J6 dynamic import of the electrobun host shim failing
-          // is non-actionable here — navigation stays blocked.
-          .catch(() => {});
-      }
-    } catch {
-      // error-policy:J3 unparseable URL → block the navigation (fail closed).
-      e.preventDefault?.();
-    }
   });
 
   win.on("close", (event: unknown) => {
@@ -1529,12 +1512,14 @@ async function restoreWindow(): Promise<void> {
     return;
   }
   backgroundWindowPromise = (async () => {
+    const rendererUrl = await resolveMainWindowRendererUrl();
     const { rpc, sendToWebview, bindRendererLifecycle, releaseShellSync } =
       createDesktopRpc("main");
     const win = attachMainWindow(
-      await createMainWindow(rpc),
+      await createMainWindow(rpc, rendererUrl),
       rpc,
       sendToWebview,
+      rendererUrl,
       bindRendererLifecycle,
       releaseShellSync,
     );
@@ -2860,6 +2845,7 @@ async function main(): Promise<void> {
   recordStartupPhase("creating_window", {
     pid: process.pid,
   });
+  const mainRendererUrl = await resolveMainWindowRendererUrl();
   const {
     rpc: mainRpc,
     sendToWebview: mainSendToWebview,
@@ -2867,9 +2853,10 @@ async function main(): Promise<void> {
     releaseShellSync: releaseMainShellSync,
   } = createDesktopRpc("main");
   const mainWin: BrowserWindow | null = attachMainWindow(
-    await createMainWindow(mainRpc),
+    await createMainWindow(mainRpc, mainRendererUrl),
     mainRpc,
     mainSendToWebview,
+    mainRendererUrl,
     bindMainRendererLifecycle,
     releaseMainShellSync,
   );
@@ -2906,7 +2893,15 @@ async function main(): Promise<void> {
   // Per-window RPC tracking: surface windows each get their own typed
   // RPC built up front via createDesktopRpc, baked into the BrowserWindow
   // constructor, then "wired" post-hoc by wireSettingsRpcAfterCreate.
-  const surfaceRpcs = new WeakMap<ManagedWindowLike, ElizaDesktopRpc>();
+  const surfaceRpcs = new WeakMap<
+    ManagedWindowLike,
+    {
+      rpc: ElizaDesktopRpc;
+      bindRendererLifecycle: ReturnType<
+        typeof createDesktopRpc
+      >["bindRendererLifecycle"];
+    }
+  >();
 
   surfaceWindowManager = new SurfaceWindowManager({
     createWindow: (options) => {
@@ -2916,24 +2911,29 @@ async function main(): Promise<void> {
         ...options,
         rpc,
       }) as BrowserWindow & ManagedWindowLike;
-      bindRendererLifecycle(window.webview);
-      surfaceRpcs.set(window, rpc);
+      surfaceRpcs.set(window, { rpc, bindRendererLifecycle });
       // Drop this window's relay endpoint when it closes so a churned detached
       // surface does not leak (#16442).
       window.on("close", releaseShellSync);
       return window;
     },
     resolveRendererUrl,
+    resolveNavigationRules: serializePrivilegedRendererNavigationRules,
     readPreload: () => readResolvedPreloadScript(import.meta.dir),
-    wireRpc: (window) => {
-      const rpc = surfaceRpcs.get(window);
-      if (!rpc) {
+    wireRpc: (window, configuredRendererUrl) => {
+      const endpoint = surfaceRpcs.get(window);
+      if (!endpoint) {
         logger.warn(
           "[surface-windows] wireRpc called for window with no tracked rpc; skipping browser-workspace caller setup",
         );
         return;
       }
-      wireSettingsRpcAfterCreate(rpc);
+      endpoint.bindRendererLifecycle(
+        (window as BrowserWindow & ManagedWindowLike).webview,
+        configuredRendererUrl,
+        openBlockedRendererNavigationExternally,
+      );
+      wireSettingsRpcAfterCreate(endpoint.rpc);
     },
     injectApiBase: (window) =>
       injectApiBase(window as BrowserWindow & ManagedWindowLike),
@@ -3071,6 +3071,9 @@ async function main(): Promise<void> {
         desktop.configureTrayPopover({
           url: popoverUrl.href,
           preload: readResolvedPreloadScript(import.meta.dir),
+          navigationRules: serializePrivilegedRendererNavigationRules(
+            popoverUrl.href,
+          ),
           partition: mainWindowPartition,
           createRpcEndpoint: () => {
             const { rpc, bindRendererLifecycle, releaseShellSync } =
@@ -3083,6 +3086,7 @@ async function main(): Promise<void> {
             };
           },
           injectApiBase,
+          onBlockedNavigation: openBlockedRendererNavigationExternally,
           onWindowFocused: (window) => {
             lastFocusedWindow = window;
           },

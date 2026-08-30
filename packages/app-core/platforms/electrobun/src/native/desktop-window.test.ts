@@ -823,6 +823,7 @@ describe("DesktopManager main window controls", () => {
     const wireReopenedRpc = vi.fn();
     const releaseRpc = vi.fn();
     const releaseReopenedRpc = vi.fn();
+    const onBlockedNavigation = vi.fn();
     const onWindowFocused = vi.fn();
     const createRpcEndpoint = vi
       .fn()
@@ -842,9 +843,11 @@ describe("DesktopManager main window controls", () => {
     manager.configureTrayPopover({
       url: "http://127.0.0.1:5173/?shellMode=tray-popover",
       preload: "// preload",
+      navigationRules: JSON.stringify(["^*", "http://127.0.0.1:5173/*"]),
       partition: "persist:eliza-main",
       createRpcEndpoint,
       injectApiBase,
+      onBlockedNavigation,
       onWindowFocused,
     });
 
@@ -855,6 +858,7 @@ describe("DesktopManager main window controls", () => {
     expect(win.options).toMatchObject({
       url: "http://127.0.0.1:5173/?shellMode=tray-popover",
       preload: "// preload",
+      navigationRules: JSON.stringify(["^*", "http://127.0.0.1:5173/*"]),
       partition: "persist:eliza-main",
       rpc,
       renderer: "native",
@@ -869,7 +873,11 @@ describe("DesktopManager main window controls", () => {
     });
     expect(win.webview.remove).not.toHaveBeenCalled();
     expect(createRpcEndpoint).toHaveBeenCalledOnce();
-    expect(bindRendererLifecycle).toHaveBeenCalledWith(win.webview);
+    expect(bindRendererLifecycle).toHaveBeenCalledWith(
+      win.webview,
+      "http://127.0.0.1:5173/?shellMode=tray-popover",
+      onBlockedNavigation,
+    );
     expect(wireRpc).toHaveBeenCalledWith(win);
     expect(onWindowFocused).toHaveBeenCalledWith(win);
     expect(win.setAlwaysOnTop).toHaveBeenCalledWith(true);
@@ -922,6 +930,8 @@ describe("DesktopManager main window controls", () => {
     expect(reopened.options).toMatchObject({ rpc: reopenedRpc });
     expect(bindReopenedRendererLifecycle).toHaveBeenCalledWith(
       reopened.webview,
+      "http://127.0.0.1:5173/?shellMode=tray-popover",
+      onBlockedNavigation,
     );
     expect(wireReopenedRpc).toHaveBeenCalledWith(reopened);
     expect(releaseReopenedRpc).not.toHaveBeenCalled();

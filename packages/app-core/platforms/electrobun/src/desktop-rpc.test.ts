@@ -8,7 +8,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   awaitDesktopRpcSecureStoreCleanup,
   createDesktopRpc,
+  createPrivilegedRendererOriginPolicy,
   quitAfterDesktopCleanup,
+  serializePrivilegedRendererNavigationRules,
 } from "./desktop-rpc";
 import type { RendererSecureStoreOwner } from "./renderer-secure-store-authority";
 import { rendererSecureStoreRevisions } from "./renderer-secure-store-revisions";
@@ -73,13 +75,13 @@ vi.mock("./logger", () => ({
 
 function createLifecycleHarness(): {
   executeJavascript: ReturnType<typeof vi.fn<(script: string) => void>>;
-  handlers: Map<string, () => void>;
+  handlers: Map<string, (event?: unknown) => void>;
   lifecycle: {
     executeJavascript: (script: string) => void;
-    on: (name: string, handler: () => void) => void;
+    on: (name: string, handler: (event?: unknown) => void) => void;
   };
 } {
-  const handlers = new Map<string, () => void>();
+  const handlers = new Map<string, (event?: unknown) => void>();
   const executeJavascript = vi.fn<(script: string) => void>();
   return {
     executeJavascript,
@@ -88,6 +90,19 @@ function createLifecycleHarness(): {
       executeJavascript,
       on: (name, handler) => handlers.set(name, handler),
     },
+  };
+}
+
+const RENDERER_URL = "http://127.0.0.1:5173/?boot=1";
+
+function navigationEvent(url?: string): {
+  data: { detail?: string };
+  preventDefault: ReturnType<typeof vi.fn>;
+  response?: { allow: boolean };
+} {
+  return {
+    data: url ? { detail: url } : {},
+    preventDefault: vi.fn(),
   };
 }
 
@@ -112,6 +127,51 @@ afterEach(async () => {
   mocks.shellRelease.mockReset();
   await awaitDesktopRpcSecureStoreCleanup();
   mocks.releaseOwner.mockClear();
+});
+
+describe("privileged renderer origin policy", () => {
+  it("allows only the configured HTTP origin while preserving internal paths and query state", () => {
+    const policy = createPrivilegedRendererOriginPolicy(RENDERER_URL);
+
+    expect(policy.allows("http://127.0.0.1:5173/chat?thread=7#latest")).toBe(
+      true,
+    );
+    expect(policy.allows("http://127.0.0.1:5174/chat")).toBe(false);
+    expect(policy.allows("http://localhost:5173/chat")).toBe(false);
+    expect(policy.allows("https://127.0.0.1:5173/chat")).toBe(false);
+    expect(policy.allows("blob:http://127.0.0.1:5173/renderer-document")).toBe(
+      false,
+    );
+    expect(policy.allows("views://main/index.html")).toBe(false);
+    expect(policy.allows("file:///tmp/eliza/index.html")).toBe(false);
+    expect(serializePrivilegedRendererNavigationRules(RENDERER_URL)).toBe(
+      JSON.stringify(["^*", "http://127.0.0.1:5173/*"]),
+    );
+  });
+
+  it("allows query/hash changes only on the exact configured file renderer", () => {
+    const configured = "file:///Applications/Eliza/app/index.html?boot=1#home";
+    const policy = createPrivilegedRendererOriginPolicy(configured);
+
+    expect(
+      policy.allows("file:///Applications/Eliza/app/index.html?tab=chat#row-2"),
+    ).toBe(true);
+    expect(
+      policy.allows("file:///Applications/Eliza/app/index.html.evil"),
+    ).toBe(false);
+    expect(policy.allows("file:///Applications/Eliza/app/other.html")).toBe(
+      false,
+    );
+    expect(policy.allows("views://main/index.html")).toBe(false);
+    expect(serializePrivilegedRendererNavigationRules(configured)).toBe(
+      JSON.stringify([
+        "^*",
+        "file:///Applications/Eliza/app/index.html",
+        "file:///Applications/Eliza/app/index.html?*",
+        "file:///Applications/Eliza/app/index.html#*",
+      ]),
+    );
+  });
 });
 
 describe("createDesktopRpc secure-store lifecycle", () => {
@@ -174,6 +234,84 @@ describe("createDesktopRpc secure-store lifecycle", () => {
     expect(quit).toHaveBeenCalledOnce();
   });
 
+  it("blocks an external navigation and never publishes a capability after its commit", async () => {
+    const endpoint = createDesktopRpc("external-navigation-renderer");
+    const lifecycle = createLifecycleHarness();
+    const onBlockedNavigation = vi.fn();
+    endpoint.bindRendererLifecycle(
+      lifecycle.lifecycle,
+      RENDERER_URL,
+      onBlockedNavigation,
+    );
+    const documents = mocks.secureStoreDocuments;
+    if (!documents) throw new Error("secure-store document authority missing");
+
+    lifecycle.handlers.get("dom-ready")?.(navigationEvent(RENDERER_URL));
+    await vi.waitFor(() => {
+      expect(lifecycle.executeJavascript).toHaveBeenCalledOnce();
+    });
+    expect(lifecycle.executeJavascript.mock.calls[0]?.[0]).toContain(
+      'globalThis.location?.origin === "http://127.0.0.1:5173"',
+    );
+    const publicationA = readPublishedCapability(
+      lifecycle.executeJavascript.mock.calls[0]?.[0] ?? "",
+    );
+
+    const externalUrl = "https://checkout.example/pay?return=eliza";
+    const willNavigate = navigationEvent(externalUrl);
+    lifecycle.handlers.get("will-navigate")?.(willNavigate);
+    expect(willNavigate.preventDefault).toHaveBeenCalledOnce();
+    expect(willNavigate.response).toEqual({ allow: false });
+    expect(onBlockedNavigation).toHaveBeenCalledWith(externalUrl);
+
+    lifecycle.handlers.get("did-commit-navigation")?.(
+      navigationEvent(externalUrl),
+    );
+    lifecycle.handlers.get("dom-ready")?.(navigationEvent(externalUrl));
+    mocks.rpcMessages.secureStoreDocumentReady?.();
+
+    await vi.waitFor(() => expect(mocks.releaseOwner).toHaveBeenCalledOnce());
+    await expect(
+      resolveDocumentOwner(documents, publicationA.documentCapability),
+    ).rejects.toThrow("document is not active");
+    await Promise.resolve();
+    expect(lifecycle.executeJavascript).toHaveBeenCalledOnce();
+
+    endpoint.releaseShellSync();
+    await awaitDesktopRpcSecureStoreCleanup();
+  });
+
+  it("revokes the active document on a commit with no URL and cannot republish it", async () => {
+    const endpoint = createDesktopRpc("missing-commit-url-renderer");
+    const lifecycle = createLifecycleHarness();
+    endpoint.bindRendererLifecycle(lifecycle.lifecycle, RENDERER_URL);
+    const documents = mocks.secureStoreDocuments;
+    if (!documents) throw new Error("secure-store document authority missing");
+
+    lifecycle.handlers.get("dom-ready")?.(navigationEvent(RENDERER_URL));
+    await vi.waitFor(() => {
+      expect(lifecycle.executeJavascript).toHaveBeenCalledOnce();
+    });
+    const publicationA = readPublishedCapability(
+      lifecycle.executeJavascript.mock.calls[0]?.[0] ?? "",
+    );
+
+    lifecycle.handlers.get("did-commit-navigation")?.(
+      navigationEvent(undefined),
+    );
+    lifecycle.handlers.get("dom-ready")?.(navigationEvent(undefined));
+    mocks.rpcMessages.secureStoreDocumentReady?.();
+
+    await vi.waitFor(() => expect(mocks.releaseOwner).toHaveBeenCalledOnce());
+    await expect(
+      resolveDocumentOwner(documents, publicationA.documentCapability),
+    ).rejects.toThrow("document is not active");
+    expect(lifecycle.executeJavascript).toHaveBeenCalledOnce();
+
+    endpoint.releaseShellSync();
+    await awaitDesktopRpcSecureStoreCleanup();
+  });
+
   it("rolls A back after native commit before publishing B and rejects delayed A", async () => {
     let finishRelease: () => void = () => {};
     mocks.releaseOwner.mockImplementation(
@@ -184,11 +322,11 @@ describe("createDesktopRpc secure-store lifecycle", () => {
     );
     const endpoint = createDesktopRpc("reload-renderer");
     const lifecycle = createLifecycleHarness();
-    endpoint.bindRendererLifecycle(lifecycle.lifecycle);
+    endpoint.bindRendererLifecycle(lifecycle.lifecycle, RENDERER_URL);
     const documents = mocks.secureStoreDocuments;
     if (!documents) throw new Error("secure-store document authority missing");
 
-    lifecycle.handlers.get("dom-ready")?.();
+    lifecycle.handlers.get("dom-ready")?.(navigationEvent(RENDERER_URL));
     await vi.waitFor(() => {
       expect(lifecycle.executeJavascript).toHaveBeenCalledOnce();
     });
@@ -201,9 +339,13 @@ describe("createDesktopRpc secure-store lifecycle", () => {
       publicationA.documentCapability,
     );
 
-    lifecycle.handlers.get("will-navigate")?.();
+    lifecycle.handlers.get("will-navigate")?.(
+      navigationEvent("http://127.0.0.1:5173/next?reload=1"),
+    );
     expect(mocks.releaseOwner).not.toHaveBeenCalled();
-    lifecycle.handlers.get("did-commit-navigation")?.();
+    lifecycle.handlers.get("did-commit-navigation")?.(
+      navigationEvent("http://127.0.0.1:5173/next?reload=1"),
+    );
     const delayedA = resolveDocumentOwner(
       documents,
       publicationA.documentCapability,
@@ -217,7 +359,9 @@ describe("createDesktopRpc secure-store lifecycle", () => {
         delayedASettled = true;
       },
     );
-    lifecycle.handlers.get("dom-ready")?.();
+    lifecycle.handlers.get("dom-ready")?.(
+      navigationEvent("http://127.0.0.1:5173/next?reload=1"),
+    );
 
     await vi.waitFor(() => {
       expect(mocks.releaseOwner).toHaveBeenCalledWith(ownerA);
@@ -262,11 +406,11 @@ describe("createDesktopRpc secure-store lifecycle", () => {
   it("keeps A active when will-navigate is cancelled and a raw ready hint cannot rotate authority", async () => {
     const endpoint = createDesktopRpc("cancelled-navigation-renderer");
     const lifecycle = createLifecycleHarness();
-    endpoint.bindRendererLifecycle(lifecycle.lifecycle);
+    endpoint.bindRendererLifecycle(lifecycle.lifecycle, RENDERER_URL);
     const documents = mocks.secureStoreDocuments;
     if (!documents) throw new Error("secure-store document authority missing");
 
-    lifecycle.handlers.get("dom-ready")?.();
+    lifecycle.handlers.get("dom-ready")?.(navigationEvent(RENDERER_URL));
     await vi.waitFor(() => {
       expect(lifecycle.executeJavascript).toHaveBeenCalledOnce();
     });
@@ -278,8 +422,10 @@ describe("createDesktopRpc secure-store lifecycle", () => {
       publicationA.documentCapability,
     );
 
-    lifecycle.handlers.get("will-navigate")?.();
-    lifecycle.handlers.get("dom-ready")?.();
+    lifecycle.handlers.get("will-navigate")?.(
+      navigationEvent("http://127.0.0.1:5173/cancelled"),
+    );
+    lifecycle.handlers.get("dom-ready")?.(navigationEvent(RENDERER_URL));
     mocks.rpcMessages.secureStoreDocumentReady?.();
     await Promise.resolve();
 
@@ -299,11 +445,11 @@ describe("createDesktopRpc secure-store lifecycle", () => {
     lifecycle.executeJavascript.mockImplementationOnce(() => {
       throw new Error("preload callback is not installed yet");
     });
-    endpoint.bindRendererLifecycle(lifecycle.lifecycle);
+    endpoint.bindRendererLifecycle(lifecycle.lifecycle, RENDERER_URL);
     const documents = mocks.secureStoreDocuments;
     if (!documents) throw new Error("secure-store document authority missing");
 
-    lifecycle.handlers.get("dom-ready")?.();
+    lifecycle.handlers.get("dom-ready")?.(navigationEvent(RENDERER_URL));
     await vi.waitFor(() => {
       expect(lifecycle.executeJavascript).toHaveBeenCalledOnce();
     });
@@ -336,11 +482,11 @@ describe("createDesktopRpc secure-store lifecycle", () => {
 
     const endpoint = createDesktopRpc("in-flight-response-renderer");
     const lifecycle = createLifecycleHarness();
-    endpoint.bindRendererLifecycle(lifecycle.lifecycle);
+    endpoint.bindRendererLifecycle(lifecycle.lifecycle, RENDERER_URL);
     const documents = mocks.secureStoreDocuments;
     if (!documents) throw new Error("secure-store document authority missing");
 
-    lifecycle.handlers.get("dom-ready")?.();
+    lifecycle.handlers.get("dom-ready")?.(navigationEvent(RENDERER_URL));
     await vi.waitFor(() => {
       expect(lifecycle.executeJavascript).toHaveBeenCalledOnce();
     });
@@ -363,7 +509,9 @@ describe("createDesktopRpc secure-store lifecycle", () => {
         return value;
       });
 
-    lifecycle.handlers.get("did-commit-navigation")?.();
+    lifecycle.handlers.get("did-commit-navigation")?.(
+      navigationEvent("http://127.0.0.1:5173/response-drain"),
+    );
     await Promise.resolve();
     expect(mocks.releaseOwner).not.toHaveBeenCalled();
     expect(lifecycle.executeJavascript).toHaveBeenCalledOnce();
@@ -392,11 +540,17 @@ describe("createDesktopRpc secure-store lifecycle", () => {
     );
     const endpoint = createDesktopRpc("overlapping-navigation-renderer");
     const lifecycle = createLifecycleHarness();
-    endpoint.bindRendererLifecycle(lifecycle.lifecycle);
+    endpoint.bindRendererLifecycle(lifecycle.lifecycle, RENDERER_URL);
 
-    lifecycle.handlers.get("did-commit-navigation")?.();
-    lifecycle.handlers.get("did-commit-navigation")?.();
-    lifecycle.handlers.get("dom-ready")?.();
+    lifecycle.handlers.get("did-commit-navigation")?.(
+      navigationEvent("http://127.0.0.1:5173/first"),
+    );
+    lifecycle.handlers.get("did-commit-navigation")?.(
+      navigationEvent("http://127.0.0.1:5173/latest"),
+    );
+    lifecycle.handlers.get("dom-ready")?.(
+      navigationEvent("http://127.0.0.1:5173/latest"),
+    );
     await vi.waitFor(() => expect(mocks.releaseOwner).toHaveBeenCalledOnce());
     finishRelease();
 
@@ -418,8 +572,8 @@ describe("createDesktopRpc secure-store lifecycle", () => {
   it("creates a fresh host capability when the same surface closes and reopens", async () => {
     const firstEndpoint = createDesktopRpc("tray-popover");
     const firstLifecycle = createLifecycleHarness();
-    firstEndpoint.bindRendererLifecycle(firstLifecycle.lifecycle);
-    firstLifecycle.handlers.get("dom-ready")?.();
+    firstEndpoint.bindRendererLifecycle(firstLifecycle.lifecycle, RENDERER_URL);
+    firstLifecycle.handlers.get("dom-ready")?.(navigationEvent(RENDERER_URL));
     await vi.waitFor(() => {
       expect(firstLifecycle.executeJavascript).toHaveBeenCalledOnce();
     });
@@ -431,8 +585,13 @@ describe("createDesktopRpc secure-store lifecycle", () => {
 
     const reopenedEndpoint = createDesktopRpc("tray-popover");
     const reopenedLifecycle = createLifecycleHarness();
-    reopenedEndpoint.bindRendererLifecycle(reopenedLifecycle.lifecycle);
-    reopenedLifecycle.handlers.get("dom-ready")?.();
+    reopenedEndpoint.bindRendererLifecycle(
+      reopenedLifecycle.lifecycle,
+      RENDERER_URL,
+    );
+    reopenedLifecycle.handlers.get("dom-ready")?.(
+      navigationEvent(RENDERER_URL),
+    );
     await vi.waitFor(() => {
       expect(reopenedLifecycle.executeJavascript).toHaveBeenCalledOnce();
     });

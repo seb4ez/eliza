@@ -37,8 +37,158 @@ interface RendererDocumentLifecycle {
   executeJavascript(script: string): void;
   on(
     name: "will-navigate" | "did-commit-navigation" | "dom-ready",
-    handler: () => void,
+    handler: (event?: unknown) => void,
   ): void;
+}
+
+export type BlockedRendererNavigationHandler = (url: string) => void;
+
+interface RendererNavigationEventLike {
+  url?: unknown;
+  detail?: unknown;
+  data?: { detail?: unknown };
+  preventDefault?: () => void;
+  response?: { allow: boolean };
+}
+
+type PrivilegedRendererAuthority =
+  | { kind: "origin"; origin: string; protocol: "http:" | "https:" }
+  | {
+      kind: "file";
+      canonicalUrl: string;
+      hostname: string;
+      pathname: string;
+    };
+
+export interface PrivilegedRendererOriginPolicy {
+  allows(candidateUrl: string): boolean;
+  readonly javascriptLocationGuard: string;
+  readonly navigationRules: readonly string[];
+}
+
+function parsePrivilegedRendererAuthority(
+  configuredRendererUrl: string,
+): PrivilegedRendererAuthority {
+  let configured: URL;
+  try {
+    configured = new URL(configuredRendererUrl);
+  } catch {
+    throw new Error(
+      `Privileged renderer URL is invalid: ${configuredRendererUrl}`,
+    );
+  }
+
+  if (configured.protocol === "http:" || configured.protocol === "https:") {
+    if (configured.origin.includes("*")) {
+      throw new Error("Privileged renderer origins cannot contain wildcards.");
+    }
+    return {
+      kind: "origin",
+      origin: configured.origin,
+      protocol: configured.protocol,
+    };
+  }
+
+  if (configured.protocol === "file:") {
+    configured.search = "";
+    configured.hash = "";
+    if (configured.href.includes("*")) {
+      throw new Error(
+        "Privileged renderer file URLs cannot contain wildcards.",
+      );
+    }
+    return {
+      kind: "file",
+      canonicalUrl: configured.href,
+      hostname: configured.hostname,
+      pathname: configured.pathname,
+    };
+  }
+
+  throw new Error(
+    `Privileged renderer URL must use http:, https:, or an exact file: URL; received ${configured.protocol}`,
+  );
+}
+
+/**
+ * Resolve the sole document authority for a preload/RPC-bearing renderer.
+ * Loopback aliases, ports, custom schemes, and sibling file paths are not
+ * interchangeable: the exact configured renderer URL defines the boundary.
+ */
+export function createPrivilegedRendererOriginPolicy(
+  configuredRendererUrl: string,
+): PrivilegedRendererOriginPolicy {
+  const authority = parsePrivilegedRendererAuthority(configuredRendererUrl);
+  if (authority.kind === "origin") {
+    return {
+      allows: (candidateUrl) => {
+        try {
+          const candidate = new URL(candidateUrl);
+          return (
+            candidate.protocol === authority.protocol &&
+            candidate.origin === authority.origin
+          );
+        } catch {
+          return false;
+        }
+      },
+      javascriptLocationGuard: [
+        `globalThis.location?.protocol === ${JSON.stringify(authority.protocol)}`,
+        `globalThis.location?.origin === ${JSON.stringify(authority.origin)}`,
+      ].join(" && "),
+      navigationRules: ["^*", `${authority.origin}/*`],
+    };
+  }
+
+  return {
+    allows: (candidateUrl) => {
+      try {
+        const candidate = new URL(candidateUrl);
+        candidate.search = "";
+        candidate.hash = "";
+        return candidate.href === authority.canonicalUrl;
+      } catch {
+        return false;
+      }
+    },
+    javascriptLocationGuard: [
+      `globalThis.location?.protocol === "file:"`,
+      `globalThis.location?.hostname === ${JSON.stringify(authority.hostname)}`,
+      `globalThis.location?.pathname === ${JSON.stringify(authority.pathname)}`,
+    ].join(" && "),
+    navigationRules: [
+      "^*",
+      authority.canonicalUrl,
+      `${authority.canonicalUrl}?*`,
+      `${authority.canonicalUrl}#*`,
+    ],
+  };
+}
+
+export function serializePrivilegedRendererNavigationRules(
+  configuredRendererUrl: string,
+): string {
+  return JSON.stringify(
+    createPrivilegedRendererOriginPolicy(configuredRendererUrl).navigationRules,
+  );
+}
+
+function readRendererNavigationUrl(event: unknown): string {
+  if (typeof event === "string") return event;
+  if (!event || typeof event !== "object") return "";
+  const candidate = event as RendererNavigationEventLike;
+  if (typeof candidate.url === "string") return candidate.url;
+  if (typeof candidate.detail === "string") return candidate.detail;
+  return typeof candidate.data?.detail === "string"
+    ? candidate.data.detail
+    : "";
+}
+
+function blockRendererNavigation(event: unknown): void {
+  if (!event || typeof event !== "object") return;
+  const candidate = event as RendererNavigationEventLike;
+  candidate.preventDefault?.();
+  candidate.response = { allow: false };
 }
 
 interface RendererDocumentOwner extends PendingOwnerRelease {
@@ -130,7 +280,11 @@ export async function quitAfterDesktopCleanup(
 export function createDesktopRpc(label: string): {
   rpc: ElizaDesktopRpc;
   sendToWebview: SendToWebview;
-  bindRendererLifecycle: (lifecycle: RendererDocumentLifecycle) => void;
+  bindRendererLifecycle: (
+    lifecycle: RendererDocumentLifecycle,
+    configuredRendererUrl: string,
+    onBlockedNavigation?: BlockedRendererNavigationHandler,
+  ) => void;
   releaseShellSync: () => void;
 } {
   let rpc: ElizaDesktopRpc | undefined;
@@ -140,6 +294,7 @@ export function createDesktopRpc(label: string): {
   let documentGeneration = 0;
   let publishableGeneration: number | null = null;
   let initialPublicationAttempted = false;
+  let rendererDocumentAuthorized = true;
 
   const createOwnerRelease = (generation: number): RendererDocumentOwner => {
     ownerGeneration += 1;
@@ -159,11 +314,13 @@ export function createDesktopRpc(label: string): {
     return entry;
   };
 
-  let currentDocument = createOwnerRelease(documentGeneration);
+  let currentDocument: RendererDocumentOwner | null =
+    createOwnerRelease(documentGeneration);
   let ownerReady: Promise<void> = Promise.resolve();
 
-  const confirmRendererNavigation = (): void => {
+  const transitionRendererDocument = (authorized: boolean): void => {
     if (released) return;
+    rendererDocumentAuthorized = authorized;
     documentGeneration += 1;
     const successorGeneration = documentGeneration;
     publishableGeneration = null;
@@ -171,8 +328,10 @@ export function createDesktopRpc(label: string): {
       .catch(() => undefined)
       .then(async () => {
         const predecessor = currentDocument;
-        await startOwnerRelease(predecessor);
-        if (!released && successorGeneration === documentGeneration) {
+        if (predecessor) await startOwnerRelease(predecessor);
+        if (successorGeneration !== documentGeneration) return;
+        currentDocument = null;
+        if (!released && authorized) {
           currentDocument = createOwnerRelease(successorGeneration);
           publishableGeneration = successorGeneration;
           requestCapabilityPublication();
@@ -194,6 +353,7 @@ export function createDesktopRpc(label: string): {
       const current = currentDocument;
       if (
         released ||
+        !current ||
         current.documentCapability !== documentCapability ||
         current.releaseStarted
       ) {
@@ -239,6 +399,7 @@ export function createDesktopRpc(label: string): {
   };
 
   let rendererLifecycle: RendererDocumentLifecycle | null = null;
+  let rendererOriginPolicy: PrivilegedRendererOriginPolicy | null = null;
   let capabilityPublication: Promise<void> | null = null;
   let capabilityPublicationQueued = false;
 
@@ -250,28 +411,33 @@ export function createDesktopRpc(label: string): {
     if (
       released ||
       !rendererLifecycle ||
+      !rendererOriginPolicy ||
       publishableGeneration !== documentGeneration
     ) {
       return;
     }
     const targetGeneration = documentGeneration;
     const targetLifecycle = rendererLifecycle;
+    const targetPolicy = rendererOriginPolicy;
     const publication = (async () => {
       await ownerReady;
+      const current = currentDocument;
       if (
         released ||
+        rendererOriginPolicy !== targetPolicy ||
         publishableGeneration !== targetGeneration ||
-        currentDocument.generation !== targetGeneration ||
-        currentDocument.releaseStarted
+        !current ||
+        current.generation !== targetGeneration ||
+        current.releaseStarted
       ) {
         return;
       }
       const payload = JSON.stringify({
-        documentCapability: currentDocument.documentCapability,
+        documentCapability: current.documentCapability,
         generation: targetGeneration,
       });
       targetLifecycle.executeJavascript(
-        `globalThis.__ELIZA_ACCEPT_SECURE_STORE_DOCUMENT_CAPABILITY__?.(${payload});`,
+        `if (${targetPolicy.javascriptLocationGuard}) globalThis.__ELIZA_ACCEPT_SECURE_STORE_DOCUMENT_CAPABILITY__?.(${payload});`,
       );
       if (targetGeneration === 0) initialPublicationAttempted = true;
     })();
@@ -329,20 +495,48 @@ export function createDesktopRpc(label: string): {
   return {
     rpc,
     sendToWebview,
-    bindRendererLifecycle: (lifecycle) => {
+    bindRendererLifecycle: (
+      lifecycle,
+      configuredRendererUrl,
+      onBlockedNavigation,
+    ) => {
       if (lifecycleBound) return;
+      const policy = createPrivilegedRendererOriginPolicy(
+        configuredRendererUrl,
+      );
       lifecycleBound = true;
       rendererLifecycle = lifecycle;
-      lifecycle.on("will-navigate", () => {
+      rendererOriginPolicy = policy;
+      lifecycle.on("will-navigate", (event) => {
         // A pre-commit navigation may still be cancelled by another listener.
         // Disable resends, but keep A fully active until an authenticated
         // native did-commit event schedules its rollback.
         publishableGeneration = null;
+        const url = readRendererNavigationUrl(event);
+        if (policy.allows(url)) return;
+        blockRendererNavigation(event);
+        if (!url || !onBlockedNavigation) return;
+        try {
+          onBlockedNavigation(url);
+        } catch (error) {
+          logger.warn(
+            `[secure-store:${label}] blocked-navigation handoff failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
       });
-      lifecycle.on("did-commit-navigation", () => {
-        confirmRendererNavigation();
+      lifecycle.on("did-commit-navigation", (event) => {
+        const url = readRendererNavigationUrl(event);
+        transitionRendererDocument(policy.allows(url));
       });
-      lifecycle.on("dom-ready", () => {
+      lifecycle.on("dom-ready", (event) => {
+        const url = readRendererNavigationUrl(event);
+        if (!policy.allows(url)) {
+          // Native navigation rules are the synchronous barrier. This second
+          // fence covers a missing/malformed commit signal and makes an
+          // externally committed document incapable of retaining authority.
+          if (rendererDocumentAuthorized) transitionRendererDocument(false);
+          return;
+        }
         // Electrobun implements dom-ready in renderer JavaScript. It is safe
         // only for bootstrapping generation zero, never as rollover authority.
         if (documentGeneration === 0 && !initialPublicationAttempted) {
@@ -355,6 +549,8 @@ export function createDesktopRpc(label: string): {
       if (released) return;
       released = true;
       rendererLifecycle = null;
+      rendererOriginPolicy = null;
+      rendererDocumentAuthorized = false;
       publishableGeneration = null;
       releaseSecureStoreRevisions();
       shellSyncEndpoint.release();

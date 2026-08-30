@@ -60,6 +60,7 @@ export interface CreateManagedWindowOptions {
   title: string;
   url: string;
   preload: string;
+  navigationRules: string;
   frame: ManagedWindowFrame;
   titleBarStyle: ManagedWindowTitleBarStyle;
   transparent: boolean;
@@ -78,8 +79,9 @@ interface PendingAppWindow {
 interface SurfaceWindowManagerOptions {
   createWindow: (options: CreateManagedWindowOptions) => ManagedWindowLike;
   resolveRendererUrl: () => Promise<string>;
+  resolveNavigationRules: (configuredRendererUrl: string) => string;
   readPreload: () => string;
-  wireRpc: (window: ManagedWindowLike) => void;
+  wireRpc: (window: ManagedWindowLike, configuredRendererUrl: string) => void;
   injectApiBase: (window: ManagedWindowLike) => void;
   onWindowFocused?: (window: ManagedWindowLike) => void;
   onRegistryChanged?: () => void;
@@ -197,6 +199,7 @@ export function buildAppWindowRendererUrl(
 export class SurfaceWindowManager {
   private readonly createWindowFn: SurfaceWindowManagerOptions["createWindow"];
   private readonly resolveRendererUrlFn: SurfaceWindowManagerOptions["resolveRendererUrl"];
+  private readonly resolveNavigationRulesFn: SurfaceWindowManagerOptions["resolveNavigationRules"];
   private readonly readPreloadFn: SurfaceWindowManagerOptions["readPreload"];
   private readonly wireRpcFn: SurfaceWindowManagerOptions["wireRpc"];
   private readonly injectApiBaseFn: SurfaceWindowManagerOptions["injectApiBase"];
@@ -214,6 +217,7 @@ export class SurfaceWindowManager {
   constructor(options: SurfaceWindowManagerOptions) {
     this.createWindowFn = options.createWindow;
     this.resolveRendererUrlFn = options.resolveRendererUrl;
+    this.resolveNavigationRulesFn = options.resolveNavigationRules;
     this.readPreloadFn = options.readPreload;
     this.wireRpcFn = options.wireRpc;
     this.injectApiBaseFn = options.injectApiBase;
@@ -489,6 +493,7 @@ export class SurfaceWindowManager {
       title,
       url,
       preload,
+      navigationRules: this.resolveNavigationRulesFn(url),
       frame,
       titleBarStyle: resolveManagedWindowTitleBarStyle(surface),
       transparent: false,
@@ -508,7 +513,7 @@ export class SurfaceWindowManager {
     };
 
     this.windows.set(id, record);
-    this.wireRpcFn(window);
+    this.wireRpcFn(window, url);
     this.onWindowFocused?.(window);
     window.webview.on("dom-ready", () => {
       this.injectApiBaseFn(window);

@@ -151,7 +151,11 @@ type TrayPopoverRpc = NonNullable<TrayPopoverBrowserWindowOptions["rpc"]>;
 
 interface TrayPopoverRpcEndpoint {
   rpc: TrayPopoverRpc;
-  bindRendererLifecycle?: (lifecycle: BrowserWindow["webview"]) => void;
+  bindRendererLifecycle?: (
+    lifecycle: BrowserWindow["webview"],
+    configuredRendererUrl: string,
+    onBlockedNavigation?: (url: string) => void,
+  ) => void;
   wireRpc?: (window: BrowserWindow) => void;
   release: () => void;
 }
@@ -159,9 +163,11 @@ interface TrayPopoverRpcEndpoint {
 interface TrayPopoverConfig {
   url: string;
   preload: string;
+  navigationRules: string;
   partition?: string | null;
   createRpcEndpoint: () => TrayPopoverRpcEndpoint;
   injectApiBase?: (window: BrowserWindow) => void;
+  onBlockedNavigation?: (url: string) => void;
   onWindowFocused?: (window: BrowserWindow) => void;
 }
 
@@ -2468,12 +2474,17 @@ X-GNOME-Autostart-enabled=true
       transparent: true,
       titleBarStyle: "hidden",
       ...(config.partition ? { partition: config.partition } : {}),
+      navigationRules: config.navigationRules,
       rpc: endpoint.rpc,
     };
     let win: BrowserWindow;
     try {
       win = createElectrobunBrowserWindow(options);
-      endpoint.bindRendererLifecycle?.(win.webview);
+      endpoint.bindRendererLifecycle?.(
+        win.webview,
+        config.url,
+        config.onBlockedNavigation,
+      );
       endpoint.wireRpc?.(win);
     } catch (error) {
       releaseEndpoint();
