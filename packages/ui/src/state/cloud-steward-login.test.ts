@@ -1,6 +1,8 @@
 /** Verifies cloud-steward-login seam through the package's configured test harness. */
 // @vitest-environment jsdom
 
+import { registerStewardTokenRemoval } from "@elizaos/shared/steward-session-client";
+
 /**
  * The Steward login seam (`cloud-steward-login`): stored-JWT usability checks
  * (expiry parsing), launcher registration, and `launchStewardLogin` dispatch.
@@ -89,6 +91,29 @@ describe("cloud-steward-login seam", () => {
       expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
     } finally {
       unregister();
+    }
+  });
+
+  it("does not clear a newer token while retiring an expired predecessor", async () => {
+    const expired = makeJwt(-60);
+    const newer = makeJwt(600);
+    localStorage.setItem(STEWARD_TOKEN_KEY, expired);
+    const unregisterRemoval = registerStewardTokenRemoval(async (options) => {
+      expect(options?.expectedToken).toBe(expired);
+      localStorage.setItem(STEWARD_TOKEN_KEY, newer);
+      return false;
+    });
+    const unregisterLauncher = registerStewardLoginLauncher(async () => ({
+      token: "fresh-jwt",
+    }));
+    try {
+      await expect(launchStewardLogin()).resolves.toEqual({
+        token: "fresh-jwt",
+      });
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(newer);
+    } finally {
+      unregisterLauncher();
+      unregisterRemoval();
     }
   });
 

@@ -106,7 +106,7 @@ export async function launchStewardLogin(): Promise<StewardLoginResult> {
   if (existing && isStoredStewardTokenUsable(existing)) {
     return { token: existing };
   }
-  if (existing) await clearStoredStewardToken();
+  if (existing) await clearStoredStewardToken({ expectedToken: existing });
 
   if (!registeredLauncher) {
     throw new Error(
