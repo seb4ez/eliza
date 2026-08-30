@@ -1,13 +1,19 @@
 /** Verifies Telegram claim authority survives Steward login without replay or loss. */
 // @vitest-environment jsdom
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { STEWARD_TOKEN_KEY } from "@elizaos/shared/steward-session-client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   clearPendingOnboardingSession,
   peekPendingOnboardingSession,
   storePendingOnboardingSession,
   TELEGRAM_ACCOUNT_CLAIM_PURPOSE,
 } from "../../join/lib/onboarding-continuation";
+import { enqueueStewardSessionMutation } from "../../lib/steward-session-mutation-queue";
+import {
+  completeStewardSessionRecoverySnapshot,
+  readStewardSessionRecovery,
+} from "../../lib/steward-session-recovery-marker";
 import {
   confirmTelegramAccountClaim,
   exchangeStewardCodeViaApi,
@@ -16,7 +22,22 @@ import {
 
 const TOKEN = "telegram-claim-test-token-00000001";
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+beforeEach(() => {
+  window.localStorage.setItem(STEWARD_TOKEN_KEY, "steward-token");
+});
+
 afterEach(() => {
+  completeStewardSessionRecoverySnapshot(
+    readStewardSessionRecovery("elizacloud"),
+  );
   clearPendingOnboardingSession();
   window.sessionStorage.clear();
   window.localStorage.clear();
@@ -117,6 +138,7 @@ describe("Steward Telegram account claim handoff", () => {
       confirmTelegramAccountClaim("steward-token", TOKEN),
     ).rejects.toThrow("This Telegram chat cannot be linked automatically");
     expect(peekPendingOnboardingSession()).toBe(TOKEN);
+    expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([]);
   });
 
   it("does not clear a newer claim when an older explicit claim succeeds", async () => {
@@ -188,6 +210,90 @@ describe("Steward Telegram account claim handoff", () => {
     expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({
       token: "steward-token",
     });
+    expect(peekPendingOnboardingSession()).toBe(TOKEN);
+  });
+
+  it("persists its receipt before waiting for the irreversible POST lease", async () => {
+    storePendingOnboardingSession(TOKEN, TELEGRAM_ACCOUNT_CLAIM_PURPOSE);
+    const leaseAcquired = deferred<void>();
+    const releaseLease = deferred<void>();
+    const held = enqueueStewardSessionMutation(async () => {
+      leaseAcquired.resolve();
+      await releaseLease.promise;
+    });
+    await leaseAcquired.promise;
+    const fetchMock = vi.fn().mockResolvedValue(Response.json({ ok: true }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const confirmation = confirmTelegramAccountClaim("steward-token", TOKEN);
+    const receipt = readStewardSessionRecovery("elizacloud");
+    expect(receipt.receipts).toHaveLength(1);
+    expect(fetchMock).not.toHaveBeenCalled();
+    sessionStorage.clear();
+    expect(readStewardSessionRecovery("elizacloud").receipts).toEqual(
+      receipt.receipts,
+    );
+
+    releaseLease.resolve();
+    await held;
+    await confirmation;
+    expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([]);
+    expect(peekPendingOnboardingSession()).toBeNull();
+  });
+
+  it("preserves receipt and claim after an ambiguous response loss", async () => {
+    storePendingOnboardingSession(TOKEN, TELEGRAM_ACCOUNT_CLAIM_PURPOSE);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new TypeError("response lost after commit");
+      }),
+    );
+
+    await expect(
+      confirmTelegramAccountClaim("steward-token", TOKEN),
+    ).rejects.toThrow("response lost after commit");
+    expect(readStewardSessionRecovery("elizacloud").receipts).toHaveLength(1);
+    expect(peekPendingOnboardingSession()).toBe(TOKEN);
+  });
+
+  it("does not dispatch account A after account B wins while waiting for the lease", async () => {
+    storePendingOnboardingSession(TOKEN, TELEGRAM_ACCOUNT_CLAIM_PURPOSE);
+    const leaseAcquired = deferred<void>();
+    const releaseLease = deferred<void>();
+    const held = enqueueStewardSessionMutation(async () => {
+      leaseAcquired.resolve();
+      await releaseLease.promise;
+    });
+    await leaseAcquired.promise;
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const confirmation = confirmTelegramAccountClaim("steward-token", TOKEN);
+    localStorage.setItem(STEWARD_TOKEN_KEY, "account-b-token");
+    releaseLease.resolve();
+    await held;
+
+    await expect(confirmation).rejects.toThrow("account changed");
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([]);
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("account-b-token");
+  });
+
+  it("never publishes A when B appears after the server may have committed", async () => {
+    storePendingOnboardingSession(TOKEN, TELEGRAM_ACCOUNT_CLAIM_PURPOSE);
+    const response = deferred<Response>();
+    const fetchMock = vi.fn(() => response.promise);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const confirmation = confirmTelegramAccountClaim("steward-token", TOKEN);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    localStorage.setItem(STEWARD_TOKEN_KEY, "account-b-token");
+    response.resolve(Response.json({ ok: true }));
+
+    await expect(confirmation).rejects.toThrow("superseded");
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("account-b-token");
+    expect(readStewardSessionRecovery("elizacloud").receipts).toHaveLength(1);
     expect(peekPendingOnboardingSession()).toBe(TOKEN);
   });
 });

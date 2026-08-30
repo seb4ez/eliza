@@ -11,8 +11,15 @@
  * names, so a wrong guess produces a resume that reports the user's sign-in as
  * expired and no evidence anywhere of why.
  */
+// @vitest-environment jsdom
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { enqueueStewardSessionMutation } from "../../lib/steward-session-mutation-queue";
+import {
+  beginStewardSessionRecovery,
+  readStewardSessionRecovery,
+  rejectStewardSessionRecovery,
+} from "../../lib/steward-session-recovery-marker";
 
 import {
   buildOidcResumeTarget,
@@ -23,8 +30,18 @@ import {
 
 const RID = `eoq_${"a".repeat(64)}`;
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
 afterEach(() => {
   vi.unstubAllEnvs();
+  localStorage.clear();
+  sessionStorage.clear();
 });
 
 function withIssuer(value: string): void {
@@ -210,6 +227,106 @@ describe("prepareOidcResumeTarget", () => {
       status: "ok",
       url: `https://api-staging.eliza.app/api/oidc/authorize/resume?rid=${RID}`,
     });
+  });
+
+  it("keeps a durable receipt across tab-close until issuer sync is fully acknowledged", async () => {
+    withIssuer("https://api-staging.eliza.app");
+    const serverCommit = deferred<void>();
+    const syncSession = vi.fn(() => serverCommit.promise);
+
+    const pending = prepareOidcResumeTarget(
+      RID,
+      "staging.eliza.app",
+      "https://staging.eliza.app",
+      {
+        readToken: () => "account-a",
+        syncSession,
+      },
+    );
+    await vi.waitFor(() => expect(syncSession).toHaveBeenCalledTimes(1));
+
+    const beforeClose = readStewardSessionRecovery("elizacloud");
+    expect(beforeClose.receipts).toHaveLength(1);
+    sessionStorage.clear();
+    expect(readStewardSessionRecovery("elizacloud").receipts).toEqual(
+      beforeClose.receipts,
+    );
+
+    serverCommit.resolve();
+    await expect(pending).resolves.toMatchObject({ status: "ok" });
+    expect(readStewardSessionRecovery("elizacloud").receipts).toHaveLength(0);
+  });
+
+  it("does not replay a stored account while a newer login receipt is ambiguous", async () => {
+    withIssuer("https://api-staging.eliza.app");
+    const newerLogin = beginStewardSessionRecovery("elizacloud", "provider");
+    const syncSession = vi.fn(() => Promise.resolve());
+    try {
+      await expect(
+        prepareOidcResumeTarget(RID, "staging.eliza.app", undefined, {
+          readToken: () => "stale-account-a",
+          syncSession,
+        }),
+      ).resolves.toEqual({ status: "session_sync_failed" });
+      expect(syncSession).not.toHaveBeenCalled();
+      expect(readStewardSessionRecovery("elizacloud").receipts).toContain(
+        newerLogin.receipt,
+      );
+    } finally {
+      rejectStewardSessionRecovery(newerLogin);
+    }
+  });
+
+  it("revalidates the exact token after waiting for the origin lease", async () => {
+    withIssuer("https://api-staging.eliza.app");
+    let storedToken = "account-a";
+    let releaseLease: () => void = () => {};
+    const leaseAcquired = deferred<void>();
+    const heldLease = enqueueStewardSessionMutation(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseLease = resolve;
+          leaseAcquired.resolve();
+        }),
+    );
+    await leaseAcquired.promise;
+    const syncSession = vi.fn(async () => undefined);
+    const pending = prepareOidcResumeTarget(
+      RID,
+      "staging.eliza.app",
+      "https://staging.eliza.app",
+      { readToken: () => storedToken, syncSession },
+    );
+    storedToken = "account-b";
+    releaseLease();
+
+    await heldLease;
+    await expect(pending).resolves.toEqual({ status: "session_sync_failed" });
+    expect(syncSession).not.toHaveBeenCalled();
+    expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([]);
+  });
+
+  it("keeps ambiguity when the exact token changes after issuer commit", async () => {
+    withIssuer("https://api-staging.eliza.app");
+    let storedToken = "account-a";
+    const syncSession = vi.fn(async () => {
+      storedToken = "account-b";
+    });
+
+    await expect(
+      prepareOidcResumeTarget(
+        RID,
+        "staging.eliza.app",
+        "https://staging.eliza.app",
+        { readToken: () => storedToken, syncSession },
+      ),
+    ).resolves.toEqual({ status: "session_sync_failed" });
+
+    expect(syncSession).toHaveBeenCalledWith(
+      "account-a",
+      "https://api-staging.eliza.app/api/auth/steward-session",
+    );
+    expect(readStewardSessionRecovery("elizacloud").receipts).toHaveLength(1);
   });
 
   it("does not sync an invalid request id", async () => {

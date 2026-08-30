@@ -55,13 +55,33 @@ import { appModeNavigation } from "../app-mode/app-mode";
 import { decodeJwtPayload } from "../lib/jwt";
 import { invalidateStewardServerCookieSyncMarker } from "../lib/steward-session-cookie-sync-marker";
 import {
+  enqueueStewardSessionMutation,
+  type StewardSessionMutationLease,
+} from "../lib/steward-session-mutation-queue";
+import {
+  beginStewardSessionLogout,
+  beginStewardSessionRecovery,
+  completeStewardSessionLogout,
+  completeStewardSessionRecovery,
+  isStewardSessionLogoutIntentLive,
+  isStewardSessionRecoveryReceiptLive,
+  readStewardSessionLogoutIntents,
+  rejectStewardSessionRecovery,
+  type StewardSessionLogoutIntent,
+} from "../lib/steward-session-recovery-marker";
+import {
   clearStaleStewardSession,
   configuredSessionEndpoint,
 } from "../shell/StewardProviderShared";
+import {
+  configuredStewardTenantId,
+  DEFAULT_STEWARD_TENANT_ID,
+} from "../shell/steward-config";
 import { ELIZA_CLOUD_DIRECT_API_BY_HOST } from "../shell/steward-url";
 
 /** Client route (registered on every host; role-switched by hostname). */
 export const SSO_BRIDGE_PATH = "/auth/bridge";
+const STEWARD_TENANT_ID = configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID);
 
 /**
  * The two deployed origin pairs. Staging must bridge to staging — a staging
@@ -504,66 +524,103 @@ export async function performSsoExchange(
   verifier: string,
   hostname: string,
   fetchFn: typeof fetch = fetch,
+  mutationLease?: StewardSessionMutationLease,
 ): Promise<SsoExchangeResult> {
   const base = apiBaseForHostname(hostname);
   if (!base) return { ok: false, error: "Host cannot exchange SSO codes" };
   if (!isWellFormedSsoChallenge(verifier)) {
     return { ok: false, error: "Malformed code verifier" };
   }
+
+  let recoveryReceipt: ReturnType<typeof beginStewardSessionRecovery>;
   try {
-    const res = await fetchFn(`${base}/api/auth/sso-bridge/exchange`, {
-      method: "POST",
-      credentials: "include",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code, codeVerifier: verifier }),
-    });
-    if (!res.ok) {
-      return { ok: false, error: `Exchange failed (HTTP ${res.status})` };
-    }
-    const body = (await res.json().catch(() => null)) as {
-      token?: unknown;
-    } | null;
-    const token = typeof body?.token === "string" ? body.token : null;
-    if (!token || !tokenLooksHydratable(token)) {
-      return { ok: false, error: "Exchange returned no usable session" };
-    }
+    // The exchange code is one-shot and its response can plant account-B
+    // cookies before this document publishes B locally. Persist ambiguity
+    // synchronously so tab-close/reload can never fall back to stale A.
+    recoveryReceipt = beginStewardSessionRecovery(
+      STEWARD_TENANT_ID,
+      "provider",
+    );
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
 
-    await writeStoredStewardToken(token);
-
-    // Same call the login flow makes: sets the HttpOnly steward cookies + the
-    // authed marker for this environment. It stays best-effort for an ordinary
-    // bridge because AuthTokenSync retries. Account-link authority is never
-    // discovered here: a pending Telegram claim remains inert until the user
-    // returns to /get-started and confirms the preview explicitly.
+  const exchange = async (
+    _mutationLease: StewardSessionMutationLease,
+  ): Promise<SsoExchangeResult> => {
+    if (!isStewardSessionRecoveryReceiptLive(recoveryReceipt)) {
+      return { ok: false, error: "SSO exchange was superseded" };
+    }
     try {
-      await fetchFn(configuredSessionEndpoint(), {
+      const res = await fetchFn(`${base}/api/auth/sso-bridge/exchange`, {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token }),
+        body: JSON.stringify({ code, codeVerifier: verifier }),
       });
-    } catch {
-      // error-policy:J6 best-effort cookie sync; the localStorage session is
-      // established and AuthTokenSync re-syncs on its own cadence.
-    }
+      if (!res.ok) {
+        if (res.status >= 400 && res.status < 500 && res.status !== 408) {
+          rejectStewardSessionRecovery(recoveryReceipt);
+        }
+        return { ok: false, error: `Exchange failed (HTTP ${res.status})` };
+      }
+      const body = (await res.json().catch(() => null)) as {
+        token?: unknown;
+      } | null;
+      const token = typeof body?.token === "string" ? body.token : null;
+      if (!token || !tokenLooksHydratable(token)) {
+        return { ok: false, error: "Exchange returned no usable session" };
+      }
 
-    clearSsoBridgeAttempt();
-    clearSsoLoggedOut();
-    try {
-      window.dispatchEvent(new CustomEvent("steward-token-sync"));
-    } catch {
-      // error-policy:J6 best-effort notification; storage listeners re-read
-      // on their own triggers.
+      if (!isStewardSessionRecoveryReceiptLive(recoveryReceipt)) {
+        return { ok: false, error: "SSO exchange was superseded" };
+      }
+
+      await writeStoredStewardToken(token);
+
+      // Same call the login flow makes: sets the HttpOnly steward cookies + the
+      // authed marker for this environment. It stays best-effort for an ordinary
+      // bridge because AuthTokenSync retries. Account-link authority is never
+      // discovered here: a pending Telegram claim remains inert until the user
+      // returns to /get-started and confirms the preview explicitly.
+      try {
+        await fetchFn(configuredSessionEndpoint(), {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token }),
+        });
+      } catch {
+        // error-policy:J6 best-effort cookie sync; the localStorage session is
+        // established and AuthTokenSync re-syncs on its own cadence.
+      }
+
+      clearSsoBridgeAttempt();
+      clearSsoLoggedOut();
+      try {
+        window.dispatchEvent(new CustomEvent("steward-token-sync"));
+      } catch {
+        // error-policy:J6 best-effort notification; storage listeners re-read
+        // on their own triggers.
+      }
+      completeStewardSessionRecovery(recoveryReceipt);
+      return { ok: true };
+    } catch (err) {
+      // error-policy:J1 transport failure becomes the typed failure result the
+      // bridge route turns into its fall-back-to-login redirect.
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
     }
-    return { ok: true };
-  } catch (err) {
-    // error-policy:J1 transport failure becomes the typed failure result the
-    // bridge route turns into its fall-back-to-login redirect.
-    return {
-      ok: false,
-      error: err instanceof Error ? err.message : String(err),
-    };
-  }
+  };
+
+  return mutationLease
+    ? exchange(mutationLease)
+    : enqueueStewardSessionMutation(exchange);
 }
 
 /**
@@ -618,32 +675,17 @@ export async function signOutFromSsoBridgedHost(
   hostname: string = window.location.hostname,
   fetchFn: typeof fetch = fetch,
 ): Promise<void> {
-  const stewardToken = readStoredStewardToken();
-  // Invalidate before even issuing the server logout request: fetch adapters
-  // may have synchronous hooks, and no re-entrant token publication may reuse
-  // proof from the authority epoch being ended.
+  // Persist before waiting for the origin lock. If this document closes while
+  // an older login owns that lock, pageshow/online replay below will issue the
+  // same idempotent logout before any passive writer can reuse the token.
+  const intent = beginStewardSessionLogout(
+    STEWARD_TENANT_ID,
+    "logout",
+    hostname,
+  );
   invalidateStewardServerCookieSyncMarker();
   markSsoLoggedOut();
-  const base = apiBaseForHostname(hostname);
-  const serverLogout = base
-    ? fetchFn(`${base}/api/auth/logout`, {
-        method: "POST",
-        credentials: "include",
-        headers: {
-          "Content-Type": "application/json",
-          ...(stewardToken ? { Authorization: `Bearer ${stewardToken}` } : {}),
-        },
-      })
-    : // error-policy:J6 best-effort server teardown — the local marker is
-      // already set and the local scrub below always runs.
-      Promise.resolve(undefined);
-  await clearStaleStewardSession();
-  const response = await serverLogout;
-  if (response && !response.ok) {
-    throw new Error(
-      `Eliza Cloud could not end the browser session (${response.status}).`,
-    );
-  }
+  await executeSsoLogoutIntent(intent, fetchFn);
 }
 
 /**
@@ -656,28 +698,95 @@ export async function prepareSsoAccountSwitch(
   hostname: string = window.location.hostname,
   fetchFn: typeof fetch = fetch,
 ): Promise<void> {
-  const stewardToken = readStoredStewardToken();
+  const intent = beginStewardSessionLogout(
+    STEWARD_TENANT_ID,
+    "account-switch",
+    hostname,
+  );
   invalidateStewardServerCookieSyncMarker();
   markSsoLoggedOut();
-  const base = apiBaseForHostname(hostname);
-  if (!base) {
-    throw new Error(
-      "Eliza Cloud account switching is unavailable on this host.",
-    );
-  }
-  const serverLogout = fetchFn(`${base}/api/auth/logout`, {
-    method: "POST",
-    credentials: "include",
-    headers: {
-      "Content-Type": "application/json",
-      ...(stewardToken ? { Authorization: `Bearer ${stewardToken}` } : {}),
-    },
+  await executeSsoLogoutIntent(intent, fetchFn);
+}
+
+async function executeSsoLogoutIntent(
+  intent: StewardSessionLogoutIntent,
+  fetchFn: typeof fetch,
+): Promise<void> {
+  await enqueueStewardSessionMutation(async (mutationLease) => {
+    if (!isStewardSessionLogoutIntentLive(intent)) return;
+    invalidateStewardServerCookieSyncMarker();
+    markSsoLoggedOut();
+
+    const base = apiBaseForHostname(intent.targetHostname);
+    if (!base && intent.kind === "account-switch") {
+      throw new Error(
+        "Eliza Cloud account switching is unavailable on this host.",
+      );
+    }
+    let stewardToken: string | null = null;
+    try {
+      stewardToken = readStoredStewardToken();
+    } catch {
+      // Cookies can still authorize an idempotent replay. The durable intent,
+      // not an optional plaintext token copy, remains the retry authority.
+    }
+    if (base) {
+      const response = await fetchFn(`${base}/api/auth/logout`, {
+        method: "POST",
+        credentials: "include",
+        keepalive: true,
+        headers: {
+          "Content-Type": "application/json",
+          "X-Eliza-CSRF": "1",
+          ...(stewardToken ? { Authorization: `Bearer ${stewardToken}` } : {}),
+        },
+      });
+      if (!response.ok) {
+        const action =
+          intent.kind === "account-switch"
+            ? "end the previous browser session"
+            : "end the browser session";
+        throw new Error(
+          `Eliza Cloud could not ${action} (${response.status}).`,
+        );
+      }
+    }
+
+    // Keep the protected token quarantined until the server acknowledges the
+    // logout. If the tab closes before that ack, reload still has enough cookie
+    // or bearer authority to replay; keepalive alone cannot provide this proof.
+    if (!isStewardSessionLogoutIntentLive(intent)) return;
+    await clearStaleStewardSession(mutationLease);
+    completeStewardSessionLogout(intent);
   });
-  await clearStaleStewardSession();
-  const response = await serverLogout;
-  if (!response.ok) {
-    throw new Error(
-      `Eliza Cloud could not end the previous browser session (${response.status}).`,
-    );
+}
+
+/** Replay durable logout intents after reload/BFCache/online restoration. */
+export async function replayPendingSsoLogouts(
+  fetchFn: typeof fetch = fetch,
+): Promise<void> {
+  const snapshot = readStewardSessionLogoutIntents(STEWARD_TENANT_ID);
+  if (!snapshot.storageAvailable) {
+    throw new Error("Pending Eliza Cloud sign-out storage cannot be read.");
   }
+  for (const intent of snapshot.intents) {
+    await executeSsoLogoutIntent(intent, fetchFn);
+  }
+}
+
+function schedulePendingSsoLogoutReplay(): void {
+  void replayPendingSsoLogouts().catch(() => {
+    // The durable intent deliberately remains. A later online/pageshow event or
+    // explicit retry re-enters the same idempotent server boundary.
+  });
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("pageshow", schedulePendingSsoLogoutReplay);
+  window.addEventListener("online", schedulePendingSsoLogoutReplay);
+  // This chunk can be loaded lazily after the document's initial `pageshow`.
+  // Run one replay pass at registration time as well, otherwise an already
+  // durable logout would remain stranded until an unrelated offline/online
+  // transition while every passive session writer stays fail-closed.
+  schedulePendingSsoLogoutReplay();
 }

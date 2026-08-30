@@ -14,7 +14,7 @@ import {
   type StewardSessionChangeDetail,
 } from "@elizaos/shared/steward-session-client";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
-import type { ReactNode } from "react";
+import { type ReactNode, StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   clearPendingOnboardingSession,
@@ -23,6 +23,13 @@ import {
   TELEGRAM_ACCOUNT_CLAIM_PURPOSE,
 } from "../join/lib/onboarding-continuation";
 import { consumeStewardServerCookieSynced } from "../lib/steward-session-cookie-sync-marker";
+import { enqueueStewardSessionMutation } from "../lib/steward-session-mutation-queue";
+import {
+  beginStewardSessionRecovery,
+  completeStewardSessionRecovery,
+  completeStewardSessionRecoverySnapshot,
+  readStewardSessionRecovery,
+} from "../lib/steward-session-recovery-marker";
 import { syncStewardSessionCookie } from "../public-pages/lib/steward-session";
 import { clearStaleStewardSession } from "./StewardProviderShared";
 
@@ -63,6 +70,14 @@ function makeJwt(payload: Record<string, unknown>): string {
       .replace(/\//g, "_")
       .replace(/=+$/, "");
   return `${b64url({ alg: "HS256", typ: "JWT" })}.${b64url(payload)}.sig`;
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
 }
 
 type RecordedCall = { url: string; method: string };
@@ -161,12 +176,164 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  completeStewardSessionRecoverySnapshot(
+    readStewardSessionRecovery("elizacloud"),
+  );
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();
   window.sessionStorage.clear();
 });
 
 describe("AuthTokenSync", () => {
+  it("serializes an admitted parent A sync before child B so B is always the final cookie commit", async () => {
+    const tokenA = makeJwt({
+      sub: "account-a",
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    });
+    const tokenB = makeJwt({
+      sub: "account-b",
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    });
+    storage.setItem(STEWARD_TOKEN_KEY, tokenA);
+    const committedTokens: string[] = [];
+    let releaseParentA: ((response: Response) => void) | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        calls.push({ url, method });
+        if (!url.includes("steward-session") || method !== "POST") {
+          return Response.json({ ok: true });
+        }
+        const body = JSON.parse(String(init?.body)) as { token?: string };
+        if (body.token) committedTokens.push(body.token);
+        if (body.token === tokenA) {
+          return await new Promise<Response>((resolve) => {
+            releaseParentA = resolve;
+          });
+        }
+        return Response.json({ ok: true });
+      }),
+    );
+
+    mount();
+    await waitFor(() => expect(committedTokens).toEqual([tokenA]));
+
+    const recovery = beginStewardSessionRecovery("elizacloud", "provider");
+    const childB = syncStewardSessionCookie(tokenB);
+    await act(async () => Promise.resolve());
+    // B is admitted only after the already-dispatched A response proves that
+    // A's server-cookie mutation has settled.
+    expect(committedTokens).toEqual([tokenA]);
+
+    releaseParentA?.(Response.json({ ok: true }));
+    await act(async () => {
+      await childB;
+    });
+    completeStewardSessionRecovery(recovery);
+
+    expect(committedTokens).toEqual([tokenA, tokenB]);
+    expect(storage.getItem(STEWARD_TOKEN_KEY)).toBe(tokenB);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(committedTokens).toEqual([tokenA, tokenB]);
+  });
+
+  it("blocks passive sync and refresh behind a durable login receipt, including StrictMode replay", async () => {
+    const token = makeJwt({
+      sub: "previous-account",
+      exp: Math.floor(Date.now() / 1000) + 60,
+    });
+    storage.setItem(STEWARD_TOKEN_KEY, token);
+    beginStewardSessionRecovery("elizacloud", "provider");
+
+    render(
+      <StrictMode>
+        <StewardAuthRuntimeProvider
+          apiUrl="https://steward.test"
+          tenantId="elizacloud"
+        >
+          <div />
+        </StewardAuthRuntimeProvider>
+      </StrictMode>,
+    );
+
+    await act(async () => Promise.resolve());
+    expect(postsTo("steward-session")).toHaveLength(0);
+    expect(postsTo("steward-refresh")).toHaveLength(0);
+
+    act(() => {
+      completeStewardSessionRecoverySnapshot(
+        readStewardSessionRecovery("elizacloud"),
+      );
+    });
+
+    await waitFor(() => {
+      expect(postsTo("steward-session").length).toBeGreaterThanOrEqual(1);
+      expect(postsTo("steward-refresh").length).toBeGreaterThanOrEqual(1);
+    });
+  });
+
+  it("revalidates a recovery receipt after waiting for an already-held lease", async () => {
+    const token = makeJwt({
+      sub: "account-a",
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    });
+    storage.setItem(STEWARD_TOKEN_KEY, token);
+    const acquired = deferred<void>();
+    const release = deferred<void>();
+    const held = enqueueStewardSessionMutation(async () => {
+      acquired.resolve();
+      await release.promise;
+    });
+    await acquired.promise;
+
+    mount();
+    await act(async () => Promise.resolve());
+    beginStewardSessionRecovery("elizacloud", "provider");
+    release.resolve();
+    await held;
+    await act(async () => Promise.resolve());
+
+    expect(postsTo("steward-session")).toHaveLength(0);
+    expect(postsTo("steward-refresh")).toHaveLength(0);
+  });
+
+  it("never posts captured account A after account B wins while the lease is held", async () => {
+    const tokenA = makeJwt({
+      sub: "account-a",
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    });
+    const tokenB = makeJwt({
+      sub: "account-b",
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    });
+    storage.setItem(STEWARD_TOKEN_KEY, tokenA);
+    const acquired = deferred<void>();
+    const release = deferred<void>();
+    const held = enqueueStewardSessionMutation(async () => {
+      acquired.resolve();
+      await release.promise;
+    });
+    await acquired.promise;
+
+    mount();
+    await act(async () => Promise.resolve());
+    storage.setItem(STEWARD_TOKEN_KEY, tokenB);
+    release.resolve();
+    await held;
+    await act(async () => Promise.resolve());
+
+    const postedBodies = (fetch as ReturnType<typeof vi.fn>).mock.calls
+      .filter(
+        ([input, init]) =>
+          String(input).includes("steward-session") && init?.method === "POST",
+      )
+      .map(([, init]) => JSON.parse(String(init?.body)) as { token?: string });
+    expect(postedBodies).not.toContainEqual({ token: tokenA });
+    expect(storage.getItem(STEWARD_TOKEN_KEY)).toBe(tokenB);
+  });
+
   it("dedupes a direct-map explicit sync only at the identical endpoint", async () => {
     const token = makeJwt({
       sub: "u1",
@@ -488,6 +655,78 @@ describe("AuthTokenSync", () => {
     // Unlike the bare-401 stale-proxy keep above, the distinct code clears the
     // stored session even though the token itself is still unexpired — this is
     // what propagates a logout performed on the PAIRED origin to this one.
+    await waitFor(() => expect(storage.getItem(STEWARD_TOKEN_KEY)).toBeNull());
+  });
+
+  it("parses refresh session_ended but never clears a newer account B", async () => {
+    const tokenA = makeJwt({
+      sub: "account-a",
+      exp: Math.floor(Date.now() / 1000) + 60,
+    });
+    const tokenB = makeJwt({
+      sub: "account-b",
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    });
+    storage.setItem(STEWARD_TOKEN_KEY, tokenA);
+    const refreshResponse = deferred<Response>();
+    let refreshInit: RequestInit | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        calls.push({ url, method: init?.method ?? "GET" });
+        if (url.includes("steward-refresh")) {
+          refreshInit = init;
+          return refreshResponse.promise;
+        }
+        return Response.json({ ok: true });
+      }),
+    );
+
+    mount();
+    await waitFor(() => expect(refreshInit).toBeDefined());
+    storage.setItem(STEWARD_TOKEN_KEY, tokenB);
+    refreshResponse.resolve(
+      Response.json(
+        { error: "Session was signed out", code: "session_ended" },
+        { status: 401 },
+      ),
+    );
+
+    await act(async () => Promise.resolve());
+    await waitFor(() =>
+      expect(storage.getItem(STEWARD_TOKEN_KEY)).toBe(tokenB),
+    );
+    expect(refreshInit?.headers).toMatchObject({
+      "Content-Type": "application/json",
+      "X-Eliza-CSRF": "1",
+    });
+  });
+
+  it("clears the exact still-valid token when refresh returns session_ended", async () => {
+    const token = makeJwt({
+      sub: "account-a",
+      exp: Math.floor(Date.now() / 1000) + 60,
+    });
+    storage.setItem(STEWARD_TOKEN_KEY, token);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        calls.push({ url, method: init?.method ?? "GET" });
+        if (init?.method === "DELETE") return Response.json({ ok: true });
+        if (url.includes("steward-refresh")) {
+          return Response.json(
+            { error: "Session was signed out", code: "session_ended" },
+            { status: 401 },
+          );
+        }
+        return Response.json({ ok: true });
+      }),
+    );
+
+    mount();
+
     await waitFor(() => expect(storage.getItem(STEWARD_TOKEN_KEY)).toBeNull());
   });
 

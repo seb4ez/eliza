@@ -10,9 +10,11 @@
 
 import {
   clearStoredStewardToken,
+  readStoredStewardToken,
   STEWARD_NONCE_EXCHANGE_ENDPOINT,
   STEWARD_REFRESH_ENDPOINT,
   STEWARD_SESSION_ENDPOINT,
+  STEWARD_TENANT_ID,
   type StewardNonceExchangeResponse,
   StewardSessionError,
   type StewardSessionRequest,
@@ -29,6 +31,20 @@ import {
   invalidateStewardServerCookieSyncMarker,
   markStewardServerCookieSynced,
 } from "../../lib/steward-session-cookie-sync-marker";
+import {
+  enqueueStewardSessionMutation,
+  type StewardSessionMutationLease,
+} from "../../lib/steward-session-mutation-queue";
+import {
+  beginStewardSessionRecovery,
+  completeStewardSessionRecovery,
+  completeStewardSessionRecoverySnapshot,
+  isStewardSessionRecoveryReceiptLive,
+  isStewardSessionRecoverySnapshotLive,
+  readStewardSessionRecovery,
+  rejectStewardSessionRecovery,
+  StewardSessionRecoveryStorageError,
+} from "../../lib/steward-session-recovery-marker";
 import { ELIZA_CLOUD_DIRECT_API_BY_HOST } from "../../shell/steward-url";
 
 export function resolveStewardAuthEndpoint(
@@ -47,21 +63,26 @@ async function postAuthJson(
   method: "POST" | "DELETE" = "POST",
   signal?: AbortSignal,
   resolvedEndpoint = resolveStewardAuthEndpoint(path),
+  mutationLease?: StewardSessionMutationLease,
 ): Promise<Response> {
-  return fetch(resolvedEndpoint, {
-    method,
-    credentials: "include",
-    // Cookie-authenticated mutations must carry an explicit non-simple marker.
-    // Keep this even for bodyless DELETEs: browsers/proxies may discard a
-    // content type when there is no body, which otherwise turns logout and
-    // stale-session recovery into a CSRF-guarded 403.
-    headers: {
-      "Content-Type": "application/json",
-      "X-Eliza-CSRF": "1",
-    },
-    ...(body ? { body: JSON.stringify(body) } : {}),
-    ...(signal ? { signal } : {}),
-  });
+  const dispatch = () =>
+    fetch(resolvedEndpoint, {
+      method,
+      credentials: "include",
+      // Cookie-authenticated mutations must carry an explicit non-simple marker.
+      // Keep this even for bodyless DELETEs: browsers/proxies may discard a
+      // content type when there is no body, which otherwise turns logout and
+      // stale-session recovery into a CSRF-guarded 403.
+      headers: {
+        "Content-Type": "application/json",
+        "X-Eliza-CSRF": "1",
+      },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+      ...(signal ? { signal } : {}),
+    });
+  return mutationLease
+    ? dispatch()
+    : enqueueStewardSessionMutation(() => dispatch());
 }
 
 async function readSessionError(response: Response): Promise<{
@@ -91,8 +112,17 @@ export async function syncStewardSessionCookie(
   options?: {
     signal?: AbortSignal;
     verifiedPhone?: string;
+    mutationLease?: StewardSessionMutationLease;
   },
 ): Promise<void> {
+  if (!options?.mutationLease) {
+    return enqueueStewardSessionMutation((mutationLease) =>
+      syncStewardSessionCookie(token, refreshToken, {
+        ...options,
+        mutationLease,
+      }),
+    );
+  }
   const request: StewardSessionRequest = {
     token,
     ...(refreshToken ? { refreshToken } : {}),
@@ -105,12 +135,15 @@ export async function syncStewardSessionCookie(
     "POST",
     options?.signal,
     sessionEndpoint,
+    options?.mutationLease,
   );
 
   if (!response.ok) {
     const body = await readSessionError(response);
-    throw new Error(
+    throw new StewardSessionError(
       body.error || "Could not establish an Eliza Cloud session.",
+      response.status,
+      body.code ?? null,
     );
   }
 
@@ -152,26 +185,95 @@ export async function confirmTelegramAccountClaim(
   if (!telegramContinuation) {
     throw new Error("Invalid Telegram account claim.");
   }
-  const request: StewardTelegramClaimConfirmationRequest = {
-    token,
-    telegramContinuation,
-    telegramClaimConfirmation: "explicit",
-  };
-  const response = await postAuthJson(STEWARD_SESSION_ENDPOINT, request);
-  if (!response.ok) {
-    const body = await readSessionError(response);
-    throw new Error(body.error || "Could not connect this Telegram account.");
-  }
-  clearPendingOnboardingSessionIfMatches(
-    telegramContinuation,
-    TELEGRAM_ACCOUNT_CLAIM_PURPOSE,
-  );
-  if (typeof window !== "undefined") {
-    await writeStoredStewardToken(token);
-    window.dispatchEvent(
-      new CustomEvent("steward-token-sync", { detail: { token } }),
+  // Account linking is irreversible and may commit before its response is
+  // delivered. Persist an independent receipt synchronously, before waiting
+  // for another tab's session lock or dispatching the confirmation POST.
+  const recovery = beginStewardSessionRecovery(STEWARD_TENANT_ID, "telegram");
+  if (recovery.preexistingReceipts.length > 0) {
+    rejectStewardSessionRecovery(recovery);
+    throw new Error(
+      "Another sign-in is still being finalized. Retry connecting Telegram in a moment.",
     );
   }
+
+  return enqueueStewardSessionMutation(async (mutationLease) => {
+    if (!isStewardSessionRecoveryReceiptLive(recovery)) {
+      throw new Error("Telegram account confirmation was superseded.");
+    }
+    let currentToken: string | null = null;
+    try {
+      currentToken = readStoredStewardToken();
+    } catch (error) {
+      rejectStewardSessionRecovery(recovery);
+      throw error;
+    }
+    if (currentToken !== token) {
+      // No request has been dispatched, so this local mismatch is definitive.
+      rejectStewardSessionRecovery(recovery);
+      throw new Error(
+        "Your Eliza Cloud account changed before Telegram could be connected.",
+      );
+    }
+
+    const request: StewardTelegramClaimConfirmationRequest = {
+      token,
+      telegramContinuation,
+      telegramClaimConfirmation: "explicit",
+    };
+    const response = await postAuthJson(
+      STEWARD_SESSION_ENDPOINT,
+      request,
+      "POST",
+      undefined,
+      undefined,
+      mutationLease,
+    );
+    if (!response.ok) {
+      const body = await readSessionError(response);
+      if (
+        response.status >= 400 &&
+        response.status < 500 &&
+        response.status !== 408
+      ) {
+        rejectStewardSessionRecovery(recovery);
+      }
+      throw new StewardSessionError(
+        body.error || "Could not connect this Telegram account.",
+        response.status,
+        body.code ?? null,
+      );
+    }
+    if (
+      !isStewardSessionRecoveryReceiptLive(recovery) ||
+      readStoredStewardToken() !== token
+    ) {
+      // The response may have committed the link. Keep any live receipt and
+      // the continuation so reload recovery, not stale renderer A, reconciles.
+      throw new Error("Telegram account confirmation was superseded.");
+    }
+
+    if (typeof window !== "undefined") {
+      await writeStoredStewardToken(token);
+      if (
+        !isStewardSessionRecoveryReceiptLive(recovery) ||
+        readStoredStewardToken() !== token
+      ) {
+        throw new Error("Telegram account confirmation was superseded.");
+      }
+      try {
+        window.dispatchEvent(
+          new CustomEvent("steward-token-sync", { detail: { token } }),
+        );
+      } catch {
+        // Token persistence is authoritative; notification is best effort.
+      }
+    }
+    clearPendingOnboardingSessionIfMatches(
+      telegramContinuation,
+      TELEGRAM_ACCOUNT_CLAIM_PURPOSE,
+    );
+    completeStewardSessionRecovery(recovery);
+  });
 }
 
 /**
@@ -340,6 +442,7 @@ export async function exchangeStewardCodeViaApi(
     tenantId?: string;
     codeVerifier?: string;
     signal?: AbortSignal;
+    mutationLease?: StewardSessionMutationLease;
   } = {},
 ): Promise<StewardNonceExchangeResponse> {
   const response = await postAuthJson(
@@ -352,6 +455,8 @@ export async function exchangeStewardCodeViaApi(
     },
     "POST",
     opts.signal,
+    undefined,
+    opts.mutationLease,
   );
 
   if (!response.ok) {
@@ -372,6 +477,7 @@ export async function exchangeStewardCodeViaApi(
  */
 export async function refreshStewardSessionViaCookie(options?: {
   signal?: AbortSignal;
+  mutationLease?: StewardSessionMutationLease;
 }): Promise<{
   ok: true;
   expiresAt?: number;
@@ -383,6 +489,8 @@ export async function refreshStewardSessionViaCookie(options?: {
     undefined,
     "POST",
     options?.signal,
+    undefined,
+    options?.mutationLease,
   );
   if (!response.ok) {
     const body = await readSessionError(response);
@@ -442,6 +550,7 @@ export async function recoverStewardEmailSessionViaCookie(
     signal?: AbortSignal;
     intervalMs?: number;
     timeoutMs?: number;
+    tenantId?: string;
   } = {},
 ): Promise<RefreshedStewardSession | null> {
   const expected = normalizedEmail(expectedEmail);
@@ -449,6 +558,7 @@ export async function recoverStewardEmailSessionViaCookie(
 
   const intervalMs = options.intervalMs ?? EMAIL_SESSION_RECOVERY_INTERVAL_MS;
   const timeoutMs = options.timeoutMs ?? EMAIL_SESSION_RECOVERY_TIMEOUT_MS;
+  const tenantId = options.tenantId ?? STEWARD_TENANT_ID;
   const deadline = Date.now() + timeoutMs;
 
   // One composed controller bounds every network attempt: a caller abort or
@@ -461,18 +571,54 @@ export async function recoverStewardEmailSessionViaCookie(
   else options.signal?.addEventListener("abort", onCallerAbort, { once: true });
   const deadlineTimer = setTimeout(() => attempt.abort(), timeoutMs);
 
+  const recoverAttempt = () =>
+    enqueueStewardSessionMutation(async (mutationLease) => {
+      const recoverySnapshot = readStewardSessionRecovery(tenantId);
+      if (!recoverySnapshot.storageAvailable) {
+        throw new StewardSessionRecoveryStorageError(
+          "Email session recovery is blocked because durable recovery storage cannot be read.",
+        );
+      }
+      const session = await refreshStewardSessionViaCookie({
+        signal: attempt.signal,
+        mutationLease,
+      });
+      if (attempt.signal.aborted || Date.now() >= deadline) return null;
+      const claims = session.token ? decodeJwtPayload(session.token) : null;
+      if (normalizedEmail(claims?.email) !== expected || !session.token) {
+        return null;
+      }
+      if (
+        recoverySnapshot.receipts.length > 0 &&
+        !isStewardSessionRecoverySnapshotLive(recoverySnapshot)
+      ) {
+        return null;
+      }
+
+      // Refresh response parsing, protected publication, event delivery, and
+      // exact ambiguity reconciliation remain inside one origin-wide lease.
+      // Callers receive an already-committed outcome and must never write the
+      // raw token after this promise resolves.
+      await writeStoredStewardToken(session.token, { signal: attempt.signal });
+      if (attempt.signal.aborted) return null;
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent("steward-token-sync"));
+      }
+      if (recoverySnapshot.receipts.length > 0) {
+        completeStewardSessionRecoverySnapshot(recoverySnapshot);
+      }
+      return session;
+    });
+
   try {
     while (!attempt.signal.aborted && Date.now() < deadline) {
       try {
-        const session = await refreshStewardSessionViaCookie({
-          signal: attempt.signal,
-        });
+        const session = await recoverAttempt();
         // Re-check cancellation before accepting: a refresh that resolves
         // after the caller aborted or the deadline passed must not surface a
         // session the caller already stopped waiting for.
         if (attempt.signal.aborted || Date.now() >= deadline) return null;
-        const claims = session.token ? decodeJwtPayload(session.token) : null;
-        if (normalizedEmail(claims?.email) === expected) return session;
+        if (session) return session;
       } catch (error) {
         // error-policy:J4 a cancelled attempt resolves to the explicit null
         // "not recovered" state and an expected 401 keeps polling until the
@@ -511,7 +657,10 @@ function isRejectedCookieSession(error: unknown): boolean {
   );
 }
 
-async function clearRejectedCookieSession(signal?: AbortSignal): Promise<void> {
+async function clearRejectedCookieSession(
+  signal?: AbortSignal,
+  mutationLease?: StewardSessionMutationLease,
+): Promise<void> {
   // The DELETE and subsequent token removal can each fail. Retire proof before
   // either boundary so recovery can never reuse pre-clear cookie authority.
   signal?.throwIfAborted();
@@ -523,6 +672,8 @@ async function clearRejectedCookieSession(signal?: AbortSignal): Promise<void> {
       undefined,
       "DELETE",
       signal,
+      undefined,
+      mutationLease,
     );
   } catch (error) {
     // Once fetch has been invoked, an AbortError is an ambiguous commit: the
@@ -557,7 +708,18 @@ async function clearRejectedCookieSession(signal?: AbortSignal): Promise<void> {
  * to clear before rendering a clean sign-in form.
  */
 export async function recoverStewardSessionViaCookie(
-  options: { signal?: AbortSignal } = {},
+  options: {
+    signal?: AbortSignal;
+    /**
+     * Ordinary login cleanup retires a twice-rejected cookie session and its
+     * matching browser token. Ambiguous post-mutation recovery must preserve
+     * the older browser token until the durable receipt is reconciled: the
+     * server may have committed an access-only cookie that another request is
+     * about to hydrate.
+     */
+    rejectedSession?: "clear" | "preserve";
+    mutationLease?: StewardSessionMutationLease;
+  } = {},
 ): Promise<{
   ok: true;
   expiresAt?: number;
@@ -565,9 +727,15 @@ export async function recoverStewardSessionViaCookie(
   token?: string;
 } | null> {
   if (options.signal?.aborted) return null;
+  if (!options.mutationLease) {
+    return enqueueStewardSessionMutation((mutationLease) =>
+      recoverStewardSessionViaCookie({ ...options, mutationLease }),
+    );
+  }
   try {
     const session = await refreshStewardSessionViaCookie({
       signal: options.signal,
+      mutationLease: options.mutationLease,
     });
     return options.signal?.aborted ? null : session;
   } catch (error) {
@@ -584,12 +752,15 @@ export async function recoverStewardSessionViaCookie(
   try {
     const session = await refreshStewardSessionViaCookie({
       signal: options.signal,
+      mutationLease: options.mutationLease,
     });
     return options.signal?.aborted ? null : session;
   } catch (error) {
     if (options.signal?.aborted || isAbortError(error)) return null;
     if (!isRejectedCookieSession(error)) throw error;
-    await clearRejectedCookieSession(options.signal);
+    if (options.rejectedSession !== "preserve") {
+      await clearRejectedCookieSession(options.signal, options.mutationLease);
+    }
     return null;
   }
 }

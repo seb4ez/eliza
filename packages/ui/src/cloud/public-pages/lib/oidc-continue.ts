@@ -35,6 +35,18 @@ import {
   STEWARD_SESSION_ENDPOINT,
   syncStewardSession,
 } from "@elizaos/shared/steward-session-client";
+import { enqueueStewardSessionMutation } from "../../lib/steward-session-mutation-queue";
+import {
+  beginStewardSessionRecovery,
+  completeStewardSessionRecoveryReceipt,
+  hasStewardSessionRecovery,
+  isStewardSessionRecoveryReceiptLive,
+  rejectStewardSessionRecovery,
+} from "../../lib/steward-session-recovery-marker";
+import {
+  configuredStewardTenantId,
+  DEFAULT_STEWARD_TENANT_ID,
+} from "../../shell/steward-config";
 
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
@@ -45,6 +57,7 @@ export const OIDC_RESUME_PATH = "/api/oidc/authorize/resume";
 
 /** The env var an operator sets to the deployment's `OIDC_ISSUER_URL`. */
 export const OIDC_ISSUER_ENV_VAR = "VITE_OIDC_ISSUER_URL";
+const STEWARD_TENANT_ID = configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID);
 
 /**
  * Why a resume URL could not be built. `issuer_unconfigured` is a deployment
@@ -167,9 +180,65 @@ export async function prepareOidcResumeTarget(
     ((stewardToken: string, sessionEndpoint: string) =>
       syncStewardSession(stewardToken, null, { endpoint: sessionEndpoint }));
 
+  // This is a passive copy of the currently stored account to a second cookie
+  // origin. It must never supersede an ambiguous newer login, and it needs its
+  // own durable proof because navigation/tab-close can interrupt the issuer
+  // sync after the server commit. Unlike an active login, success retires only
+  // this exact receipt; preexisting ambiguity is never cleared.
+  if (hasStewardSessionRecovery(STEWARD_TENANT_ID)) {
+    return { status: "session_sync_failed" };
+  }
+  let recoveryReceipt: ReturnType<typeof beginStewardSessionRecovery>;
   try {
-    await syncSession(token, endpoint);
+    recoveryReceipt = beginStewardSessionRecovery(
+      STEWARD_TENANT_ID,
+      "provider",
+    );
+    if (recoveryReceipt.preexistingReceipts.length > 0) {
+      completeStewardSessionRecoveryReceipt(recoveryReceipt);
+      return { status: "session_sync_failed" };
+    }
   } catch {
+    return { status: "session_sync_failed" };
+  }
+
+  try {
+    const committed = await enqueueStewardSessionMutation(async () => {
+      if (!isStewardSessionRecoveryReceiptLive(recoveryReceipt)) return false;
+      // The token was read before waiting for another tab's cookie mutation.
+      // Only that exact bearer may be mirrored to the issuer once this lease is
+      // acquired; a newer account must never inherit this parked request.
+      if (readToken()?.trim() !== token) {
+        rejectStewardSessionRecovery(recoveryReceipt);
+        return false;
+      }
+      await syncSession(token, endpoint);
+      if (
+        !isStewardSessionRecoveryReceiptLive(recoveryReceipt) ||
+        readToken()?.trim() !== token
+      ) {
+        // The issuer POST may already have committed. Keep a still-live receipt
+        // for cookie-first reconciliation rather than pretending the stale
+        // continuation can prove which account now owns the browser.
+        return false;
+      }
+      completeStewardSessionRecoveryReceipt(recoveryReceipt);
+      return true;
+    });
+    if (!committed) return { status: "session_sync_failed" };
+  } catch (error) {
+    const status =
+      error !== null && typeof error === "object" && "status" in error
+        ? Reflect.get(error, "status")
+        : undefined;
+    if (
+      typeof status === "number" &&
+      status >= 400 &&
+      status < 500 &&
+      status !== 408
+    ) {
+      rejectStewardSessionRecovery(recoveryReceipt);
+    }
     // error-policy:J4 user-facing degrade — a failed cross-origin session sync
     // is shown as an authentication error and the one-time OIDC request is not
     // consumed without the issuer-host session required to authorize it.

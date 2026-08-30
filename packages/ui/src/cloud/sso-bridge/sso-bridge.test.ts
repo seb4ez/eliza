@@ -2,7 +2,7 @@
 // @vitest-environment jsdom
 
 import { STEWARD_TOKEN_KEY } from "@elizaos/shared/steward-session-client";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   peekPendingOnboardingSession,
   storePendingOnboardingSession,
@@ -13,6 +13,12 @@ import {
   invalidateStewardServerCookieSyncMarker,
   markStewardServerCookieSynced,
 } from "../lib/steward-session-cookie-sync-marker";
+import {
+  beginStewardSessionLogout,
+  completeStewardSessionLogout,
+  readStewardSessionLogoutIntents,
+  readStewardSessionRecovery,
+} from "../lib/steward-session-recovery-marker";
 import {
   buildBridgeExchangeUrl,
   buildBridgeMintUrl,
@@ -32,6 +38,7 @@ import {
   pairedAppOrigin,
   performSsoExchange,
   prepareSsoAccountSwitch,
+  replayPendingSsoLogouts,
   sanitizeBridgeReturnTo,
   shouldAttemptSsoBridge,
   shouldAutoBridgeToSso,
@@ -43,6 +50,16 @@ const STATE = "a".repeat(64);
 const CHALLENGE = "c".repeat(64);
 const VERIFIER = "d".repeat(64);
 const CODE = `esso_${"b".repeat(64)}`;
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 
 async function sha256Hex(input: string): Promise<string> {
   const digest = await globalThis.crypto.subtle.digest(
@@ -90,6 +107,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  for (const intent of readStewardSessionLogoutIntents("elizacloud").intents) {
+    completeStewardSessionLogout(intent);
+  }
   localStorage.clear();
   sessionStorage.clear();
   clearCookies();
@@ -416,6 +436,38 @@ describe("performSsoExchange", () => {
     expect(isSsoLoggedOut()).toBe(false);
   });
 
+  it("keeps a durable recovery receipt if the tab closes after exchange dispatch", async () => {
+    const responseBody = deferred<{ ok: true; token: string }>();
+    const calls: FetchCall[] = [];
+    const fn = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (url.includes("/sso-bridge/exchange")) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => responseBody.promise,
+        } as Response);
+      }
+      return Promise.resolve(json(200, { ok: true }));
+    }) as typeof fetch;
+
+    const exchange = performSsoExchange(CODE, VERIFIER, "cloud.eliza.app", fn);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(calls).toHaveLength(1);
+    const beforeClose = readStewardSessionRecovery("elizacloud");
+    expect(beforeClose.receipts).toHaveLength(1);
+    sessionStorage.clear();
+    expect(readStewardSessionRecovery("elizacloud").receipts).toEqual(
+      beforeClose.receipts,
+    );
+
+    responseBody.resolve({ ok: true, token: liveToken() });
+    await expect(exchange).resolves.toEqual({ ok: true });
+    expect(readStewardSessionRecovery("elizacloud").receipts).toHaveLength(0);
+  });
+
   it("establishes bridged auth without sending or consuming a Telegram claim", async () => {
     storePendingOnboardingSession(
       "opaque-telegram-claim-token",
@@ -509,6 +561,23 @@ describe("performSsoExchange", () => {
     );
     expect(result.ok).toBe(false);
     expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(readStewardSessionRecovery("elizacloud").receipts).toHaveLength(0);
+  });
+
+  it("keeps the receipt when a 200 response cannot hydrate the committed session", async () => {
+    const { fn } = fetchStub(() => json(200, { ok: true }));
+    const result = await performSsoExchange(
+      CODE,
+      VERIFIER,
+      "cloud.eliza.app",
+      fn,
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      error: "Exchange returned no usable session",
+    });
+    expect(readStewardSessionRecovery("elizacloud").receipts).toHaveLength(1);
   });
 });
 
@@ -532,6 +601,39 @@ describe("burnSsoBridgeCode", () => {
 });
 
 describe("signOutFromSsoBridgedHost", () => {
+  it("replays a durable logout immediately when the chunk loads after pageshow", async () => {
+    const token = liveToken();
+    localStorage.setItem(STEWARD_TOKEN_KEY, token);
+    beginStewardSessionLogout("elizacloud", "logout", "cloud.eliza.app");
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), init });
+      return Promise.resolve(json(200, { success: true }));
+    }) as typeof fetch;
+
+    try {
+      // No pageshow/online event is dispatched: the fresh, lazily evaluated
+      // module must notice the preexisting intent during registration itself.
+      vi.resetModules();
+      await import("./sso-bridge");
+
+      await vi.waitFor(() =>
+        expect(calls.some(({ url }) => url.endsWith("/api/auth/logout"))).toBe(
+          true,
+        ),
+      );
+      await vi.waitFor(() =>
+        expect(readStewardSessionLogoutIntents("elizacloud").intents).toEqual(
+          [],
+        ),
+      );
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
   it("marks logged-out synchronously, ends the server session, scrubs locally", async () => {
     const token = liveToken();
     localStorage.setItem(STEWARD_TOKEN_KEY, token);
@@ -562,6 +664,7 @@ describe("signOutFromSsoBridgedHost", () => {
       expect(calls[0].init).toMatchObject({
         method: "POST",
         credentials: "include",
+        keepalive: true,
       });
       expect(new Headers(calls[0].init?.headers).get("content-type")).toBe(
         "application/json",
@@ -569,6 +672,7 @@ describe("signOutFromSsoBridgedHost", () => {
       expect(new Headers(calls[0].init?.headers).get("authorization")).toBe(
         `Bearer ${token}`,
       );
+      expect(new Headers(calls[0].init?.headers).get("x-eliza-csrf")).toBe("1");
       expect(proofAtServerLogoutIssue).toBe(false);
       expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
     } finally {
@@ -587,6 +691,9 @@ describe("signOutFromSsoBridgedHost", () => {
       await expect(
         signOutFromSsoBridgedHost("cloud.eliza.app", fn),
       ).rejects.toThrow("could not end the browser session (403)");
+      expect(
+        readStewardSessionLogoutIntents("elizacloud").intents,
+      ).toHaveLength(1);
     } finally {
       globalThis.fetch = realFetch;
     }
@@ -598,11 +705,145 @@ describe("signOutFromSsoBridgedHost", () => {
       Promise.resolve(new Response(null, { status: 204 }))) as typeof fetch;
     try {
       const networkFailure = new TypeError("network unavailable");
+      const token = liveToken();
+      localStorage.setItem(STEWARD_TOKEN_KEY, token);
       const fn = (() => Promise.reject(networkFailure)) as typeof fetch;
       await expect(
         signOutFromSsoBridgedHost("cloud.eliza.app", fn),
       ).rejects.toBe(networkFailure);
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(token);
+      expect(
+        readStewardSessionLogoutIntents("elizacloud").intents,
+      ).toHaveLength(1);
+
+      const replay = fetchStub(() => json(200, { success: true }));
+      await replayPendingSsoLogouts(replay.fn);
+      expect(replay.calls).toHaveLength(1);
+      expect(replay.calls[0]?.init?.keepalive).toBe(true);
       expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+      expect(readStewardSessionLogoutIntents("elizacloud").intents).toEqual([]);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it("orders a logout after an already-admitted login and leaves logout authoritative", async () => {
+    const nextToken = liveToken();
+    const exchangeResponse = deferred<Response>();
+    const exchangeIssued = deferred<void>();
+    const order: string[] = [];
+    const loginFetch = ((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/sso-bridge/exchange")) {
+        order.push("login:exchange");
+        exchangeIssued.resolve();
+        return exchangeResponse.promise;
+      }
+      order.push("login:cookie");
+      return Promise.resolve(json(200, { ok: true }));
+    }) as typeof fetch;
+    const logoutCalls: string[] = [];
+    const logoutFetch = ((input: RequestInfo | URL) => {
+      logoutCalls.push(String(input));
+      order.push("logout:server");
+      return Promise.resolve(json(200, { success: true }));
+    }) as typeof fetch;
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (() =>
+      Promise.resolve(new Response(null, { status: 204 }))) as typeof fetch;
+    try {
+      const login = performSsoExchange(
+        CODE,
+        VERIFIER,
+        "cloud.eliza.app",
+        loginFetch,
+      );
+      await exchangeIssued.promise;
+
+      const logout = signOutFromSsoBridgedHost("cloud.eliza.app", logoutFetch);
+      expect(isSsoLoggedOut()).toBe(true);
+      expect(logoutCalls).toEqual([]);
+      const durableLogout = readStewardSessionLogoutIntents("elizacloud");
+      expect(durableLogout.intents).toHaveLength(1);
+      sessionStorage.clear();
+      expect(readStewardSessionLogoutIntents("elizacloud").intents).toEqual(
+        durableLogout.intents,
+      );
+
+      exchangeResponse.resolve(json(200, { ok: true, token: nextToken }));
+      await expect(login).resolves.toEqual({
+        ok: false,
+        error: "SSO exchange was superseded",
+      });
+      await expect(logout).resolves.toBeUndefined();
+
+      expect(order).toEqual(["login:exchange", "logout:server"]);
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+      expect(isSsoLoggedOut()).toBe(true);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it("blocks a later login while logout is ambiguous and allows an explicit retry after ack", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, liveToken());
+    const logoutResponse = deferred<Response>();
+    const logoutIssued = deferred<void>();
+    const order: string[] = [];
+    const logoutFetch = ((_input: RequestInfo | URL) => {
+      order.push("logout:server");
+      logoutIssued.resolve();
+      return logoutResponse.promise;
+    }) as typeof fetch;
+    const nextToken = liveToken();
+    const loginCalls: string[] = [];
+    const loginFetch = ((input: RequestInfo | URL) => {
+      const url = String(input);
+      loginCalls.push(url);
+      order.push(
+        url.includes("/sso-bridge/exchange")
+          ? "login:exchange"
+          : "login:cookie",
+      );
+      return Promise.resolve(
+        url.includes("/sso-bridge/exchange")
+          ? json(200, { ok: true, token: nextToken })
+          : json(200, { ok: true }),
+      );
+    }) as typeof fetch;
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (() =>
+      Promise.resolve(new Response(null, { status: 204 }))) as typeof fetch;
+    try {
+      const logout = signOutFromSsoBridgedHost("cloud.eliza.app", logoutFetch);
+      await logoutIssued.promise;
+
+      const login = performSsoExchange(
+        CODE,
+        VERIFIER,
+        "cloud.eliza.app",
+        loginFetch,
+      );
+      expect(loginCalls).toEqual([]);
+      await expect(login).resolves.toMatchObject({ ok: false });
+
+      logoutResponse.resolve(json(200, { success: true }));
+      await expect(logout).resolves.toBeUndefined();
+      const retry = performSsoExchange(
+        CODE,
+        VERIFIER,
+        "cloud.eliza.app",
+        loginFetch,
+      );
+      await expect(retry).resolves.toEqual({ ok: true });
+
+      expect(order).toEqual([
+        "logout:server",
+        "login:exchange",
+        "login:cookie",
+      ]);
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(nextToken);
+      expect(isSsoLoggedOut()).toBe(false);
     } finally {
       globalThis.fetch = realFetch;
     }
@@ -621,8 +862,11 @@ describe("prepareSsoAccountSwitch", () => {
       await expect(prepareSsoAccountSwitch("eliza.app", fn)).rejects.toThrow(
         "could not end the previous browser session (503)",
       );
-      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(token);
       expect(isSsoLoggedOut()).toBe(true);
+      expect(
+        readStewardSessionLogoutIntents("elizacloud").intents,
+      ).toHaveLength(1);
     } finally {
       globalThis.fetch = realFetch;
     }
@@ -640,6 +884,7 @@ describe("prepareSsoAccountSwitch", () => {
       expect(calls[0].init).toMatchObject({
         method: "POST",
         credentials: "include",
+        keepalive: true,
       });
       expect(new Headers(calls[0].init?.headers).get("content-type")).toBe(
         "application/json",
@@ -647,6 +892,51 @@ describe("prepareSsoAccountSwitch", () => {
       expect(new Headers(calls[0].init?.headers).get("authorization")).toBe(
         `Bearer ${token}`,
       );
+      expect(new Headers(calls[0].init?.headers).get("x-eliza-csrf")).toBe("1");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it("waits for an admitted login before ending that account's session", async () => {
+    const exchangeResponse = deferred<Response>();
+    const exchangeIssued = deferred<void>();
+    const loginFetch = ((input: RequestInfo | URL) => {
+      if (String(input).includes("/sso-bridge/exchange")) {
+        exchangeIssued.resolve();
+        return exchangeResponse.promise;
+      }
+      return Promise.resolve(json(200, { ok: true }));
+    }) as typeof fetch;
+    const logoutCalls: string[] = [];
+    const logoutFetch = ((input: RequestInfo | URL) => {
+      logoutCalls.push(String(input));
+      return Promise.resolve(json(200, { success: true }));
+    }) as typeof fetch;
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (() =>
+      Promise.resolve(new Response(null, { status: 204 }))) as typeof fetch;
+    try {
+      const login = performSsoExchange(
+        CODE,
+        VERIFIER,
+        "cloud.eliza.app",
+        loginFetch,
+      );
+      await exchangeIssued.promise;
+      const accountSwitch = prepareSsoAccountSwitch("eliza.app", logoutFetch);
+      expect(logoutCalls).toEqual([]);
+
+      exchangeResponse.resolve(json(200, { ok: true, token: liveToken() }));
+      await expect(login).resolves.toEqual({
+        ok: false,
+        error: "SSO exchange was superseded",
+      });
+      await expect(accountSwitch).resolves.toBeUndefined();
+
+      expect(logoutCalls).toEqual(["https://eliza.app/api/auth/logout"]);
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+      expect(isSsoLoggedOut()).toBe(true);
     } finally {
       globalThis.fetch = realFetch;
     }
