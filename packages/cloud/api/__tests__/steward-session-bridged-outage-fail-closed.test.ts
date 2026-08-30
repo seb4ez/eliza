@@ -17,11 +17,15 @@ const verifyStewardTokenCached = mock(async (_env: unknown, token: string) => {
   const base = {
     userId: "steward-user-1",
     email: "person@example.test",
+    tenantId: "elizacloud",
     expiration: Math.floor(Date.now() / 1000) + 900,
     issuedAt: Math.floor(Date.now() / 1000) - 60,
   };
   if (token === "bridged-token") return { ...base, bridged: true };
   if (token === "plain-token") return base;
+  if (token === "different-user-token") {
+    return { ...base, userId: "steward-user-2" };
+  }
   return null;
 });
 const syncUserFromSteward = mock(async () => ({
@@ -35,7 +39,9 @@ const syncUserFromSteward = mock(async () => ({
 }));
 class MockStewardPhoneAccountConflictError extends Error {}
 class MockStewardTelegramAccountClaimError extends Error {}
-const isBlockedBySsoBridgeLogout = mock(async () => {
+const isBlockedBySsoBridgeLogout = mock<
+  (_userId: string, _issuedAt: number) => Promise<boolean>
+>(async () => {
   throw new Error("connect ECONNREFUSED: postgres down");
 });
 
@@ -80,7 +86,7 @@ const ENV = {
 
 let ipCounter = 0;
 
-function postStewardSession(body: unknown) {
+function postStewardSession(body: unknown, cookie?: string) {
   ipCounter += 1;
   const app = new Hono();
   app.route("/api/auth/steward-session", stewardSessionRoute);
@@ -91,6 +97,7 @@ function postStewardSession(body: unknown) {
         "cf-connecting-ip": `203.0.113.${ipCounter}`,
         "content-type": "application/json",
         origin: "https://staging.elizacloud.ai",
+        ...(cookie ? { cookie } : {}),
       },
       body: JSON.stringify(body),
     }),
@@ -129,5 +136,53 @@ describe("POST /api/auth/steward-session — logout-marker store outage", () => 
       "steward-token-staging=plain-token",
     );
     expect(isBlockedBySsoBridgeLogout).not.toHaveBeenCalled();
+  });
+
+  test("an access-only bridge login removes an older refresh cookie", async () => {
+    isBlockedBySsoBridgeLogout.mockResolvedValueOnce(false);
+
+    const res = await postStewardSession(
+      { token: "bridged-token" },
+      "steward-token=prod-token; steward-refresh-token=prod-refresh; steward-token-staging=plain-token; steward-refresh-token-staging=stale-refresh",
+    );
+
+    expect(res.status).toBe(200);
+    const cookies = res.headers.getSetCookie();
+    const deleted = cookies
+      .filter((cookie) => /Max-Age=0/i.test(cookie))
+      .map((cookie) => cookie.split("=")[0]);
+    expect(deleted).toContain("steward-refresh-token-staging");
+    expect(deleted).not.toContain("steward-refresh-token");
+    expect(cookies.join("\n")).toContain("steward-token-staging=bridged-token");
+  });
+
+  test("an access-only account switch removes the prior identity's refresh cookie", async () => {
+    const res = await postStewardSession(
+      { token: "different-user-token" },
+      "steward-token-staging=plain-token; steward-refresh-token-staging=stale-refresh",
+    );
+
+    expect(res.status).toBe(200);
+    const deleted = res.headers
+      .getSetCookie()
+      .filter((cookie) => /Max-Age=0/i.test(cookie))
+      .map((cookie) => cookie.split("=")[0]);
+    expect(deleted).toEqual(["steward-refresh-token-staging"]);
+    expect(isBlockedBySsoBridgeLogout).not.toHaveBeenCalled();
+  });
+
+  test("an ordinary same-identity passive sync preserves its refresh cookie", async () => {
+    const res = await postStewardSession(
+      { token: "plain-token" },
+      "steward-token-staging=plain-token; steward-refresh-token-staging=live-refresh",
+    );
+
+    expect(res.status).toBe(200);
+    expect(
+      res.headers
+        .getSetCookie()
+        .map((cookie) => cookie.split("=")[0])
+        .filter((name) => name === "steward-refresh-token-staging"),
+    ).toEqual([]);
   });
 });

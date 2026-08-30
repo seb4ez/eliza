@@ -26,8 +26,8 @@
  */
 
 import type { StewardSessionErrorCode } from "@elizaos/shared/steward-session-client";
-import { Hono } from "hono";
-import { getCookie, setCookie } from "hono/cookie";
+import { type Context, Hono } from "hono";
+import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import {
   browserOriginHost,
   checkElizaMutatingRequestOrigin,
@@ -37,10 +37,12 @@ import { cookieDomainForHost } from "@/lib/auth/cookie-domain";
 import {
   mintStewardTokenFromClaims,
   STEWARD_AUTH_UPSTREAM_TIMEOUT_MS,
+  type StewardTokenClaims,
   type StewardVerifyEnv,
   verifyStewardTokenCached,
 } from "@/lib/auth/steward-client";
 import { stewardCookieNames } from "@/lib/auth/steward-cookies";
+import { isBlockedBySsoBridgeLogout } from "@/lib/services/sso-bridge-codes";
 import { signStewardMutatingRequest } from "@/lib/steward/sign";
 import { logger } from "@/lib/utils/logger";
 import type { AppEnv } from "@/types/cloud-worker-env";
@@ -89,6 +91,70 @@ function errorBody(
   code: StewardSessionErrorCode,
 ): { error: string; code: StewardSessionErrorCode } {
   return { error: message, code };
+}
+
+type SsoLogoutBarrierResult = "allowed" | "blocked" | "unavailable";
+
+async function checkSsoLogoutBarrier(
+  claims: StewardTokenClaims,
+): Promise<SsoLogoutBarrierResult> {
+  if (!claims.bridged) return "allowed";
+  try {
+    return (await isBlockedBySsoBridgeLogout(claims.userId, claims.issuedAt))
+      ? "blocked"
+      : "allowed";
+  } catch (error) {
+    logger.error("[steward-refresh] SSO logout-marker store unavailable", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return "unavailable";
+  }
+}
+
+function effectiveStewardTenantId(
+  claims: StewardTokenClaims,
+  expectedTenantId: string | undefined,
+): string | null {
+  const claimed = claims.tenantId?.trim();
+  if (claimed) return claimed;
+  const expected = expectedTenantId?.trim();
+  return expected || null;
+}
+
+function isSameStewardIdentity(
+  current: StewardTokenClaims,
+  refreshed: StewardTokenClaims,
+  expectedTenantId: string | undefined,
+): boolean {
+  return (
+    current.userId === refreshed.userId &&
+    effectiveStewardTenantId(current, expectedTenantId) ===
+      effectiveStewardTenantId(refreshed, expectedTenantId)
+  );
+}
+
+function deleteCurrentAccessCookies(
+  c: Context<AppEnv>,
+  cookieNames: ReturnType<typeof stewardCookieNames>,
+): void {
+  const domain = cookieDomainForHost(c.req.header("host"));
+  const options = {
+    path: "/",
+    ...(domain ? { domain } : {}),
+  };
+  deleteCookie(c, cookieNames.token, options);
+  deleteCookie(c, cookieNames.authed, options);
+}
+
+function deleteCurrentRefreshCookie(
+  c: Context<AppEnv>,
+  cookieNames: ReturnType<typeof stewardCookieNames>,
+): void {
+  const domain = cookieDomainForHost(c.req.header("host"));
+  deleteCookie(c, cookieNames.refreshToken, {
+    path: "/",
+    ...(domain ? { domain } : {}),
+  });
 }
 
 let stewardRefreshMetricCounter = 0;
@@ -307,6 +373,19 @@ app.post("/", async (c) => {
       return c.json(errorBody("Invalid token", "invalid_token"), 401);
     }
 
+    const logoutBarrier = await checkSsoLogoutBarrier(claims);
+    if (logoutBarrier === "unavailable") {
+      logRefresh("bearer-sso-marker-unavailable");
+      return c.json(
+        errorBody("SSO bridge unavailable", "sso_unavailable"),
+        503,
+      );
+    }
+    if (logoutBarrier === "blocked") {
+      logRefresh("bearer-session-ended");
+      return c.json(errorBody("Session was signed out", "session_ended"), 401);
+    }
+
     const refreshed = await mintStewardTokenFromClaims(
       c.env,
       claims,
@@ -346,7 +425,59 @@ app.post("/", async (c) => {
   // the environment suffix remains a compatibility invariant and prevents a
   // preview accidentally treating an older unsuffixed cookie as its session.
   const refreshToken = getCookie(c, cookieNames.refreshToken);
+  const accessToken = getCookie(c, cookieNames.token);
   if (!refreshToken) {
+    // A session POST can commit its access cookie immediately before the
+    // renderer is closed, while its auth result carries no refresh token (or
+    // before the refresh cookie is stored). Durable login recovery must be
+    // able to hydrate that already-verified first-party access cookie without
+    // destructively treating the ordinary `steward-authed` bearer marker as a
+    // dead refresh session. This read neither rotates nor clears cookies.
+    if (accessToken && shouldReturnClientToken(c, isProduction)) {
+      if (!stewardSecretConfigured(c.env)) {
+        logRefresh("access-cookie-server-secret-missing");
+        return c.json(
+          errorBody(
+            "Steward verification not configured on server",
+            "server_secret_missing",
+          ),
+          503,
+        );
+      }
+      const claims = await verifyStewardTokenCached(c.env, accessToken);
+      if (!claims) {
+        logRefresh("access-cookie-invalid-token");
+        return c.json(errorBody("Invalid token", "invalid_token"), 401);
+      }
+      const logoutBarrier = await checkSsoLogoutBarrier(claims);
+      if (logoutBarrier === "unavailable") {
+        logRefresh("access-cookie-sso-marker-unavailable");
+        return c.json(
+          errorBody("SSO bridge unavailable", "sso_unavailable"),
+          503,
+        );
+      }
+      if (logoutBarrier === "blocked") {
+        // This is a positive, user-scoped revocation signal rather than a
+        // refresh-rotation loser. Remove only this environment's access and
+        // marker cookies; never touch sibling-environment or refresh cookies.
+        deleteCurrentAccessCookies(c, cookieNames);
+        logRefresh("access-cookie-session-ended");
+        return c.json(
+          errorBody("Session was signed out", "session_ended"),
+          401,
+        );
+      }
+      const expiresAt = claims.expiration;
+      const expiresIn = Math.max(0, expiresAt - Math.floor(Date.now() / 1000));
+      logRefresh("ok-access-cookie");
+      return c.json({
+        ok: true,
+        token: accessToken,
+        expiresAt,
+        expiresIn,
+      });
+    }
     logRefresh("missing-refresh-cookie");
     return c.json(errorBody("Refresh token required", "missing_token"), 401);
   }
@@ -361,6 +492,14 @@ app.post("/", async (c) => {
       503,
     );
   }
+
+  // Capture the verified access identity from this request before consuming
+  // the single-use refresh token. If an access-only login for account B has
+  // already replaced account A's access cookie but A's old refresh cookie
+  // survived, the rotated A result must never overwrite B below.
+  const currentAccessClaims = accessToken
+    ? await verifyStewardTokenCached(c.env, accessToken)
+    : null;
 
   const stewardBaseUrl = resolveStewardBaseUrl(c.env);
   if (!stewardBaseUrl) {
@@ -438,6 +577,25 @@ app.post("/", async (c) => {
   if (!claims) {
     logRefresh("invalid-token-after-refresh");
     return c.json(errorBody("Invalid token", "invalid_token"), 401);
+  }
+
+  if (
+    currentAccessClaims &&
+    !isSameStewardIdentity(currentAccessClaims, claims, c.env.STEWARD_TENANT_ID)
+  ) {
+    // Unlike an upstream 401, this is not ambiguous with an ordinary
+    // same-identity refresh-rotation loser: both signed identities are known
+    // and disagree. Burn only the stale refresh cookie from this environment,
+    // preserving account B's access + marker cookies and every sibling env.
+    deleteCurrentRefreshCookie(c, cookieNames);
+    logRefresh("access-refresh-identity-mismatch");
+    return c.json(
+      errorBody(
+        "Refresh token does not match current session",
+        "invalid_token",
+      ),
+      401,
+    );
   }
 
   const ttl = claims.expiration

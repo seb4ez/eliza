@@ -11,7 +11,7 @@ import {
   sanitizeTelegramAccountClaimContinuation,
 } from "@elizaos/shared/steward-session-client";
 import { type Context, Hono } from "hono";
-import { deleteCookie, setCookie } from "hono/cookie";
+import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import { getAuditDispatcher } from "@/api-app/services/audit-dispatcher-singleton";
 import {
   checkElizaMutatingRequestOrigin,
@@ -21,6 +21,7 @@ import { cookieDomainForHost } from "@/lib/auth/cookie-domain";
 import { primeVerifiedUserSessionCache } from "@/lib/auth/session-user-cache";
 import { loadVerifiedStagingSessionUser } from "@/lib/auth/staging-session-binding";
 import {
+  type StewardTokenClaims,
   type StewardVerifyEnv,
   verifyStewardTokenCached,
 } from "@/lib/auth/steward-client";
@@ -112,6 +113,28 @@ function errorBody(
   code: StewardSessionErrorCode,
 ): { error: string; code: StewardSessionErrorCode } {
   return { error: message, code };
+}
+
+function effectiveStewardTenantId(
+  claims: StewardTokenClaims,
+  expectedTenantId: string | undefined,
+): string | null {
+  const claimed = claims.tenantId?.trim();
+  if (claimed) return claimed;
+  const expected = expectedTenantId?.trim();
+  return expected || null;
+}
+
+function isSameStewardIdentity(
+  current: StewardTokenClaims,
+  incoming: StewardTokenClaims,
+  expectedTenantId: string | undefined,
+): boolean {
+  return (
+    current.userId === incoming.userId &&
+    effectiveStewardTenantId(current, expectedTenantId) ===
+      effectiveStewardTenantId(incoming, expectedTenantId)
+  );
 }
 
 const app = new Hono<AppEnv>();
@@ -452,6 +475,32 @@ app.post("/", async (c) => {
     const domain = cookieDomainForHost(c.req.header("host"));
 
     const cookieNames = stewardCookieNames(c.env.ENVIRONMENT);
+    const incomingRefreshToken =
+      typeof refreshToken === "string" && refreshToken.length > 0
+        ? refreshToken
+        : null;
+    let accessOnlyIdentityChanged = false;
+    if (
+      !incomingRefreshToken &&
+      !claims.bridged &&
+      !claims.stagingSessionBinding
+    ) {
+      const currentAccessToken = getCookie(c, cookieNames.token);
+      if (currentAccessToken && currentAccessToken !== token) {
+        const currentClaims = await verifyStewardTokenCached(
+          c.env,
+          currentAccessToken,
+        );
+        accessOnlyIdentityChanged = Boolean(
+          currentClaims &&
+            !isSameStewardIdentity(
+              currentClaims,
+              claims,
+              c.env.STEWARD_TENANT_ID,
+            ),
+        );
+      }
+    }
 
     setCookie(c, cookieNames.token, token, {
       httpOnly: true,
@@ -462,16 +511,21 @@ app.post("/", async (c) => {
       ...(typeof ttl === "number" ? { maxAge: ttl } : {}),
     });
 
-    if (claims.stagingSessionBinding) {
-      // QA sessions have a signed absolute expiry and are deliberately not
-      // renewable. Remove any older refresh cookie so it cannot silently
-      // replace the QA session with an ordinary long-lived Steward session.
+    if (
+      claims.stagingSessionBinding ||
+      (!incomingRefreshToken && (claims.bridged || accessOnlyIdentityChanged))
+    ) {
+      // QA and bridge sessions are deliberately access-only. A verified
+      // account/tenant switch without a replacement refresh token is the same
+      // identity boundary. Remove the older opaque refresh cookie so it cannot
+      // later rotate account A back over newly established account B. Preserve
+      // it for ordinary same-identity passive syncs.
       deleteCookie(c, cookieNames.refreshToken, {
         path: "/",
         ...(domain ? { domain } : {}),
       });
-    } else if (typeof refreshToken === "string" && refreshToken.length > 0) {
-      setCookie(c, cookieNames.refreshToken, refreshToken, {
+    } else if (incomingRefreshToken) {
+      setCookie(c, cookieNames.refreshToken, incomingRefreshToken, {
         httpOnly: true,
         secure,
         sameSite: "Lax",

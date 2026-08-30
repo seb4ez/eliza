@@ -7,6 +7,7 @@ type VerifiedStewardClaims = {
   tenantId: string;
   expiration: number;
   issuedAt: number;
+  bridged?: boolean;
 };
 
 const verifyStewardTokenCached = mock<
@@ -31,6 +32,10 @@ const mintStewardTokenFromClaims = mock<
   expiresIn: 3600,
 }));
 
+const isBlockedBySsoBridgeLogout = mock<
+  (_userId: string, _issuedAt: number) => Promise<boolean>
+>(async () => false);
+
 mock.module("@/lib/auth/steward-client", () => ({
   STEWARD_AUTH_UPSTREAM_TIMEOUT_MS: 25_000,
   verifyStewardTokenCached,
@@ -39,6 +44,10 @@ mock.module("@/lib/auth/steward-client", () => ({
 
 mock.module("@/lib/steward/sign", () => ({
   signStewardMutatingRequest: mock(async () => undefined),
+}));
+
+mock.module("@/lib/services/sso-bridge-codes", () => ({
+  isBlockedBySsoBridgeLogout,
 }));
 
 mock.module("@/lib/utils/logger", () => ({
@@ -78,6 +87,8 @@ describe("steward-refresh bearer rotation", () => {
   beforeEach(() => {
     verifyStewardTokenCached.mockClear();
     mintStewardTokenFromClaims.mockClear();
+    isBlockedBySsoBridgeLogout.mockClear();
+    isBlockedBySsoBridgeLogout.mockResolvedValue(false);
     verifyStewardTokenCached.mockResolvedValue({
       userId: "steward-user-1",
       email: "user@example.com",
@@ -115,6 +126,59 @@ describe("steward-refresh bearer rotation", () => {
     );
   });
 
+  test("rejects a revoked bridge-issued Bearer with authoritative session_ended", async () => {
+    const issuedAt = Math.floor(Date.now() / 1000) - 60;
+    verifyStewardTokenCached.mockResolvedValue({
+      userId: "bridged-user",
+      email: "bridged@example.com",
+      tenantId: "elizacloud",
+      expiration: issuedAt + 600,
+      issuedAt,
+      bridged: true,
+    });
+    isBlockedBySsoBridgeLogout.mockResolvedValue(true);
+
+    const response = await post({
+      Authorization: "Bearer revoked-bridge-jwt",
+    });
+
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toEqual({
+      error: "Session was signed out",
+      code: "session_ended",
+    });
+    expect(isBlockedBySsoBridgeLogout).toHaveBeenCalledWith(
+      "bridged-user",
+      issuedAt,
+    );
+    expect(mintStewardTokenFromClaims).not.toHaveBeenCalled();
+  });
+
+  test("fails a bridge-issued Bearer closed when the logout marker store is unavailable", async () => {
+    verifyStewardTokenCached.mockResolvedValue({
+      userId: "bridged-user",
+      email: "bridged@example.com",
+      tenantId: "elizacloud",
+      expiration: Math.floor(Date.now() / 1000) + 600,
+      issuedAt: Math.floor(Date.now() / 1000) - 60,
+      bridged: true,
+    });
+    isBlockedBySsoBridgeLogout.mockImplementation(async () => {
+      throw new Error("marker store unavailable");
+    });
+
+    const response = await post({
+      Authorization: "Bearer bridge-jwt-during-outage",
+    });
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({
+      error: "SSO bridge unavailable",
+      code: "sso_unavailable",
+    });
+    expect(mintStewardTokenFromClaims).not.toHaveBeenCalled();
+  });
+
   test("rejects invalid Bearer refresh before falling back to cookie refresh", async () => {
     verifyStewardTokenCached.mockResolvedValue(null);
 
@@ -140,6 +204,151 @@ describe("steward-refresh bearer rotation", () => {
 });
 
 describe("steward-refresh browser cookie cleanup", () => {
+  beforeEach(() => {
+    verifyStewardTokenCached.mockClear();
+    mintStewardTokenFromClaims.mockClear();
+    isBlockedBySsoBridgeLogout.mockClear();
+    isBlockedBySsoBridgeLogout.mockResolvedValue(false);
+    verifyStewardTokenCached.mockResolvedValue({
+      userId: "steward-user-1",
+      email: "user@example.com",
+      tenantId: "elizacloud",
+      expiration: Math.floor(Date.now() / 1000) + 60,
+      issuedAt: Math.floor(Date.now() / 1000) - 60,
+    });
+  });
+
+  test("hydrates a valid first-party access cookie without a refresh cookie or mutation", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = mock(async () => {
+      throw new Error("access-cookie hydration must not call Steward");
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const expiration = Math.floor(Date.now() / 1000) + 300;
+    verifyStewardTokenCached.mockResolvedValue({
+      userId: "steward-user-1",
+      email: "user@example.com",
+      tenantId: "elizacloud",
+      expiration,
+      issuedAt: expiration - 60,
+    });
+
+    try {
+      const response = await app.fetch(
+        new Request("https://api-staging.elizacloud.ai/", {
+          method: "POST",
+          headers: {
+            host: "api-staging.elizacloud.ai",
+            origin: "https://staging.elizacloud.ai",
+            cookie:
+              "steward-token-staging=committed-access-token; steward-authed-staging=1",
+          },
+        }),
+        {
+          ...ENV,
+          ENVIRONMENT: "staging",
+          STEWARD_API_URL: "https://steward.example.test",
+        },
+      );
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toEqual({
+        ok: true,
+        token: "committed-access-token",
+        expiresAt: expiration,
+        expiresIn: expect.any(Number),
+      });
+      expect(verifyStewardTokenCached).toHaveBeenCalledWith(
+        expect.objectContaining({ ENVIRONMENT: "staging" }),
+        "committed-access-token",
+      );
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(response.headers.getSetCookie()).toEqual([]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("clears only current-environment access cookies for a revoked bridged access-cookie session", async () => {
+    const issuedAt = Math.floor(Date.now() / 1000) - 60;
+    verifyStewardTokenCached.mockResolvedValue({
+      userId: "bridged-user",
+      email: "bridged@example.com",
+      tenantId: "elizacloud",
+      expiration: issuedAt + 600,
+      issuedAt,
+      bridged: true,
+    });
+    isBlockedBySsoBridgeLogout.mockResolvedValue(true);
+
+    const response = await app.fetch(
+      new Request("https://api-staging.elizacloud.ai/", {
+        method: "POST",
+        headers: {
+          host: "api-staging.elizacloud.ai",
+          origin: "https://staging.elizacloud.ai",
+          cookie:
+            "steward-token=prod-access; steward-authed=1; steward-token-staging=revoked-bridge-access; steward-authed-staging=1",
+        },
+      }),
+      {
+        ...ENV,
+        ENVIRONMENT: "staging",
+        STEWARD_API_URL: "https://steward.example.test",
+      },
+    );
+
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toEqual({
+      error: "Session was signed out",
+      code: "session_ended",
+    });
+    const cleared = deletedCookieNames(response);
+    expect(cleared).toContain("steward-token-staging");
+    expect(cleared).toContain("steward-authed-staging");
+    expect(cleared).not.toContain("steward-refresh-token-staging");
+    expect(cleared).not.toContain("steward-token");
+    expect(cleared).not.toContain("steward-authed");
+  });
+
+  test("keeps access cookies intact when the bridged logout marker store is unavailable", async () => {
+    verifyStewardTokenCached.mockResolvedValue({
+      userId: "bridged-user",
+      email: "bridged@example.com",
+      tenantId: "elizacloud",
+      expiration: Math.floor(Date.now() / 1000) + 600,
+      issuedAt: Math.floor(Date.now() / 1000) - 60,
+      bridged: true,
+    });
+    isBlockedBySsoBridgeLogout.mockImplementation(async () => {
+      throw new Error("marker store unavailable");
+    });
+
+    const response = await app.fetch(
+      new Request("https://api-staging.elizacloud.ai/", {
+        method: "POST",
+        headers: {
+          host: "api-staging.elizacloud.ai",
+          origin: "https://staging.elizacloud.ai",
+          cookie:
+            "steward-token-staging=bridge-access; steward-authed-staging=1",
+        },
+      }),
+      {
+        ...ENV,
+        ENVIRONMENT: "staging",
+        STEWARD_API_URL: "https://steward.example.test",
+      },
+    );
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({
+      error: "SSO bridge unavailable",
+      code: "sso_unavailable",
+    });
+    expect(deletedCookieNames(response)).toEqual([]);
+  });
+
   test("staging legacy-only refresh cookie is not read or forwarded", async () => {
     const originalFetch = globalThis.fetch;
     const fetchMock = mock(async () => {
@@ -214,6 +423,131 @@ describe("steward-refresh browser cookie cleanup", () => {
       // cookies) holds trivially.
       const cleared = deletedCookieNames(response);
       expect(cleared).toHaveLength(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("rejects stale refresh A before it can overwrite access-only identity B", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = mock(async () =>
+      Response.json({
+        ok: true,
+        token: "rotated-refresh-access",
+        refreshToken: "rotated-refresh-cookie",
+        expiresAt: 1_800_000_000,
+        expiresIn: 3600,
+      }),
+    );
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const cases = [
+      {
+        label: "different user in the same tenant",
+        current: { userId: "access-user-b", tenantId: "elizacloud" },
+        refreshed: { userId: "refresh-user-a", tenantId: "elizacloud" },
+      },
+      {
+        label: "same user in a different tenant",
+        current: {
+          userId: "shared-user",
+          tenantId: "personal-shared-user",
+        },
+        refreshed: { userId: "shared-user", tenantId: "elizacloud" },
+      },
+    ] as const;
+
+    try {
+      for (const identityCase of cases) {
+        verifyStewardTokenCached.mockImplementation(async (_env, token) => {
+          const identity =
+            token === "current-access-b"
+              ? identityCase.current
+              : identityCase.refreshed;
+          return {
+            ...identity,
+            email: "user@example.com",
+            expiration: Math.floor(Date.now() / 1000) + 600,
+            issuedAt: Math.floor(Date.now() / 1000) - 60,
+          };
+        });
+
+        const response = await app.fetch(
+          new Request("https://api-staging.elizacloud.ai/", {
+            method: "POST",
+            headers: {
+              host: "api-staging.elizacloud.ai",
+              origin: "https://staging.elizacloud.ai",
+              cookie:
+                "steward-token=prod-access; steward-refresh-token=prod-refresh; steward-token-staging=current-access-b; steward-refresh-token-staging=stale-refresh-a; steward-authed-staging=1",
+            },
+          }),
+          {
+            ...ENV,
+            ENVIRONMENT: "staging",
+            STEWARD_API_URL: "https://steward.example.test",
+          },
+        );
+
+        expect(response.status).toBe(401);
+        await expect(response.json()).resolves.toEqual({
+          error: "Refresh token does not match current session",
+          code: "invalid_token",
+        });
+        expect(deletedCookieNames(response)).toEqual([
+          "steward-refresh-token-staging",
+        ]);
+        const setCookies = response.headers.getSetCookie().join("\n");
+        expect(setCookies).not.toContain(
+          "steward-token-staging=rotated-refresh-access",
+        );
+        expect(setCookies).not.toContain("steward-refresh-token=prod-refresh");
+      }
+      expect(fetchMock).toHaveBeenCalledTimes(cases.length);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("allows a normal same-identity refresh rotation and sets its fresh cookies", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = mock(async () =>
+      Response.json({
+        ok: true,
+        token: "same-identity-access",
+        refreshToken: "same-identity-refresh",
+        expiresAt: 1_800_000_000,
+        expiresIn: 3600,
+      }),
+    ) as unknown as typeof fetch;
+
+    try {
+      const response = await app.fetch(
+        new Request("https://api-staging.elizacloud.ai/", {
+          method: "POST",
+          headers: {
+            host: "api-staging.elizacloud.ai",
+            origin: "https://staging.elizacloud.ai",
+            cookie:
+              "steward-token-staging=old-same-identity-access; steward-refresh-token-staging=old-same-identity-refresh",
+          },
+        }),
+        {
+          ...ENV,
+          ENVIRONMENT: "staging",
+          STEWARD_API_URL: "https://steward.example.test",
+        },
+      );
+
+      expect(response.status).toBe(200);
+      const setCookies = response.headers.getSetCookie().join("\n");
+      expect(setCookies).toContain(
+        "steward-token-staging=same-identity-access",
+      );
+      expect(setCookies).toContain(
+        "steward-refresh-token-staging=same-identity-refresh",
+      );
+      expect(deletedCookieNames(response)).toEqual([]);
     } finally {
       globalThis.fetch = originalFetch;
     }
