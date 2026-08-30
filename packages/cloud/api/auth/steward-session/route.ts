@@ -479,26 +479,25 @@ app.post("/", async (c) => {
       typeof refreshToken === "string" && refreshToken.length > 0
         ? refreshToken
         : null;
-    let accessOnlyIdentityChanged = false;
+    let accessOnlyRefreshMustBeDeleted = false;
     if (
       !incomingRefreshToken &&
       !claims.bridged &&
       !claims.stagingSessionBinding
     ) {
+      const currentRefreshToken = getCookie(c, cookieNames.refreshToken);
       const currentAccessToken = getCookie(c, cookieNames.token);
-      if (currentAccessToken && currentAccessToken !== token) {
-        const currentClaims = await verifyStewardTokenCached(
-          c.env,
-          currentAccessToken,
-        );
-        accessOnlyIdentityChanged = Boolean(
-          currentClaims &&
-            !isSameStewardIdentity(
-              currentClaims,
-              claims,
-              c.env.STEWARD_TENANT_ID,
-            ),
-        );
+      if (currentRefreshToken && currentAccessToken !== token) {
+        const currentClaims = currentAccessToken
+          ? await verifyStewardTokenCached(c.env, currentAccessToken)
+          : null;
+        accessOnlyRefreshMustBeDeleted =
+          !currentClaims ||
+          !isSameStewardIdentity(
+            currentClaims,
+            claims,
+            c.env.STEWARD_TENANT_ID,
+          );
       }
     }
 
@@ -513,13 +512,17 @@ app.post("/", async (c) => {
 
     if (
       claims.stagingSessionBinding ||
-      (!incomingRefreshToken && (claims.bridged || accessOnlyIdentityChanged))
+      (!incomingRefreshToken &&
+        (claims.bridged || accessOnlyRefreshMustBeDeleted))
     ) {
       // QA and bridge sessions are deliberately access-only. A verified
       // account/tenant switch without a replacement refresh token is the same
-      // identity boundary. Remove the older opaque refresh cookie so it cannot
-      // later rotate account A back over newly established account B. Preserve
-      // it for ordinary same-identity passive syncs.
+      // identity boundary. If an older opaque refresh cookie exists, preserve
+      // it only when the prior access token proves the same identity (or is the
+      // exact token being installed); an absent, expired, malformed, or
+      // different-identity access token cannot authorize that refresh to
+      // survive. Otherwise it could later rotate account A back over newly
+      // established account B.
       deleteCookie(c, cookieNames.refreshToken, {
         path: "/",
         ...(domain ? { domain } : {}),

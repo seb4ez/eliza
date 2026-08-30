@@ -171,6 +171,38 @@ describe("POST /api/auth/steward-session — logout-marker store outage", () => 
     expect(isBlockedBySsoBridgeLogout).not.toHaveBeenCalled();
   });
 
+  test.each([
+    ["expired", "expired-access-token"],
+    ["malformed", "malformed-access-token"],
+    ["missing", null],
+  ])(
+    "an access-only login removes a stale refresh when the prior access is %s",
+    async (_label, priorAccessToken) => {
+      const priorCookies = [
+        priorAccessToken ? `steward-token-staging=${priorAccessToken}` : null,
+        "steward-refresh-token-staging=stale-refresh-a",
+      ]
+        .filter((cookie): cookie is string => cookie !== null)
+        .join("; ");
+
+      const res = await postStewardSession(
+        { token: "different-user-token" },
+        priorCookies,
+      );
+
+      expect(res.status).toBe(200);
+      const deleted = res.headers
+        .getSetCookie()
+        .filter((cookie) => /Max-Age=0/i.test(cookie))
+        .map((cookie) => cookie.split("=")[0]);
+      expect(deleted).toEqual(["steward-refresh-token-staging"]);
+      expect(res.headers.getSetCookie().join("\n")).toContain(
+        "steward-token-staging=different-user-token",
+      );
+      expect(isBlockedBySsoBridgeLogout).not.toHaveBeenCalled();
+    },
+  );
+
   test("an ordinary same-identity passive sync preserves its refresh cookie", async () => {
     const res = await postStewardSession(
       { token: "plain-token" },
