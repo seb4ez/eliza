@@ -8,7 +8,9 @@ import { ElizaError } from "@elizaos/core";
 import {
   clearStoredStewardToken,
   readStoredStewardToken,
+  STEWARD_CSRF_HEADER,
   STEWARD_REFRESH_ENDPOINT,
+  STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
   writeStoredStewardToken,
 } from "@elizaos/shared/steward-session-client";
 import { isElectrobunRuntime } from "../bridge/electrobun-runtime";
@@ -972,7 +974,7 @@ export async function refreshCloudStewardSession(opts?: {
           // browser-only.
           headers: {
             "Content-Type": "application/json",
-            "X-Eliza-CSRF": "1",
+            [STEWARD_CSRF_HEADER]: STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
           },
           signal: stewardSignal,
         });

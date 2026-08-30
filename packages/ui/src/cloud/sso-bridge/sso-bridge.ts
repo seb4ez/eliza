@@ -48,6 +48,8 @@
 import { ELIZA_DOMAIN_CONTRACTS } from "@elizaos/shared/elizacloud";
 import {
   readStoredStewardToken,
+  STEWARD_CSRF_HEADER,
+  STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
   writeStoredStewardToken,
 } from "@elizaos/shared/steward-session-client";
 import { shellLocalStorage } from "../../surface-realm-channel";
@@ -590,7 +592,10 @@ export async function performSsoExchange(
         await fetchFn(configuredSessionEndpoint(), {
           method: "POST",
           credentials: "include",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            [STEWARD_CSRF_HEADER]: STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+          },
           body: JSON.stringify({ token }),
         });
       } catch {
@@ -821,7 +826,7 @@ async function executeSsoLogoutIntentWithLease(
       keepalive: true,
       headers: {
         "Content-Type": "application/json",
-        "X-Eliza-CSRF": "1",
+        [STEWARD_CSRF_HEADER]: STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
         ...(exactToken ? { Authorization: `Bearer ${exactToken}` } : {}),
       },
     });

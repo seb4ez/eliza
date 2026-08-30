@@ -127,6 +127,19 @@ describe("fetchWithCsrf", () => {
     expect(getHeaders.has("x-eliza-csrf")).toBe(false);
   });
 
+  it("preserves an explicit session-mutation protocol marker", async () => {
+    setCookie("eliza_csrf=ordinary-csrf-token");
+
+    await fetchWithCsrf("/api/auth/logout", {
+      method: "POST",
+      headers: { "x-eliza-csrf": "steward-session-web-lock.v1" },
+    });
+
+    const headers = fetchTransportMock.fetchAgentTransport.request.mock
+      .calls[0]?.[1].headers as Headers;
+    expect(headers.get("x-eliza-csrf")).toBe("steward-session-web-lock.v1");
+  });
+
   it("never sends browser cookies or their CSRF mirror to a dedicated agent", async () => {
     setCookie("eliza_csrf=cloud-control-plane-csrf");
     bootConfigMock.getBootConfig.mockReturnValue({

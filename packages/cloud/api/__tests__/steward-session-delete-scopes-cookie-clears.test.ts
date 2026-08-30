@@ -6,6 +6,10 @@
  * because production's cookieNames already resolve to the unsuffixed names.
  */
 
+import {
+  STEWARD_CSRF_HEADER_VALUE,
+  STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+} from "@elizaos/shared/steward-session-client";
 import { describe, expect, it } from "vitest";
 import app from "../auth/steward-session/route";
 
@@ -34,6 +38,26 @@ describe("DELETE /api/auth/steward-session cookie clearing", () => {
     expect(res.headers.getSetCookie()).toHaveLength(0);
   });
 
+  it("rejects a legacy clear without deleting a newer session", async () => {
+    const res = await app.request(
+      "/",
+      {
+        method: "DELETE",
+        headers: {
+          host: "api-staging.elizacloud.ai",
+          origin: "https://staging.elizacloud.ai",
+          "x-eliza-csrf": STEWARD_CSRF_HEADER_VALUE,
+        },
+      },
+      { ENVIRONMENT: "staging", NODE_ENV: "test" },
+    );
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      code: "session_mutation_protocol_required",
+    });
+    expect(res.headers.getSetCookie()).toHaveLength(0);
+  });
+
   it("staging clears only the staging-suffixed pair", async () => {
     const res = await app.request(
       "/",
@@ -42,7 +66,7 @@ describe("DELETE /api/auth/steward-session cookie clearing", () => {
         headers: {
           host: "api-staging.elizacloud.ai",
           origin: "https://staging.elizacloud.ai",
-          "x-eliza-csrf": "1",
+          "x-eliza-csrf": STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
         },
       },
       { ENVIRONMENT: "staging", NODE_ENV: "test" },
@@ -65,7 +89,7 @@ describe("DELETE /api/auth/steward-session cookie clearing", () => {
         headers: {
           host: "api.elizacloud.ai",
           origin: "https://elizacloud.ai",
-          "x-eliza-csrf": "1",
+          "x-eliza-csrf": STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
         },
       },
       { ENVIRONMENT: "production", NODE_ENV: "test" },

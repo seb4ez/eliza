@@ -16,6 +16,7 @@ import {
   STEWARD_CSRF_HEADER_VALUE,
   STEWARD_REFRESH_TOKEN_KEY,
   STEWARD_SESSION_CHANGE_EVENT,
+  STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
   STEWARD_TOKEN_KEY,
   STEWARD_TOKEN_SCOPE_KEY,
   type StewardSessionChangeDetail,
@@ -89,6 +90,23 @@ describe("Steward session client CSRF marker header", () => {
 
     const headers = new Headers(seen?.headers);
     expect(headers.get(STEWARD_CSRF_HEADER)).toBe(STEWARD_CSRF_HEADER_VALUE);
+  });
+
+  it("emits the mutation protocol only when a serialized caller opts in", async () => {
+    let seen: RequestInit | undefined;
+    const fetchImpl = (async (_input: unknown, init?: RequestInit) => {
+      seen = init;
+      return jsonResponse({ ok: true, userId: "u", stewardUserId: "s" });
+    }) as typeof fetch;
+
+    await syncStewardSession("token", null, {
+      fetchImpl,
+      sessionMutationProtocol: STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+    });
+
+    expect(new Headers(seen?.headers).get(STEWARD_CSRF_HEADER)).toBe(
+      STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+    );
   });
 });
 

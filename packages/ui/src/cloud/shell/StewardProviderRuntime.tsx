@@ -10,7 +10,11 @@
  * (honoring `exp`) running while a cloud surface is mounted.
  */
 
-import { writeStoredStewardToken } from "@elizaos/shared/steward-session-client";
+import {
+  STEWARD_CSRF_HEADER,
+  STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+  writeStoredStewardToken,
+} from "@elizaos/shared/steward-session-client";
 import { StewardProvider, useAuth as useStewardAuth } from "@stwd/react";
 import { StewardClient } from "@stwd/sdk";
 import {
@@ -180,7 +184,7 @@ function AuthTokenSync({
           credentials: "include",
           headers: {
             "Content-Type": "application/json",
-            "X-Eliza-CSRF": "1",
+            [STEWARD_CSRF_HEADER]: STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
           },
           body: JSON.stringify({ token }),
         });
@@ -317,7 +321,7 @@ function AuthTokenSync({
             credentials: "include",
             headers: {
               "Content-Type": "application/json",
-              "X-Eliza-CSRF": "1",
+              [STEWARD_CSRF_HEADER]: STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
             },
           });
           const body = await parseStewardResponseBody(res);

@@ -33,6 +33,7 @@
 import {
   readStoredStewardToken,
   STEWARD_SESSION_ENDPOINT,
+  STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
   syncStewardSession,
 } from "@elizaos/shared/steward-session-client";
 import { enqueueStewardSessionMutation } from "../../lib/steward-session-mutation-queue";
@@ -178,7 +179,10 @@ export async function prepareOidcResumeTarget(
   const syncSession =
     dependencies.syncSession ??
     ((stewardToken: string, sessionEndpoint: string) =>
-      syncStewardSession(stewardToken, null, { endpoint: sessionEndpoint }));
+      syncStewardSession(stewardToken, null, {
+        endpoint: sessionEndpoint,
+        sessionMutationProtocol: STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+      }));
 
   // This is a passive copy of the currently stored account to a second cookie
   // origin. It must never supersede an ambiguous newer login, and it needs its

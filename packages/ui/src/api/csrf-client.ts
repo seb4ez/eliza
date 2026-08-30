@@ -51,7 +51,7 @@ export async function fetchWithCsrf(
 
   if (!isDedicatedAgentRequest && STATE_CHANGING_METHODS.has(method)) {
     const csrfToken = readCsrfTokenForUrl(url);
-    if (csrfToken) {
+    if (csrfToken && !headers.has(CSRF_HEADER_NAME)) {
       headers.set(CSRF_HEADER_NAME, csrfToken);
     }
   }

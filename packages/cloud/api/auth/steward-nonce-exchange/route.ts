@@ -22,7 +22,11 @@
  * first-party Eliza UI origins plus localhost in non-production.
  */
 
-import type { StewardSessionErrorCode } from "@elizaos/shared/steward-session-client";
+import {
+  STEWARD_CSRF_HEADER,
+  STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+  type StewardSessionErrorCode,
+} from "@elizaos/shared/steward-session-client";
 import { Hono } from "hono";
 import { setCookie } from "hono/cookie";
 import {
@@ -247,6 +251,19 @@ app.post("/", async (c) => {
   if (!hasElizaNonSimpleRequestMarker(c.req)) {
     logExchange("csrf-marker-missing");
     return c.json(errorBody("Forbidden", "csrf_marker_required"), 403);
+  }
+  if (
+    c.req.header(STEWARD_CSRF_HEADER) !==
+    STEWARD_SESSION_MUTATION_PROTOCOL_VALUE
+  ) {
+    logExchange("session-mutation-protocol-required");
+    return c.json(
+      errorBody(
+        "Session client update required",
+        "session_mutation_protocol_required",
+      ),
+      409,
+    );
   }
 
   const body = (await c.req.json().catch(() => ({}))) as {

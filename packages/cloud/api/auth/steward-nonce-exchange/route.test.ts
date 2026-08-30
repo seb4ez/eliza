@@ -7,6 +7,11 @@
  * are mocked.
  */
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import {
+  STEWARD_CSRF_HEADER,
+  STEWARD_CSRF_HEADER_VALUE,
+  STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+} from "@elizaos/shared/steward-session-client";
 import { Hono } from "hono";
 
 const verifyCalls: string[] = [];
@@ -77,6 +82,7 @@ function postExchange(headers: Record<string, string>, body?: unknown) {
 const FIRST_PARTY = {
   origin: "http://localhost:3000",
   "content-type": "application/json",
+  [STEWARD_CSRF_HEADER]: STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
 };
 
 beforeEach(() => {
@@ -117,6 +123,29 @@ describe("POST /api/auth/steward-nonce-exchange", () => {
     );
     expect(res.status).toBe(403);
     expect(await res.json()).toMatchObject({ code: "csrf_marker_required" });
+  });
+
+  test("rejects a legacy browser exchange before consuming its code or setting cookies", async () => {
+    const res = await postExchange(
+      {
+        origin: "http://localhost:3000",
+        "content-type": "application/json",
+        [STEWARD_CSRF_HEADER]: STEWARD_CSRF_HEADER_VALUE,
+      },
+      {
+        code: "account-a-code",
+        redirectUri: "https://eliza.app/login",
+        codeVerifier: "account-a-verifier",
+      },
+    );
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      code: "session_mutation_protocol_required",
+    });
+    expect(upstreamBodies).toHaveLength(0);
+    expect(verifyCalls).toHaveLength(0);
+    expect(res.headers.getSetCookie()).toEqual([]);
   });
 
   test("rejects a verifier-less exchange", async () => {

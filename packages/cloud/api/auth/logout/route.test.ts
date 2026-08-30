@@ -5,6 +5,15 @@
  */
 
 import { beforeEach, describe, expect, mock, test } from "bun:test";
+import {
+  STEWARD_CSRF_HEADER,
+  STEWARD_CSRF_HEADER_VALUE,
+  STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+} from "@elizaos/shared/steward-session-client";
+
+const MUTATION_PROTOCOL_HEADERS = {
+  [STEWARD_CSRF_HEADER]: STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+};
 
 const getCurrentUserMock = mock(
   async (): Promise<{ id: string; organization_id: string } | null> => null,
@@ -93,6 +102,7 @@ describe("POST /api/auth/logout cookie clearing", () => {
       {
         method: "POST",
         headers: {
+          ...MUTATION_PROTOCOL_HEADERS,
           host: "api-staging.elizacloud.ai",
           origin: "https://cloud-staging.eliza.app",
           authorization: "Bearer header.payload.signature",
@@ -123,6 +133,7 @@ describe("POST /api/auth/logout cookie clearing", () => {
       {
         method: "POST",
         headers: {
+          ...MUTATION_PROTOCOL_HEADERS,
           host: "api.elizacloud.ai",
           origin: "https://eliza.app",
           cookie: "steward-token=prod-token",
@@ -158,6 +169,7 @@ describe("POST /api/auth/logout cookie clearing", () => {
       {
         method: "POST",
         headers: {
+          ...MUTATION_PROTOCOL_HEADERS,
           host: "api.elizacloud.ai",
           origin: "https://eliza.app",
           cookie: "steward-token=prod-token",
@@ -187,6 +199,7 @@ describe("POST /api/auth/logout cookie clearing", () => {
       {
         method: "POST",
         headers: {
+          ...MUTATION_PROTOCOL_HEADERS,
           host: "api-staging.elizacloud.ai",
           origin: "https://staging.eliza.app",
           cookie:
@@ -217,6 +230,7 @@ describe("POST /api/auth/logout cookie clearing", () => {
       {
         method: "POST",
         headers: {
+          ...MUTATION_PROTOCOL_HEADERS,
           host: "api-staging.elizacloud.ai",
           origin: "https://staging.eliza.app",
           cookie:
@@ -242,6 +256,7 @@ describe("POST /api/auth/logout cookie clearing", () => {
       {
         method: "POST",
         headers: {
+          ...MUTATION_PROTOCOL_HEADERS,
           host: "api.elizacloud.ai",
           origin: "https://eliza.app",
           cookie:
@@ -267,6 +282,7 @@ describe("POST /api/auth/logout cookie clearing", () => {
       {
         method: "POST",
         headers: {
+          ...MUTATION_PROTOCOL_HEADERS,
           host: "api.eliza.app",
           origin: "https://attacker.cloud.eliza.app",
           cookie:
@@ -295,6 +311,7 @@ describe("POST /api/auth/logout cookie clearing", () => {
       {
         method: "POST",
         headers: {
+          ...MUTATION_PROTOCOL_HEADERS,
           host: "api.eliza.app",
           cookie:
             "steward-token=prod-token; steward-refresh-token=prod-refresh",
@@ -307,5 +324,36 @@ describe("POST /api/auth/logout cookie clearing", () => {
     expect(res.headers.getSetCookie()).toEqual([]);
     expect(getCurrentUserMock).not.toHaveBeenCalled();
     expect(endAllUserSessionsMock).not.toHaveBeenCalled();
+  });
+
+  test("legacy logout cannot clear a newer browser session", async () => {
+    getCurrentUserMock.mockClear();
+    endAllUserSessionsMock.mockClear();
+    readStewardSessionTokenMock.mockClear();
+
+    const res = await app.request(
+      "/",
+      {
+        method: "POST",
+        headers: {
+          host: "api.eliza.app",
+          origin: "https://eliza.app",
+          cookie:
+            "steward-token=account-a; steward-refresh-token=account-a-refresh",
+          [STEWARD_CSRF_HEADER]: STEWARD_CSRF_HEADER_VALUE,
+        },
+      },
+      { ENVIRONMENT: "production", NODE_ENV: "production" },
+    );
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      code: "session_mutation_protocol_required",
+    });
+    expect(res.headers.getSetCookie()).toEqual([]);
+    expect(readStewardSessionTokenMock).not.toHaveBeenCalled();
+    expect(getCurrentUserMock).not.toHaveBeenCalled();
+    expect(endAllUserSessionsMock).not.toHaveBeenCalled();
+    expect(markSsoBridgeLogoutMock).not.toHaveBeenCalled();
   });
 });

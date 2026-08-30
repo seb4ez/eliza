@@ -9,6 +9,7 @@
  */
 
 import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { STEWARD_SESSION_MUTATION_PROTOCOL_VALUE } from "@elizaos/shared/steward-session-client";
 import { Hono } from "hono";
 
 const emitAudit = mock(async () => undefined);
@@ -98,6 +99,7 @@ function postStewardSession(body: unknown, ip = "203.0.113.10") {
         "cf-connecting-ip": ip,
         "content-type": "application/json",
         origin: "https://staging.elizacloud.ai",
+        "x-eliza-csrf": STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
       },
       body: JSON.stringify(body),
     }),

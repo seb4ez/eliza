@@ -12,6 +12,7 @@
 import {
   registerStewardTokenPersistence,
   STEWARD_SESSION_CHANGE_EVENT,
+  STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
   writeStoredStewardToken,
 } from "@elizaos/shared/steward-session-client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -417,7 +418,7 @@ describe("refreshCloudStewardSession (web/fetch branch)", () => {
         credentials: "include",
         headers: {
           "Content-Type": "application/json",
-          "X-Eliza-CSRF": "1",
+          "x-eliza-csrf": STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
         },
         signal: expect.any(AbortSignal),
       }),

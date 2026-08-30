@@ -21,11 +21,16 @@
  * Origin/Referer CSRF check mirrors `/api/auth/steward-session`.
  *
  * This route is the only way to refresh once the localStorage copy of the
- * refresh token is removed. Old browser tabs that still POST a refreshToken
- * to `/api/auth/steward-session` continue to work during the rollout window.
+ * refresh token is removed. The legacy session-POST payload shape remains
+ * accepted for updated callers holding the origin mutation lease, while
+ * pre-protocol bundles fail closed before any cookie mutation.
  */
 
-import type { StewardSessionErrorCode } from "@elizaos/shared/steward-session-client";
+import {
+  STEWARD_CSRF_HEADER,
+  STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+  type StewardSessionErrorCode,
+} from "@elizaos/shared/steward-session-client";
 import { type Context, Hono } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import {
@@ -426,6 +431,24 @@ app.post("/", async (c) => {
   // preview accidentally treating an older unsuffixed cookie as its session.
   const refreshToken = getCookie(c, cookieNames.refreshToken);
   const accessToken = getCookie(c, cookieNames.token);
+  // Any cookie-backed request can become a writer: the access-only recovery
+  // branch below removes a revoked account's cookies. Gate before either
+  // branch so a legacy response for account A cannot arrive after login B and
+  // delete or replace B's fixed-name cookies.
+  if (
+    (refreshToken || accessToken) &&
+    c.req.header(STEWARD_CSRF_HEADER) !==
+      STEWARD_SESSION_MUTATION_PROTOCOL_VALUE
+  ) {
+    logRefresh("session-mutation-protocol-required");
+    return c.json(
+      errorBody(
+        "Session refresh client update required",
+        "session_mutation_protocol_required",
+      ),
+      409,
+    );
+  }
   if (!refreshToken) {
     // A session POST can commit its access cookie immediately before the
     // renderer is closed, while its auth result carries no refresh token (or

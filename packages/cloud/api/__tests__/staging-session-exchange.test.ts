@@ -17,6 +17,7 @@ import {
   test,
 } from "bun:test";
 import { createHash } from "node:crypto";
+import { STEWARD_SESSION_MUTATION_PROTOCOL_VALUE } from "@elizaos/shared/steward-session-client";
 import { eq, sql } from "drizzle-orm";
 import { Hono } from "hono";
 import { decodeJwt, decodeProtectedHeader, jwtVerify, SignJWT } from "jose";
@@ -320,6 +321,7 @@ async function syncSessionCookie(
         "content-type": "application/json",
         host: API_HOST,
         origin: APP_ORIGIN,
+        "x-eliza-csrf": STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
       },
       body: JSON.stringify({ token, refreshToken }),
     },

@@ -4,6 +4,8 @@
  */
 
 import {
+  STEWARD_CSRF_HEADER,
+  STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
   type StewardSessionErrorCode,
   type StewardSessionRequest,
   type StewardSessionResponse,
@@ -172,6 +174,19 @@ app.post("/", async (c) => {
       return c.json(
         { error: "Forbidden", code: "csrf_marker_required" as const },
         403,
+      );
+    }
+    if (
+      c.req.header(STEWARD_CSRF_HEADER) !==
+      STEWARD_SESSION_MUTATION_PROTOCOL_VALUE
+    ) {
+      logStewardAuth("session-mutation-protocol-required", null);
+      return c.json(
+        errorBody(
+          "Session client update required",
+          "session_mutation_protocol_required",
+        ),
+        409,
       );
     }
 
@@ -604,6 +619,19 @@ app.delete("/", (c) => {
   if (!checkNonSimpleMarker(c)) {
     logStewardAuth("csrf-marker-missing-delete", null);
     return c.json({ error: "Forbidden", code: "csrf_marker_required" }, 403);
+  }
+  if (
+    c.req.header(STEWARD_CSRF_HEADER) !==
+    STEWARD_SESSION_MUTATION_PROTOCOL_VALUE
+  ) {
+    logStewardAuth("session-mutation-protocol-required-delete", null);
+    return c.json(
+      errorBody(
+        "Session client update required",
+        "session_mutation_protocol_required",
+      ),
+      409,
+    );
   }
   const domain = cookieDomainForHost(c.req.header("host"));
   const opts = domain ? { path: "/", domain } : { path: "/" };

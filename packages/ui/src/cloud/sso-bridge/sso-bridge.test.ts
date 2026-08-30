@@ -1,7 +1,11 @@
 /** Pure-logic contract for the SSO bridge client module: hostname role table, returnTo sanitation, state-nonce + PKCE-verifier lifecycle, loop guard, logged-out marker, URL builders, and the mint/exchange/burn fetch wrappers — jsdom storage + hand-rolled fetch stubs, nothing mocked at module level. */
 // @vitest-environment jsdom
 
-import { STEWARD_TOKEN_KEY } from "@elizaos/shared/steward-session-client";
+import {
+  STEWARD_CSRF_HEADER,
+  STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+  STEWARD_TOKEN_KEY,
+} from "@elizaos/shared/steward-session-client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   peekPendingOnboardingSession,
@@ -433,6 +437,9 @@ describe("performSsoExchange", () => {
     });
     // The session-cookie sync rides the same call the login flow makes.
     expect(calls[1].url).toContain("/api/auth/steward-session");
+    expect(new Headers(calls[1].init?.headers).get(STEWARD_CSRF_HEADER)).toBe(
+      STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+    );
     expect(events).toEqual(["steward-token-sync"]);
     expect(shouldAttemptSsoBridge()).toBe(true);
     expect(isSsoLoggedOut()).toBe(false);
@@ -706,7 +713,9 @@ describe("signOutFromSsoBridgedHost", () => {
       expect(new Headers(calls[0].init?.headers).get("authorization")).toBe(
         `Bearer ${token}`,
       );
-      expect(new Headers(calls[0].init?.headers).get("x-eliza-csrf")).toBe("1");
+      expect(new Headers(calls[0].init?.headers).get("x-eliza-csrf")).toBe(
+        STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+      );
       expect(proofAtServerLogoutIssue).toBe(false);
       expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
       expect(globalCalls).toEqual([]);
@@ -1001,7 +1010,9 @@ describe("prepareSsoAccountSwitch", () => {
       expect(new Headers(calls[0].init?.headers).get("authorization")).toBe(
         `Bearer ${token}`,
       );
-      expect(new Headers(calls[0].init?.headers).get("x-eliza-csrf")).toBe("1");
+      expect(new Headers(calls[0].init?.headers).get("x-eliza-csrf")).toBe(
+        STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+      );
     } finally {
       globalThis.fetch = realFetch;
     }

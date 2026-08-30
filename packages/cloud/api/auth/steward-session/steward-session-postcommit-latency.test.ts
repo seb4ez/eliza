@@ -9,6 +9,7 @@
  */
 
 import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { STEWARD_SESSION_MUTATION_PROTOCOL_VALUE } from "@elizaos/shared/steward-session-client";
 import { Hono } from "hono";
 
 function deferred<T>() {
@@ -99,6 +100,15 @@ mock.module("@/lib/services/steward-client", () => ({
 mock.module("@/lib/services/sso-bridge-codes", () => ({
   isBlockedBySsoBridgeLogout: async () => false,
 }));
+mock.module("@/lib/services/account-lifecycle-authority", () => ({
+  readOrganizationLifecycleAuthority: async () => ({
+    state: "active",
+    revision: 1,
+    active: true,
+    deletionRequestId: null,
+  }),
+  organizationLifecycleAllowsNewWork: () => true,
+}));
 mock.module("@/lib/middleware/rate-limit-hono-cloudflare", () => ({
   getIpKey: () => "test-client",
   getRequestIp: () => "127.0.0.1",
@@ -149,6 +159,7 @@ function sessionRequest(): Request {
       headers: {
         "content-type": "application/json",
         origin: "https://staging.elizacloud.ai",
+        "x-eliza-csrf": STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
       },
       body: JSON.stringify({ token: "valid-steward-token" }),
     },

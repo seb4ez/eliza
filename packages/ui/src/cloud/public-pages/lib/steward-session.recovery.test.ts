@@ -8,7 +8,9 @@
 import {
   registerStewardTokenPersistence,
   registerStewardTokenRemoval,
+  STEWARD_CSRF_HEADER,
   STEWARD_SESSION_CHANGE_EVENT,
+  STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
   STEWARD_TOKEN_KEY,
   writeStoredStewardToken,
 } from "@elizaos/shared/steward-session-client";
@@ -77,6 +79,26 @@ function deferred<T>() {
   });
   return { promise, resolve };
 }
+
+it("marks cookie refresh as an admitted serialized session mutation", async () => {
+  let refreshInit: RequestInit | undefined;
+  globalThis.fetch = vi.fn(
+    async (_input: RequestInfo | URL, init?: RequestInit) => {
+      refreshInit = init;
+      return jsonResponse({
+        ok: true,
+        token: tokenForEmail("person@example.com"),
+      });
+    },
+  ) as unknown as typeof fetch;
+
+  await expect(refreshStewardSessionViaCookie()).resolves.toMatchObject({
+    ok: true,
+  });
+  expect(new Headers(refreshInit?.headers).get(STEWARD_CSRF_HEADER)).toBe(
+    STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+  );
+});
 
 describe("recoverStewardEmailSessionViaCookie", () => {
   afterEach(() => {
@@ -445,7 +467,9 @@ describe("recoverStewardSessionViaCookie", () => {
     expect(fetchMock.mock.calls[2]?.[1]).toMatchObject({
       method: "DELETE",
       credentials: "include",
-      headers: expect.objectContaining({ "X-Eliza-CSRF": "1" }),
+      headers: expect.objectContaining({
+        [STEWARD_CSRF_HEADER]: STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+      }),
     });
   });
 

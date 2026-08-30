@@ -11,9 +11,11 @@
 import {
   clearStoredStewardToken,
   readStoredStewardToken,
+  STEWARD_CSRF_HEADER,
   STEWARD_NONCE_EXCHANGE_ENDPOINT,
   STEWARD_REFRESH_ENDPOINT,
   STEWARD_SESSION_ENDPOINT,
+  STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
   STEWARD_TENANT_ID,
   type StewardNonceExchangeResponse,
   StewardSessionError,
@@ -75,7 +77,7 @@ async function postAuthJson(
       // stale-session recovery into a CSRF-guarded 403.
       headers: {
         "Content-Type": "application/json",
-        "X-Eliza-CSRF": "1",
+        [STEWARD_CSRF_HEADER]: STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
       },
       ...(body ? { body: JSON.stringify(body) } : {}),
       ...(signal ? { signal } : {}),

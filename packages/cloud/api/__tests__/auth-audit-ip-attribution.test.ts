@@ -14,6 +14,7 @@
  */
 
 import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { STEWARD_SESSION_MUTATION_PROTOCOL_VALUE } from "@elizaos/shared/steward-session-client";
 
 process.env.NODE_ENV ||= "test";
 
@@ -136,6 +137,7 @@ function attributedHeaders(): Record<string, string> {
     "x-forwarded-for": SPOOFED_XFF,
     origin: "https://staging.elizacloud.ai",
     "content-type": "application/json",
+    "x-eliza-csrf": STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
   };
 }
 

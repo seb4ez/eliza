@@ -11,7 +11,10 @@
  * so the renderer drives the whole exchange.
  */
 
-import { STEWARD_SESSION_CHANGE_EVENT } from "@elizaos/shared/steward-session-client";
+import {
+  STEWARD_SESSION_CHANGE_EVENT,
+  STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+} from "@elizaos/shared/steward-session-client";
 import { expect, type Route, test } from "@playwright/test";
 import {
   expectNoPageDiagnostics,
@@ -116,7 +119,9 @@ test("cloud session survives a mid-suite JWT expiry by renewing the token", asyn
   await expect
     .poll(() => refreshRequests, { timeout: 30_000 })
     .toBeGreaterThan(0);
-  expect(refreshRequestHeaders?.["x-eliza-csrf"]).toBe("1");
+  expect(refreshRequestHeaders?.["x-eliza-csrf"]).toBe(
+    STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+  );
   expect(refreshRequestHeaders?.["content-type"]).toBe("application/json");
   await expect
     .poll(

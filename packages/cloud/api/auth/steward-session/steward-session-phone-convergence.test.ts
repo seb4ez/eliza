@@ -1,6 +1,11 @@
 /** Verifies SMS session sync proves phone ownership before Cloud account convergence. */
 
 import { beforeEach, describe, expect, mock, test } from "bun:test";
+import {
+  STEWARD_CSRF_HEADER,
+  STEWARD_CSRF_HEADER_VALUE,
+  STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+} from "@elizaos/shared/steward-session-client";
 import { Hono } from "hono";
 
 const emitAudit = mock(async () => undefined);
@@ -95,7 +100,10 @@ const ENV = {
   STEWARD_API_URL: "https://steward.example",
 };
 
-async function post(body: unknown): Promise<Response> {
+async function post(
+  body: unknown,
+  mutationProtocol = STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+): Promise<Response> {
   const app = new Hono();
   app.route("/api/auth/steward-session", route);
   return await app.fetch(
@@ -104,6 +112,7 @@ async function post(body: unknown): Promise<Response> {
       headers: {
         "content-type": "application/json",
         origin: "https://staging.elizacloud.ai",
+        [STEWARD_CSRF_HEADER]: mutationProtocol,
       },
       body: JSON.stringify(body),
     }),
@@ -129,6 +138,21 @@ beforeEach(() => {
 });
 
 describe("POST /api/auth/steward-session phone convergence", () => {
+  test("rejects a legacy account-A login before verification or cookie mutation", async () => {
+    const response = await post(
+      { token: "account-a-token" },
+      STEWARD_CSRF_HEADER_VALUE,
+    );
+
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toMatchObject({
+      code: "session_mutation_protocol_required",
+    });
+    expect(verifyStewardTokenCached).not.toHaveBeenCalled();
+    expect(syncUserFromSteward).not.toHaveBeenCalled();
+    expect(response.headers.getSetCookie()).toEqual([]);
+  });
+
   test("passes only the server-verified phone into the existing sync authority", async () => {
     const response = await post({
       token: "sms-session-token",
@@ -143,17 +167,19 @@ describe("POST /api/auth/steward-session phone convergence", () => {
       tenantId: "personal-steward-user-1",
       phoneNumber: "+1 (415) 555-2671",
     });
-    expect(syncUserFromSteward).toHaveBeenCalledWith({
-      stewardUserId: "steward-user-1",
-      email: undefined,
-      walletAddress: undefined,
-      walletChainType: undefined,
-      verifiedPhone: "+14155552671",
-      verifiedTelegramId: undefined,
-      telegramContinuation: undefined,
-      sharedRuntimeConversationNamespace: undefined,
-      executionCtx: undefined,
-    });
+    expect(syncUserFromSteward).toHaveBeenCalledWith(
+      expect.objectContaining({
+        stewardUserId: "steward-user-1",
+        email: undefined,
+        walletAddress: undefined,
+        walletChainType: undefined,
+        verifiedPhone: "+14155552671",
+        verifiedTelegramId: undefined,
+        telegramContinuation: undefined,
+        sharedRuntimeConversationNamespace: undefined,
+        executionCtx: undefined,
+      }),
+    );
   });
 
   test("passes an opaque Telegram account claim into pre-creation convergence", async () => {
@@ -164,17 +190,19 @@ describe("POST /api/auth/steward-session phone convergence", () => {
     });
 
     expect(response.status).toBe(200);
-    expect(syncUserFromSteward).toHaveBeenCalledWith({
-      stewardUserId: "steward-user-1",
-      email: undefined,
-      walletAddress: undefined,
-      walletChainType: undefined,
-      verifiedPhone: undefined,
-      verifiedTelegramId: undefined,
-      telegramContinuation: "opaque-telegram-claim-token",
-      sharedRuntimeConversationNamespace: undefined,
-      executionCtx: undefined,
-    });
+    expect(syncUserFromSteward).toHaveBeenCalledWith(
+      expect.objectContaining({
+        stewardUserId: "steward-user-1",
+        email: undefined,
+        walletAddress: undefined,
+        walletChainType: undefined,
+        verifiedPhone: undefined,
+        verifiedTelegramId: undefined,
+        telegramContinuation: "opaque-telegram-claim-token",
+        sharedRuntimeConversationNamespace: undefined,
+        executionCtx: undefined,
+      }),
+    );
   });
 
   test("passes Telegram identity only from verified Steward claims", async () => {
@@ -193,17 +221,19 @@ describe("POST /api/auth/steward-session phone convergence", () => {
     });
 
     expect(response.status).toBe(200);
-    expect(syncUserFromSteward).toHaveBeenCalledWith({
-      stewardUserId: "steward-telegram-user",
-      email: undefined,
-      walletAddress: undefined,
-      walletChainType: undefined,
-      verifiedPhone: undefined,
-      verifiedTelegramId: "424242",
-      telegramContinuation: undefined,
-      sharedRuntimeConversationNamespace: undefined,
-      executionCtx: undefined,
-    });
+    expect(syncUserFromSteward).toHaveBeenCalledWith(
+      expect.objectContaining({
+        stewardUserId: "steward-telegram-user",
+        email: undefined,
+        walletAddress: undefined,
+        walletChainType: undefined,
+        verifiedPhone: undefined,
+        verifiedTelegramId: "424242",
+        telegramContinuation: undefined,
+        sharedRuntimeConversationNamespace: undefined,
+        executionCtx: undefined,
+      }),
+    );
   });
 
   test("rejects Telegram identity on a non-Telegram verified session", async () => {

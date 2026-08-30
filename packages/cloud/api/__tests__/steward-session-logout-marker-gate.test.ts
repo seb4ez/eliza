@@ -21,6 +21,7 @@ import {
   setSystemTime,
   test,
 } from "bun:test";
+import { STEWARD_SESSION_MUTATION_PROTOCOL_VALUE } from "@elizaos/shared/steward-session-client";
 
 const AMBIENT_DATABASE_URL = process.env.DATABASE_URL ?? "";
 const CAN_USE_ISOLATED_PGLITE =
@@ -83,6 +84,7 @@ async function postSession(token: string): Promise<Response> {
       headers: {
         "content-type": "application/json",
         origin: "https://elizacloud.ai",
+        "x-eliza-csrf": STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
         "x-forwarded-for": `10.9.0.${ipCounter}`,
       },
       body: JSON.stringify({ token }),

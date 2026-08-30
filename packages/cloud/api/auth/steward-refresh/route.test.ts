@@ -1,5 +1,9 @@
 // Exercises cloud API auth steward refresh route.test behavior with deterministic Worker route fixtures.
 import { beforeEach, describe, expect, mock, test } from "bun:test";
+import {
+  STEWARD_CSRF_HEADER,
+  STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+} from "@elizaos/shared/steward-session-client";
 
 type VerifiedStewardClaims = {
   userId: string;
@@ -65,6 +69,10 @@ const ENV = {
   STEWARD_JWT_SECRET: "secret",
   STEWARD_TENANT_ID: "elizacloud",
 };
+
+const MUTATION_PROTOCOL_HEADERS = {
+  [STEWARD_CSRF_HEADER]: STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+} as const;
 
 function post(headers: HeadersInit = {}) {
   return app.fetch(
@@ -238,6 +246,7 @@ describe("steward-refresh browser cookie cleanup", () => {
         new Request("https://api-staging.elizacloud.ai/", {
           method: "POST",
           headers: {
+            ...MUTATION_PROTOCOL_HEADERS,
             host: "api-staging.elizacloud.ai",
             origin: "https://staging.elizacloud.ai",
             cookie:
@@ -285,6 +294,7 @@ describe("steward-refresh browser cookie cleanup", () => {
       new Request("https://api-staging.elizacloud.ai/", {
         method: "POST",
         headers: {
+          ...MUTATION_PROTOCOL_HEADERS,
           host: "api-staging.elizacloud.ai",
           origin: "https://staging.elizacloud.ai",
           cookie:
@@ -311,6 +321,34 @@ describe("steward-refresh browser cookie cleanup", () => {
     expect(cleared).not.toContain("steward-authed");
   });
 
+  test("legacy access-only recovery cannot delete account B cookies", async () => {
+    const response = await app.fetch(
+      new Request("https://api-staging.elizacloud.ai/", {
+        method: "POST",
+        headers: {
+          host: "api-staging.elizacloud.ai",
+          origin: "https://staging.elizacloud.ai",
+          cookie:
+            "steward-token-staging=account-a-access; steward-authed-staging=1",
+          [STEWARD_CSRF_HEADER]: "1",
+        },
+      }),
+      {
+        ...ENV,
+        ENVIRONMENT: "staging",
+        STEWARD_API_URL: "https://steward.example.test",
+      },
+    );
+
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toMatchObject({
+      code: "session_mutation_protocol_required",
+    });
+    expect(verifyStewardTokenCached).not.toHaveBeenCalled();
+    expect(isBlockedBySsoBridgeLogout).not.toHaveBeenCalled();
+    expect(response.headers.getSetCookie()).toEqual([]);
+  });
+
   test("keeps access cookies intact when the bridged logout marker store is unavailable", async () => {
     verifyStewardTokenCached.mockResolvedValue({
       userId: "bridged-user",
@@ -328,6 +366,7 @@ describe("steward-refresh browser cookie cleanup", () => {
       new Request("https://api-staging.elizacloud.ai/", {
         method: "POST",
         headers: {
+          ...MUTATION_PROTOCOL_HEADERS,
           host: "api-staging.elizacloud.ai",
           origin: "https://staging.elizacloud.ai",
           cookie:
@@ -399,6 +438,7 @@ describe("steward-refresh browser cookie cleanup", () => {
         new Request("https://api-staging.elizacloud.ai/", {
           method: "POST",
           headers: {
+            ...MUTATION_PROTOCOL_HEADERS,
             host: "api-staging.elizacloud.ai",
             origin: "https://staging.elizacloud.ai",
             cookie:
@@ -423,6 +463,47 @@ describe("steward-refresh browser cookie cleanup", () => {
       // cookies) holds trivially.
       const cleared = deletedCookieNames(response);
       expect(cleared).toHaveLength(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("rejects a legacy cookie refresh before upstream work or Set-Cookie", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = mock(async () => {
+      throw new Error("legacy refresh must not reach Steward");
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    try {
+      const response = await app.fetch(
+        new Request("https://api-staging.elizacloud.ai/", {
+          method: "POST",
+          headers: {
+            host: "api-staging.elizacloud.ai",
+            origin: "https://staging.elizacloud.ai",
+            cookie:
+              "steward-token-staging=account-a-access; steward-refresh-token-staging=account-a-refresh; steward-authed-staging=1",
+            // The pre-Web-Locks bundle sent the CSRF marker but could not
+            // attest the serialized session-mutation protocol.
+            [STEWARD_CSRF_HEADER]: "1",
+          },
+        }),
+        {
+          ...ENV,
+          ENVIRONMENT: "staging",
+          STEWARD_API_URL: "https://steward.example.test",
+        },
+      );
+
+      expect(response.status).toBe(409);
+      await expect(response.json()).resolves.toEqual({
+        error: "Session refresh client update required",
+        code: "session_mutation_protocol_required",
+      });
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(verifyStewardTokenCached).not.toHaveBeenCalled();
+      expect(response.headers.getSetCookie()).toEqual([]);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -476,6 +557,7 @@ describe("steward-refresh browser cookie cleanup", () => {
           new Request("https://api-staging.elizacloud.ai/", {
             method: "POST",
             headers: {
+              ...MUTATION_PROTOCOL_HEADERS,
               host: "api-staging.elizacloud.ai",
               origin: "https://staging.elizacloud.ai",
               cookie:
@@ -526,6 +608,7 @@ describe("steward-refresh browser cookie cleanup", () => {
         new Request("https://api-staging.elizacloud.ai/", {
           method: "POST",
           headers: {
+            ...MUTATION_PROTOCOL_HEADERS,
             host: "api-staging.elizacloud.ai",
             origin: "https://staging.elizacloud.ai",
             cookie:
@@ -569,6 +652,7 @@ describe("steward-refresh browser cookie cleanup", () => {
         new Request("https://api-staging.elizacloud.ai/", {
           method: "POST",
           headers: {
+            ...MUTATION_PROTOCOL_HEADERS,
             host: "api-staging.elizacloud.ai",
             origin: "https://staging.elizacloud.ai",
             cookie: "steward-refresh-token-staging=staging-refresh",
@@ -613,6 +697,7 @@ describe("steward-refresh browser cookie cleanup", () => {
         new Request("https://api-staging.elizacloud.ai/", {
           method: "POST",
           headers: {
+            ...MUTATION_PROTOCOL_HEADERS,
             host: "api-staging.elizacloud.ai",
             origin: "https://staging.elizacloud.ai",
             cookie: "steward-refresh-token-staging=staging-refresh",
@@ -650,6 +735,7 @@ describe("steward-refresh browser cookie cleanup", () => {
         new Request("http://127.0.0.1:8787/", {
           method: "POST",
           headers: {
+            ...MUTATION_PROTOCOL_HEADERS,
             host: "127.0.0.1:8787",
             origin: "http://127.0.0.1:5173",
             cookie: "steward-refresh-token-staging=staging-refresh",
@@ -687,6 +773,7 @@ describe("steward-refresh browser cookie cleanup", () => {
         new Request("http://127.0.0.1:8787/", {
           method: "POST",
           headers: {
+            ...MUTATION_PROTOCOL_HEADERS,
             host: "127.0.0.1:8787",
             origin: "https://cloud.eliza.app",
             cookie: "steward-refresh-token-staging=staging-refresh",
@@ -721,6 +808,7 @@ describe("steward-refresh browser cookie cleanup", () => {
         new Request("https://api-staging.elizacloud.ai/", {
           method: "POST",
           headers: {
+            ...MUTATION_PROTOCOL_HEADERS,
             host: "api-staging.elizacloud.ai",
             origin: "https://staging.elizacloud.ai",
             cookie: "steward-refresh-token-staging=staging-refresh",
@@ -760,6 +848,7 @@ describe("steward-refresh browser cookie cleanup", () => {
         new Request("https://api-staging.elizacloud.ai/", {
           method: "POST",
           headers: {
+            ...MUTATION_PROTOCOL_HEADERS,
             host: "api-staging.elizacloud.ai",
             origin: "https://staging.elizacloud.ai",
             cookie: "steward-refresh-token-staging=staging-refresh",

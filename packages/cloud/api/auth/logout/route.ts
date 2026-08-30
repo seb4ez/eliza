@@ -4,6 +4,10 @@
  * Also invalidates Redis caches to ensure immediate token invalidation.
  */
 
+import {
+  STEWARD_CSRF_HEADER,
+  STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+} from "@elizaos/shared/steward-session-client";
 import { Hono } from "hono";
 import { deleteCookie } from "hono/cookie";
 import { getAuditDispatcher } from "@/api-app/services/audit-dispatcher-singleton";
@@ -46,6 +50,18 @@ app.post("/", async (c) => {
     return c.json(
       { error: "Forbidden", code: "forbidden_origin" as const },
       403,
+    );
+  }
+  if (
+    c.req.header(STEWARD_CSRF_HEADER) !==
+    STEWARD_SESSION_MUTATION_PROTOCOL_VALUE
+  ) {
+    return c.json(
+      {
+        error: "Session client update required",
+        code: "session_mutation_protocol_required" as const,
+      },
+      409,
     );
   }
 

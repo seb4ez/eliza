@@ -1,6 +1,7 @@
 /** Verifies OAuth code exchange cannot carry Telegram claim authority. */
 
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { STEWARD_SESSION_MUTATION_PROTOCOL_VALUE } from "@elizaos/shared/steward-session-client";
 import { Hono } from "hono";
 
 const nativeFetch = globalThis.fetch;
@@ -62,6 +63,7 @@ async function post(body: unknown): Promise<Response> {
         headers: {
           "content-type": "application/json",
           origin: "https://staging.elizacloud.ai",
+          "x-eliza-csrf": STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
         },
         body: JSON.stringify(body),
       },

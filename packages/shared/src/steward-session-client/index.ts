@@ -259,6 +259,21 @@ export const STEWARD_REFRESH_ENDPOINT = "/api/auth/steward-refresh";
 export const STEWARD_CSRF_HEADER = "x-eliza-csrf";
 export const STEWARD_CSRF_HEADER_VALUE = "1";
 
+/**
+ * Exact CSRF-header value sent by browser cookie writers only after entering
+ * the origin-wide Steward session mutation queue, or by an isolated non-browser
+ * client whose singleton control flow supplies the same no-concurrent-writer
+ * guarantee. Cookie-mutating auth routes require this version during the Web
+ * Locks rollout, so an older tab that can still race a newer login is rejected
+ * before it consumes upstream authority or emits any Set-Cookie header.
+ *
+ * This is a first-party protocol/version marker, not an authentication
+ * credential. Origin/CSRF validation and the HttpOnly refresh cookie remain
+ * the request authorities.
+ */
+export const STEWARD_SESSION_MUTATION_PROTOCOL_VALUE =
+  "steward-session-web-lock.v1";
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -352,6 +367,9 @@ export type StewardSessionErrorCode =
    * header or JSON content type), so it could have been a cross-origin
    * simple request. Rejected before any cookie was read. */
   | "csrf_marker_required"
+  /** The browser cookie writer predates the origin-wide session-mutation
+   * protocol. It must reload/update before it can safely mutate cookies. */
+  | "session_mutation_protocol_required"
   | "forbidden_origin";
 
 export class StewardSessionError extends Error {
@@ -381,12 +399,20 @@ export interface SyncOpts {
    * Override the global fetch (mainly for tests and SSR shims).
    */
   fetchImpl?: typeof fetch;
+  /**
+   * Present only when the caller owns the origin-wide Steward mutation lease.
+   * Omitting it deliberately emits the legacy marker, which current cookie
+   * writers reject rather than accepting an unserialized mutation.
+   */
+  sessionMutationProtocol?: typeof STEWARD_SESSION_MUTATION_PROTOCOL_VALUE;
 }
 
 export interface ClearOpts {
   /** Endpoints to DELETE. Defaults to [STEWARD_SESSION_ENDPOINT]. */
   endpoints?: string[];
   fetchImpl?: typeof fetch;
+  /** See {@link SyncOpts.sessionMutationProtocol}. */
+  sessionMutationProtocol?: typeof STEWARD_SESSION_MUTATION_PROTOCOL_VALUE;
 }
 
 // ---------------------------------------------------------------------------
@@ -1219,7 +1245,8 @@ export async function syncStewardSession(
     credentials: "include",
     headers: {
       "Content-Type": "application/json",
-      [STEWARD_CSRF_HEADER]: STEWARD_CSRF_HEADER_VALUE,
+      [STEWARD_CSRF_HEADER]:
+        opts.sessionMutationProtocol ?? STEWARD_CSRF_HEADER_VALUE,
     },
     body: JSON.stringify(body),
   });
@@ -1301,7 +1328,8 @@ export async function exchangeStewardCode(
     credentials: "include",
     headers: {
       "Content-Type": "application/json",
-      [STEWARD_CSRF_HEADER]: STEWARD_CSRF_HEADER_VALUE,
+      [STEWARD_CSRF_HEADER]:
+        opts.sessionMutationProtocol ?? STEWARD_CSRF_HEADER_VALUE,
     },
     body: JSON.stringify(body),
   });
@@ -1342,7 +1370,10 @@ export function clearStewardSession(opts: ClearOpts = {}): void {
     f(url, {
       method: "DELETE",
       credentials: "include",
-      headers: { [STEWARD_CSRF_HEADER]: STEWARD_CSRF_HEADER_VALUE },
+      headers: {
+        [STEWARD_CSRF_HEADER]:
+          opts.sessionMutationProtocol ?? STEWARD_CSRF_HEADER_VALUE,
+      },
     }).catch(() => {
       // ignore — see jsdoc
     });

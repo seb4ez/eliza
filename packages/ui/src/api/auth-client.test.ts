@@ -6,6 +6,8 @@ import {
   clearStoredStewardToken,
   hasStewardAuthedCookie,
   readStoredStewardToken,
+  STEWARD_CSRF_HEADER,
+  STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
   writeStoredStewardToken,
 } from "@elizaos/shared/steward-session-client";
 /**
@@ -49,6 +51,8 @@ vi.mock("@elizaos/shared/steward-session-client", () => ({
   writeStoredStewardToken: vi.fn(),
   clearStoredStewardToken: vi.fn(),
   hasStewardAuthedCookie: vi.fn(),
+  STEWARD_CSRF_HEADER: "x-eliza-csrf",
+  STEWARD_SESSION_MUTATION_PROTOCOL_VALUE: "steward-session-web-lock.v1",
 }));
 vi.mock("../bridge/electrobun-rpc", () => ({
   invokeDesktopBridgeRequest: vi.fn(),
@@ -429,6 +433,9 @@ describe("authLogout", () => {
     await expect(authLogout()).resolves.toEqual({ ok: true });
     expect(fetchWithCsrfMock).toHaveBeenCalledWith("/api/auth/logout", {
       method: "POST",
+      headers: {
+        [STEWARD_CSRF_HEADER]: STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+      },
     });
   });
 

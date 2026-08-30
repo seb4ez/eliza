@@ -32,6 +32,8 @@ import { expect, test } from "../src/helpers/test-fixtures";
  */
 
 const STEWARD_SESSION = "/api/auth/steward-session";
+// cloud/e2e intentionally runs without building @elizaos/shared first.
+const STEWARD_SESSION_MUTATION_PROTOCOL_VALUE = "steward-session-web-lock.v1";
 const ME = "/api/users/me";
 
 /**
@@ -85,6 +87,7 @@ test.describe("steward session", () => {
       headers: {
         "Content-Type": "application/json",
         Origin: stack.urls.api,
+        "X-Eliza-CSRF": STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
       },
       body: JSON.stringify({}),
     });
@@ -101,6 +104,7 @@ test.describe("steward session", () => {
       headers: {
         "Content-Type": "application/json",
         Origin: stack.urls.api,
+        "X-Eliza-CSRF": STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
       },
       body: JSON.stringify({ token: "header.payload.signature" }),
     });
@@ -119,7 +123,10 @@ test.describe("steward session", () => {
       method: "DELETE",
       // The route's non-simple-request CSRF marker: a bodyless DELETE carries
       // no JSON content type, so the custom header must be sent explicitly.
-      headers: { Origin: stack.urls.api, "X-Eliza-CSRF": "1" },
+      headers: {
+        Origin: stack.urls.api,
+        "X-Eliza-CSRF": STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+      },
     });
     expect(res.status).toBe(200);
     expect((await res.json()) as { ok?: boolean }).toMatchObject({ ok: true });

@@ -31,6 +31,8 @@ import { test as base, expect } from "../src/helpers/test-fixtures";
 
 const STEWARD_JWT_SECRET = "personal-eliza-first-five-local-secret-32-bytes";
 const STEWARD_USER_ID = "steward-personal-eliza-first-five";
+// cloud/e2e intentionally runs without building @elizaos/shared first.
+const STEWARD_SESSION_MUTATION_PROTOCOL_VALUE = "steward-session-web-lock.v1";
 const RUN_ID = randomUUID();
 const TELEGRAM_USER_ID = BigInt(
   `0x${RUN_ID.replaceAll("-", "").slice(0, 15)}`,
@@ -389,6 +391,7 @@ test.describe("personal Eliza first five minutes", () => {
         headers: {
           "Content-Type": "application/json",
           Origin: stack.urls.api,
+          "X-Eliza-CSRF": STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
         },
         // The browser's explicit claim ceremony: since #21925 a continuation
         // is only honoured with this marker, which ordinary login sync never

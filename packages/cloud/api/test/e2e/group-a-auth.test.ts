@@ -18,6 +18,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { STEWARD_SESSION_MUTATION_PROTOCOL_VALUE } from "@elizaos/shared/steward-session-client";
 import {
   api,
   bearerHeaders,
@@ -183,7 +184,7 @@ describeE2E("Group A: auth + sessions", () => {
     // satisfy it implicitly, but a bodyless DELETE must send it explicitly.
     const stewardSessionHeaders = {
       Origin: "https://staging.elizacloud.ai",
-      "X-Eliza-CSRF": "1",
+      "X-Eliza-CSRF": STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
     };
 
     test("POST validation: missing token returns 400", async () => {
@@ -248,7 +249,7 @@ describeE2E("Group A: auth + sessions", () => {
     // host unconditionally (localhost is dev-only, staging runs production).
     const nonceHeaders = {
       Origin: "https://staging.elizacloud.ai",
-      "X-Eliza-CSRF": "1",
+      "X-Eliza-CSRF": STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
     };
 
     test("validation: missing code returns 400 missing_code", async () => {
@@ -781,6 +782,7 @@ describeE2E("Group A: auth + sessions", () => {
           headers: {
             ...bearerHeaders(),
             Origin: new URL(getBaseUrl()).origin,
+            "X-Eliza-CSRF": STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
           },
         },
       );

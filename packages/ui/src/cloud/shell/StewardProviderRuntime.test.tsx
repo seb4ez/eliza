@@ -10,6 +10,7 @@
 
 import {
   STEWARD_SESSION_CHANGE_EVENT,
+  STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
   STEWARD_TOKEN_KEY,
   type StewardSessionChangeDetail,
 } from "@elizaos/shared/steward-session-client";
@@ -699,7 +700,7 @@ describe("AuthTokenSync", () => {
     );
     expect(refreshInit?.headers).toMatchObject({
       "Content-Type": "application/json",
-      "X-Eliza-CSRF": "1",
+      "x-eliza-csrf": STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
     });
   });
 

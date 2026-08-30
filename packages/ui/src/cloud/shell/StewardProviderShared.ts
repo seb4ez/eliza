@@ -5,8 +5,10 @@
 import {
   clearStoredStewardToken,
   readStoredStewardToken,
+  STEWARD_CSRF_HEADER,
   STEWARD_REFRESH_ENDPOINT,
   STEWARD_SESSION_ENDPOINT,
+  STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
   StewardTokenRemovalError,
 } from "@elizaos/shared/steward-session-client";
 import { createContext } from "react";
@@ -140,7 +142,10 @@ async function clearStewardSessionCookieAt(url: string): Promise<void> {
   const requestSettled = fetch(url, {
     method: "DELETE",
     credentials: "include",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      [STEWARD_CSRF_HEADER]: STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+    },
     signal: controller.signal,
   }).then(
     () => undefined,

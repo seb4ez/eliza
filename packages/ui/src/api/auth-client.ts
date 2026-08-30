@@ -13,6 +13,8 @@ import { getElizaApiToken } from "@elizaos/shared";
 import {
   hasStewardAuthedCookie,
   readStoredStewardToken,
+  STEWARD_CSRF_HEADER,
+  STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
   writeStoredStewardToken,
 } from "@elizaos/shared/steward-session-client";
 import { invokeDesktopBridgeRequest } from "../bridge/electrobun-rpc";
@@ -387,7 +389,14 @@ export async function authLoginPassword(params: {
  */
 export async function authLogout(): Promise<AuthLogoutResult> {
   try {
-    await fetchWithCsrf(`${authBase()}/api/auth/logout`, { method: "POST" });
+    await enqueueStewardSessionMutation(async () => {
+      await fetchWithCsrf(`${authBase()}/api/auth/logout`, {
+        method: "POST",
+        headers: {
+          [STEWARD_CSRF_HEADER]: STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+        },
+      });
+    });
   } catch {
     // Logout is best-effort; treat network errors as success from the
     // client's perspective — the cookie may still clear on reconnect.

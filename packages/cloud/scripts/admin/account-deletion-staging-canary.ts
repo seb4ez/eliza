@@ -9,6 +9,10 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname } from "node:path";
+import {
+  STEWARD_CSRF_HEADER,
+  STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+} from "@elizaos/shared/steward-session-client";
 import { readDatabaseIdentityReceipt } from "./preflight-database-identity";
 
 interface PgClient {
@@ -716,6 +720,9 @@ class CloudClient {
         headers: {
           "content-type": "application/json",
           origin: this.config.cloudOrigin,
+          // This singleton CLI has no browser cookie jar or concurrent writer;
+          // its sequential control flow is the session-mutation lease.
+          [STEWARD_CSRF_HEADER]: STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
         },
         body: JSON.stringify({
           token: steward.token,
