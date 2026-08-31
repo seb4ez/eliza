@@ -1,7 +1,7 @@
 /**
  * Unit coverage for the default boot config invariants. Pure data, no runtime.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { DEFAULT_BOOT_CONFIG } from "./boot-config-store";
 
@@ -47,6 +47,7 @@ describe("DEFAULT_BOOT_CONFIG", () => {
 // ---------------------------------------------------------------------------
 
 import {
+  BOOT_CONFIG_CHANGE_EVENT,
   getBootConfig,
   resolveCharacterCatalog,
   setBootConfig,
@@ -80,6 +81,22 @@ describe("boot config store", () => {
     setBootConfig(next);
     expect(getBootConfig()).toBe(next);
     expect((globalThis as GlobalSlot)[WINDOW_KEY]).toBe(next);
+    resetGlobalStore();
+  });
+
+  it("signals same-document consumers when a runtime credential rotates", () => {
+    resetGlobalStore();
+    const dispatchEvent = vi.fn();
+    vi.stubGlobal("window", { dispatchEvent });
+    setBootConfig({
+      ...DEFAULT_BOOT_CONFIG,
+      apiToken: "eliza_rotated-owner-key",
+    });
+    expect(dispatchEvent).toHaveBeenCalledTimes(1);
+    expect(dispatchEvent.mock.calls[0]?.[0]).toMatchObject({
+      type: BOOT_CONFIG_CHANGE_EVENT,
+    });
+    vi.unstubAllGlobals();
     resetGlobalStore();
   });
 

@@ -285,7 +285,7 @@ async function sessionCookie(
     ttlSeconds,
   );
   if (!minted) throw new Error("test steward mint failed");
-  return `steward-token-test=${minted.token}`;
+  return `__Host-steward-token-v2-test=${minted.token}`;
 }
 
 function authorizeUrl(
@@ -954,7 +954,7 @@ describe("authorize — session gating", () => {
 
   test("a garbage cookie is treated as signed out, not as an error", async () => {
     const res = await call(authorizeUrl(), {
-      cookie: "steward-token-test=not-a-jwt",
+      cookie: "__Host-steward-token-v2-test=not-a-jwt",
     });
     expect(res.status).toBe(302);
     expect(new URL(res.headers.get("location") as string).pathname).toBe(
@@ -3434,6 +3434,51 @@ describe("token endpoint failures are audited", () => {
       error: "invalid_grant",
       reason: "client_mismatch",
       client_id: CONSOLE_CLIENT_ID,
+    });
+  });
+
+  test("a logout committed during final token audit wins before publication", async () => {
+    const stewardUserId = "u-audit-logout-race";
+    await seedUser({ stewardUserId });
+    const cookie = await sessionCookie(stewardUserId);
+    const { code } = await getAuthorizationCode(cookie);
+
+    const { AuditDispatcher } = await import("@/api-app/services/audit");
+    const { markSsoBridgeLogout } = await import(
+      "@/lib/services/sso-bridge-codes"
+    );
+    const { setAuditDispatcher } = await import(
+      "../src/services/audit-dispatcher-singleton"
+    );
+    setAuditDispatcher(
+      new AuditDispatcher({
+        sinks: [
+          sink,
+          {
+            name: "logout-during-token-audit",
+            required: true,
+            async emit(event) {
+              if (event.action === "oidc.token" && event.result === "success") {
+                await markSsoBridgeLogout(stewardUserId);
+              }
+            },
+          },
+        ],
+        onSinkError: () => undefined,
+      }),
+    );
+
+    const response = await redeem(code);
+
+    expect(response.status).toBe(400);
+    expect((await response.json()) as Record<string, unknown>).toMatchObject({
+      error: "invalid_grant",
+    });
+    expect(tokenFailures()).toHaveLength(1);
+    expect(tokenFailures()[0].metadata).toMatchObject({
+      error: "invalid_grant",
+      reason: "signed_out_before_publish",
+      client_id: FORGEJO_CLIENT_ID,
     });
   });
 });

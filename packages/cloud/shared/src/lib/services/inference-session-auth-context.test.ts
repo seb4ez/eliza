@@ -13,6 +13,7 @@ import { beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 let claims: {
   userId: string;
   email: string;
+  bridged?: boolean;
   expiration: number;
   issuedAt: number;
 } | null;
@@ -27,6 +28,8 @@ let getUser:
 let userReads = 0;
 let moderationReads = 0;
 let assertSessionActive: () => Promise<void>;
+let bridgeLogoutMarkerRead: () => Promise<boolean>;
+const bridgeLogoutMarkerChecks: Array<{ stewardUserId: string; issuedAt: number }> = [];
 const strongCredentialChecks: Array<Record<string, unknown>> = [];
 const ADMISSION = {
   balance: { balanceUsd: 100, balanceAt: 1, balanceRevision: "1" },
@@ -66,6 +69,12 @@ mock.module("../steward-sync", () => ({
 
 mock.module("./inference-admission-snapshot", () => ({
   loadInferenceAdmissionSnapshot: async () => ADMISSION,
+}));
+mock.module("./sso-bridge-codes", () => ({
+  isBlockedBySsoBridgeLogout: async (stewardUserId: string, issuedAt: number) => {
+    bridgeLogoutMarkerChecks.push({ stewardUserId, issuedAt });
+    return await bridgeLogoutMarkerRead();
+  },
 }));
 mock.module("./inference-credential-revocation", () => ({
   isInferenceStrongRevocationEnabled: () =>
@@ -114,6 +123,8 @@ beforeEach(async () => {
   };
   userReads = 0;
   moderationReads = 0;
+  bridgeLogoutMarkerChecks.length = 0;
+  bridgeLogoutMarkerRead = async () => false;
   strongCredentialChecks.length = 0;
   assertSessionActive = async () => undefined;
   getUser = async () => ({
@@ -248,6 +259,80 @@ describe("resolveInferenceSessionAuthContext", () => {
     ).toEqual({ kind: "rejected", status: 401 });
   });
 
+  test("a logout marker rejects a bridged session before a warm cache can authorize it", async () => {
+    await resolveInferenceSessionAuthContext(request(), {
+      cacheOnly: false,
+      useAuthCache: true,
+    });
+    userReads = 0;
+    moderationReads = 0;
+    bridgeLogoutMarkerChecks.length = 0;
+    claims = { ...claims!, bridged: true };
+    bridgeLogoutMarkerRead = async () => true;
+    const cacheRead = spyOn(cache, "getWithOutcome");
+
+    const result = await resolveInferenceSessionAuthContext(request(), {
+      cacheOnly: true,
+      useAuthCache: true,
+    });
+
+    expect(result).toEqual({ kind: "rejected", status: 401 });
+    expect(bridgeLogoutMarkerChecks).toEqual([
+      { stewardUserId: "steward-1", issuedAt: claims.issuedAt },
+    ]);
+    expect(cacheRead).not.toHaveBeenCalled();
+    expect(userReads).toBe(0);
+    expect(moderationReads).toBe(0);
+    cacheRead.mockRestore();
+  });
+
+  test("a logout marker rejects an ordinary Steward session before cache-disabled hydration", async () => {
+    bridgeLogoutMarkerRead = async () => true;
+
+    const result = await resolveInferenceSessionAuthContext(request(), {
+      cacheOnly: false,
+      useAuthCache: false,
+    });
+
+    expect(result).toEqual({ kind: "rejected", status: 401 });
+    expect(bridgeLogoutMarkerChecks).toEqual([
+      { stewardUserId: "steward-1", issuedAt: claims.issuedAt },
+    ]);
+    expect(userReads).toBe(0);
+    expect(moderationReads).toBe(0);
+  });
+
+  test("a Steward session fails with 503 when the logout-marker store is unavailable", async () => {
+    bridgeLogoutMarkerRead = async () => {
+      throw new Error("primary store unavailable");
+    };
+
+    for (const useAuthCache of [false, true]) {
+      await expect(
+        resolveInferenceSessionAuthContext(request(), {
+          cacheOnly: useAuthCache,
+          useAuthCache,
+        }),
+      ).rejects.toMatchObject({ status: 503, code: "service_unavailable" });
+    }
+
+    expect(bridgeLogoutMarkerChecks).toHaveLength(2);
+    expect(userReads).toBe(0);
+    expect(moderationReads).toBe(0);
+  });
+
+  test("an ordinary Steward session newer than the logout marker is authorized", async () => {
+    const result = await resolveInferenceSessionAuthContext(request(), {
+      cacheOnly: false,
+      useAuthCache: false,
+    });
+
+    expect(result).toMatchObject({ kind: "authorized", source: "origin" });
+    expect(bridgeLogoutMarkerChecks).toEqual([
+      { stewardUserId: "steward-1", issuedAt: claims?.issuedAt },
+    ]);
+  });
+
   test("concurrent cold requests share one authoritative hydration", async () => {
     const releaseUser = Promise.withResolvers<void>();
     getUser = async () => {
@@ -328,6 +413,7 @@ describe("resolveInferenceSessionAuthContext", () => {
         executionCtx: { waitUntil: () => undefined },
       }),
     ).resolves.toEqual({ kind: "rejected", status: 401 });
+    expect(bridgeLogoutMarkerChecks).toHaveLength(0);
     expect(userReads).toBe(0);
     expect(moderationReads).toBe(0);
   });

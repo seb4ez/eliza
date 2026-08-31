@@ -23,6 +23,7 @@ vi.mock("@capacitor/core", () => ({
 }));
 
 import { ElizaClient } from "./client-base";
+import type { ExactCloudAccountAuthority } from "./client-cloud";
 import "./client-cloud";
 import { setBootConfig } from "../config/boot-config";
 
@@ -592,6 +593,59 @@ describe("ElizaClient direct Cloud auth on native", () => {
       },
     });
     expectNoLocalPersistOrStatusProbe();
+  });
+
+  it("uses the exact owner key for native management from a dedicated agent client", async () => {
+    capacitorMocks.request.mockResolvedValue({
+      status: 202,
+      data: {
+        success: true,
+        data: { jobId: "job-owner", status: "queued", message: "queued" },
+      },
+    });
+    const client = new ElizaClient(
+      "https://11111111-1111-4111-8111-111111111111.elizacloud.ai",
+      "agent-local-bearer",
+    );
+    const authority: ExactCloudAccountAuthority = {
+      apiBase: "https://www.elizacloud.ai",
+      token: "eliza_exact-owner-key",
+      validateAuthority: () => true,
+    };
+
+    await client.resumeCloudCompatAgent("agent-1", authority);
+
+    expect(capacitorMocks.request).toHaveBeenCalledWith(
+      expect.objectContaining({
+        url: "https://api.eliza.app/api/v1/eliza/agents/agent-1/resume",
+        headers: expect.objectContaining({
+          Authorization: "Bearer eliza_exact-owner-key",
+        }),
+      }),
+    );
+    expect(
+      capacitorMocks.request.mock.calls.some(
+        ([request]) =>
+          request?.headers?.Authorization === "Bearer agent-local-bearer",
+      ),
+    ).toBe(false);
+  });
+
+  it("fails closed before native dispatch when the exact authority is superseded", async () => {
+    const client = new ElizaClient(
+      "https://11111111-1111-4111-8111-111111111111.elizacloud.ai",
+      "agent-local-bearer",
+    );
+    const authority: ExactCloudAccountAuthority = {
+      apiBase: "https://www.elizacloud.ai",
+      token: "eliza_exact-owner-key",
+      validateAuthority: () => false,
+    };
+
+    await expect(
+      client.deleteCloudCompatAgent("agent-1", undefined, authority),
+    ).rejects.toMatchObject({ code: "STEWARD_SESSION_SUPERSEDED" });
+    expect(capacitorMocks.request).not.toHaveBeenCalled();
   });
 
   // Note: restart is intentionally NOT part of the direct-cloud ladder — the

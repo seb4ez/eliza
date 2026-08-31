@@ -303,7 +303,10 @@ describe("Cloud active server persistence", () => {
 
     const expectedApiBase = `${DEFAULT_DIRECT_CLOUD_API_BASE_URL}/api/v1/eliza/agents/${agentId}`;
     expect(setBaseUrl).toHaveBeenCalledWith(expectedApiBase);
-    expect(setToken).toHaveBeenCalledWith("cloud-token");
+    // A persisted shared-adapter bearer is not Steward owner authority. The
+    // restore may canonicalize and discard the record, but must never briefly
+    // publish that unverified credential to the control-plane client.
+    expect(setToken).not.toHaveBeenCalledWith("cloud-token");
     expect(setToken).toHaveBeenLastCalledWith(null);
     expect(setBaseUrl).toHaveBeenLastCalledWith(null);
     expect(loadPersistedActiveServer()).toBeNull();

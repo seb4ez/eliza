@@ -9,10 +9,21 @@
  * only what it needs: `{ ready, authenticated }`.
  */
 
-import { readStoredStewardToken } from "@elizaos/shared/steward-session-client";
+import {
+  readStoredStewardToken,
+  STEWARD_SESSION_CHANGE_EVENT,
+} from "@elizaos/shared/steward-session-client";
 import { useContext, useEffect, useState } from "react";
 import { decodeJwtPayload } from "../../lib/jwt";
+import {
+  readStewardSessionRecovery,
+  STEWARD_SESSION_RECOVERY_CHANGE_EVENT,
+} from "../../lib/steward-session-recovery-marker";
 import { LocalStewardAuthContext } from "../../shell/StewardProvider";
+import {
+  configuredStewardTenantId,
+  DEFAULT_STEWARD_TENANT_ID,
+} from "../../shell/steward-config";
 
 function isPlaywrightTestAuthEnabled(): boolean {
   if (import.meta.env?.VITE_PLAYWRIGHT_TEST_AUTH === "true") return true;
@@ -34,16 +45,24 @@ function tokenIsLive(token: string): boolean {
   return true;
 }
 
-function readStoredAuthenticated(): boolean {
-  if (typeof window === "undefined") return false;
+function readStoredAuthToken(): string | null {
+  if (typeof window === "undefined") return null;
   try {
-    const token = readStoredStewardToken();
-    return token ? tokenIsLive(token) : false;
+    if (!readStewardRecoveryClean()) return null;
+    const token = readStoredStewardToken()?.trim();
+    if (!token || !tokenIsLive(token)) return null;
+    return readStewardRecoveryClean() ? token : null;
   } catch {
     // error-policy:J3 storage unavailable reads as unauthenticated
     // (fail-closed) — the join flow prompts for login.
-    return false;
+    return null;
   }
+}
+
+function readStewardRecoveryClean(): boolean {
+  const tenantId = configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID);
+  const recovery = readStewardSessionRecovery(tenantId);
+  return recovery.storageAvailable && recovery.receipts.length === 0;
 }
 
 export interface JoinSessionAuthState {
@@ -51,29 +70,46 @@ export interface JoinSessionAuthState {
   ready: boolean;
   /** True when a live Steward session exists. */
   authenticated: boolean;
+  /** Exact live Steward bearer that owns any join work started by this render. */
+  authToken: string | null;
 }
 
 export function useJoinSessionAuth(): JoinSessionAuthState {
   const providerAuth = useContext(LocalStewardAuthContext);
-  const [storageAuthed, setStorageAuthed] = useState(readStoredAuthenticated);
+  const [authToken, setAuthToken] = useState(readStoredAuthToken);
+  const [stewardRecoveryClean, setStewardRecoveryClean] = useState(
+    readStewardRecoveryClean,
+  );
 
   useEffect(() => {
-    const handler = () => setStorageAuthed(readStoredAuthenticated());
+    const handler = () => {
+      setStewardRecoveryClean(readStewardRecoveryClean());
+      setAuthToken(readStoredAuthToken());
+    };
     handler();
     window.addEventListener("storage", handler);
     window.addEventListener("steward-token-sync", handler);
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, handler);
+    window.addEventListener(STEWARD_SESSION_RECOVERY_CHANGE_EVENT, handler);
     const timer = setTimeout(handler, 250);
     return () => {
       window.removeEventListener("storage", handler);
       window.removeEventListener("steward-token-sync", handler);
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, handler);
+      window.removeEventListener(
+        STEWARD_SESSION_RECOVERY_CHANGE_EVENT,
+        handler,
+      );
       clearTimeout(timer);
     };
   }, []);
 
+  const usableAuthToken = stewardRecoveryClean ? authToken : null;
   const authenticated =
-    (providerAuth?.isAuthenticated ?? false) || storageAuthed;
+    (stewardRecoveryClean && (providerAuth?.isAuthenticated ?? false)) ||
+    usableAuthToken !== null;
   const ready =
     !(providerAuth?.isLoading ?? false) || isPlaywrightTestAuthEnabled();
 
-  return { ready, authenticated };
+  return { ready, authenticated, authToken: usableAuthToken };
 }

@@ -98,6 +98,8 @@ export interface ConversationHandoffDeps {
   ) => Promise<{ inserted: number; alreadyPopulated?: boolean }>;
   /** Switch the live client to the personal container. Seamless to the user. */
   switchToPersonal: (personal: PersonalReadiness) => void | Promise<void>;
+  /** Exact login/session authority which must still own every handoff effect. */
+  validateAuthority?: () => boolean;
   /** Readiness-poll cadence + budget. */
   intervalMs?: number;
   timeoutMs?: number;
@@ -110,6 +112,17 @@ export interface ConversationHandoffDeps {
 const DEFAULT_INTERVAL_MS = 5_000;
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 
+function assertHandoffAuthority(
+  validateAuthority: (() => boolean) | undefined,
+): void {
+  if (validateAuthority?.() === false) {
+    throw Object.assign(
+      new Error("Cloud agent handoff was superseded by a newer login."),
+      { code: "CLOUD_HANDOFF_AUTHORITY_SUPERSEDED" },
+    );
+  }
+}
+
 function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -121,7 +134,13 @@ function defaultSleep(ms: number): Promise<void> {
 export async function waitForPersonalAgent(
   deps: Pick<
     ConversationHandoffDeps,
-    "checkPersonalReady" | "intervalMs" | "timeoutMs" | "now" | "sleep" | "log"
+    | "checkPersonalReady"
+    | "intervalMs"
+    | "timeoutMs"
+    | "now"
+    | "sleep"
+    | "log"
+    | "validateAuthority"
   >,
 ): Promise<PersonalReadiness> {
   const intervalMs = deps.intervalMs ?? DEFAULT_INTERVAL_MS;
@@ -131,10 +150,15 @@ export async function waitForPersonalAgent(
   const deadline = now() + timeoutMs;
 
   for (;;) {
+    assertHandoffAuthority(deps.validateAuthority);
     let readiness: PersonalReadiness;
     try {
       readiness = await deps.checkPersonalReady();
+      assertHandoffAuthority(deps.validateAuthority);
     } catch (err) {
+      // Authority loss is terminal, never a transient readiness miss which may
+      // keep account-A work alive until the full polling deadline.
+      assertHandoffAuthority(deps.validateAuthority);
       deps.log?.(
         `[handoff] readiness check failed: ${err instanceof Error ? err.message : String(err)}`,
       );
@@ -142,7 +166,9 @@ export async function waitForPersonalAgent(
     }
     if (readiness.ready) return readiness;
     if (now() >= deadline) return { ready: false };
+    assertHandoffAuthority(deps.validateAuthority);
     await sleep(intervalMs);
+    assertHandoffAuthority(deps.validateAuthority);
   }
 }
 
@@ -179,6 +205,7 @@ export async function runConversationHandoff(
       // transient copy/switch failure never re-arms a fresh 10 minutes.
       timeoutMs: Math.max(0, deadline - now()),
     });
+    assertHandoffAuthority(deps.validateAuthority);
     if (!personal.ready) {
       deps.log?.("[handoff] personal container did not become ready in time");
       return {
@@ -189,17 +216,23 @@ export async function runConversationHandoff(
     }
 
     try {
+      assertHandoffAuthority(deps.validateAuthority);
       const messages = await deps.readSharedMessages();
+      assertHandoffAuthority(deps.validateAuthority);
       let imported = 0;
       if (messages.length > 0) {
+        assertHandoffAuthority(deps.validateAuthority);
         const result = await deps.importToPersonal(messages, personal);
+        assertHandoffAuthority(deps.validateAuthority);
         imported = result.inserted;
         deps.log?.(
           `[handoff] imported ${imported}/${messages.length} message(s)` +
             (result.alreadyPopulated ? " (already populated)" : ""),
         );
       }
+      assertHandoffAuthority(deps.validateAuthority);
       await deps.switchToPersonal(personal);
+      assertHandoffAuthority(deps.validateAuthority);
       return {
         status: messages.length > 0 ? "switched" : "switched-empty",
         imported,

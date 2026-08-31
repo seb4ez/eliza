@@ -27,6 +27,7 @@ const pageState = vi.hoisted(() => ({
 const TOKEN = "aaaaaaaa-test-test-test-tokentoken01";
 const confirmTelegramAccountClaim = vi.fn(async () => {
   clearPendingOnboardingSession();
+  return { isCurrent: (): boolean => true };
 });
 
 vi.mock("@elizaos/shared/steward-session-client", async (importOriginal) => ({
@@ -323,6 +324,46 @@ describe("GetStartedPage", () => {
       peekPendingOnboardingSession(TELEGRAM_ACCOUNT_CLAIM_PURPOSE),
     ).toBeNull();
     expect(window.location.search).not.toContain("accountClaim");
+  });
+
+  it("does not publish Telegram terminal UI or navigation after its authority is superseded", async () => {
+    vi.mocked(previewPendingOnboardingContinuation).mockResolvedValue({
+      platform: "telegram",
+      platformUserId: "123456789",
+      platformDisplayName: "attested-telegram-user",
+      returnUrl: null,
+    });
+    const isCurrent = vi
+      .fn<() => boolean>()
+      .mockReturnValueOnce(true)
+      .mockReturnValue(false);
+    confirmTelegramAccountClaim.mockResolvedValueOnce({ isCurrent });
+    const entry = `/get-started?onboardingSession=${TOKEN}&accountClaim=telegram`;
+    window.history.replaceState(null, "", entry);
+
+    render(
+      <MemoryRouter initialEntries={[entry]}>
+        <Routes>
+          <Route path="/get-started" element={<GetStartedPage />} />
+          <Route path="/join" element={<div>join</div>} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: /Connect this Telegram account/,
+      }),
+    );
+
+    expect(
+      await screen.findByText(
+        "Another sign-in superseded this Telegram confirmation.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText("You're connected")).toBeNull();
+    expect(screen.queryByText("join")).toBeNull();
+    expect(isCurrent).toHaveBeenCalledTimes(2);
   });
 
   it("retries a failed Telegram claim without re-running the preview", async () => {

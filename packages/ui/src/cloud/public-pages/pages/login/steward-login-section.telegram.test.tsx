@@ -127,7 +127,19 @@ describe("StewardLoginSection Telegram login", () => {
       token: "steward-token",
       refreshToken: "refresh-token",
     });
-    harness.syncSessionCookie.mockResolvedValue(undefined);
+    harness.syncSessionCookie.mockImplementation(
+      async (
+        token: string,
+        _refreshToken?: string | null,
+        options?: {
+          finalizeBeforePublish?: () => (durableRestored: boolean) => void;
+        },
+      ) => {
+        harness.storedToken = token;
+        harness.writeToken(token);
+        options?.finalizeBeforePublish?.();
+      },
+    );
     harness.writeToken.mockResolvedValue(undefined);
     window.sessionStorage.clear();
   });
@@ -207,9 +219,13 @@ describe("StewardLoginSection Telegram login", () => {
     expect(harness.syncSessionCookie).toHaveBeenCalledWith(
       "steward-token",
       "refresh-token",
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      expect.objectContaining({
+        finalizeBeforePublish: expect.any(Function),
+        signal: expect.any(AbortSignal),
+      }),
     );
     expect(harness.writeToken).toHaveBeenCalledWith("steward-token");
+    expect(harness.writeToken).toHaveBeenCalledOnce();
   });
 
   it("keeps cancellation available during Telegram auth and ignores stale completion", async () => {

@@ -472,7 +472,6 @@ app.post("/", async (c) => {
       }),
     ]);
 
-    logger.info("[oidc] token issued", { client_id: client.client_id });
     await emitOidcAudit(c, {
       action: "oidc.token",
       result: "success",
@@ -480,6 +479,22 @@ app.post("/", async (c) => {
       orgId: subject.user.organization_id ?? undefined,
       metadata: { client_id: client.client_id, scope: grant.scope },
     });
+
+    // Signing, live-claim loading, username resolution, and audit delivery all
+    // await external work after the admission check above. A logout committed
+    // on another host during any of those awaits must win over this grant. Keep
+    // this as the final async operation before the synchronous response publish
+    // and order it against the ORIGINAL session generation stored on the code.
+    if (
+      await isBlockedBySsoBridgeLogout(grant.stewardUserId, grant.tokenIssuedAt)
+    ) {
+      return await refuseGrant(c, "signed_out_before_publish", {
+        ...bound,
+        orgId: subject.user.organization_id ?? undefined,
+      });
+    }
+
+    logger.info("[oidc] token issued", { client_id: client.client_id });
 
     return c.json(
       {

@@ -46,7 +46,7 @@
  */
 
 import { ELIZA_DOMAIN_CONTRACTS } from "@elizaos/shared/elizacloud";
-import { Hono } from "hono";
+import { type Context, Hono } from "hono";
 import {
   mintStewardTokenFromClaims,
   STEWARD_ACCESS_TOKEN_TTL_SECONDS,
@@ -59,11 +59,12 @@ import {
   rateLimit,
 } from "@/lib/middleware/rate-limit-hono-cloudflare";
 import {
+  classifySsoBridgeLogout,
   consumeSsoBridgeCode,
-  isBlockedBySsoBridgeLogout,
   issueSsoBridgeCode,
   looksLikeSsoBridgeChallenge,
   looksLikeSsoBridgeCode,
+  type SsoBridgeLogoutClassification,
 } from "@/lib/services/sso-bridge-codes";
 import { logger } from "@/lib/utils/logger";
 import type { AppEnv } from "@/types/cloud-worker-env";
@@ -129,6 +130,33 @@ function errorBody(
   code: string,
 ): { error: string; code: string } {
   return { error: message, code };
+}
+
+function logoutCooldownMessage(retryAfterSeconds: number): string {
+  if (retryAfterSeconds <= 0) {
+    return "You signed out moments ago. Sign in again to create a new session.";
+  }
+  const unit = retryAfterSeconds === 1 ? "second" : "seconds";
+  return `You signed out moments ago. Wait ${retryAfterSeconds} ${unit}, then sign in again to create a new session.`;
+}
+
+function rejectLogoutClassification(
+  c: Context<AppEnv>,
+  classification: Exclude<SsoBridgeLogoutClassification, { status: "allowed" }>,
+): Response {
+  if (classification.status === "definitely_revoked") {
+    return c.json(errorBody("Session was signed out", "session_ended"), 401);
+  }
+  c.header("Retry-After", String(classification.retryAfterSeconds));
+  return c.json(
+    {
+      error: logoutCooldownMessage(classification.retryAfterSeconds),
+      code: "logout_cooldown",
+      retryAfterSeconds: classification.retryAfterSeconds,
+      retryAtEpochSeconds: classification.retryAtEpochSeconds,
+    },
+    409,
+  );
 }
 
 const app = new Hono<AppEnv>();
@@ -198,10 +226,14 @@ app.post("/mint", async (c) => {
       return c.json(errorBody("Invalid token", "invalid_token"), 401);
     }
 
-    if (await isBlockedBySsoBridgeLogout(claims.userId, claims.issuedAt)) {
-      // The user explicitly logged out after this token was issued: minting
-      // would silently undo that logout on the app host.
-      return c.json(errorBody("Session was signed out", "session_ended"), 401);
+    const logoutClassification = await classifySsoBridgeLogout(
+      claims.userId,
+      claims.issuedAt,
+    );
+    if (logoutClassification.status !== "allowed") {
+      // The token is either definitely pre-logout or inside the bounded
+      // issuer-clock ambiguity window. Neither may mint cross-host authority.
+      return rejectLogoutClassification(c, logoutClassification);
     }
 
     const issued = await issueSsoBridgeCode({ claims, codeChallenge });
@@ -249,22 +281,20 @@ app.post("/exchange", async (c) => {
     // The session could have been logged out inside the 60-second code window —
     // never hand out a token the platform would now reject. Marker ordering
     // uses the ORIGINAL token's iat captured at mint.
-    if (
-      await isBlockedBySsoBridgeLogout(
-        record.stewardUserId,
-        record.tokenIssuedAt,
-      )
-    ) {
-      return c.json(errorBody("Session was signed out", "session_ended"), 401);
+    let logoutClassification = await classifySsoBridgeLogout(
+      record.stewardUserId,
+      record.tokenIssuedAt,
+    );
+    if (logoutClassification.status !== "allowed") {
+      return rejectLogoutClassification(c, logoutClassification);
     }
 
     // Re-mint from the claims verified at mint, capped to the ORIGINAL exp so
     // the bridge can never extend a session's lifetime. The stored dashboard
     // token was never persisted, so there is nothing to replay out of the DB.
-    // The `bridged` stamp marks the token as bridge-issued: the session-sync
-    // endpoint consults the logout marker (fail closed) ONLY for stamped
-    // tokens, so ordinary logins never acquire the marker store as a hard
-    // availability dependency.
+    // The `bridged` stamp records bridge provenance. Logout-marker authority
+    // applies to every Steward token so signing out on either paired origin
+    // cannot leave an ordinary token on the other origin reusable.
     // The verifier caps the signed issued lifetime at the access-token TTL,
     // while an original token minted on a slightly-ahead issuer clock is
     // accepted with remaining = TTL + skew. Clamp the re-mint to the TTL so
@@ -290,6 +320,17 @@ app.post("/exchange", async (c) => {
         ),
         503,
       );
+    }
+
+    // Minting assigns a fresh iat. Re-check the immutable source iat after the
+    // await so a logout committed between the first check and this mint cannot
+    // be hidden by the replacement token's newer timestamp.
+    logoutClassification = await classifySsoBridgeLogout(
+      record.stewardUserId,
+      record.tokenIssuedAt,
+    );
+    if (logoutClassification.status !== "allowed") {
+      return rejectLogoutClassification(c, logoutClassification);
     }
 
     return c.json({ ok: true, token: minted.token });

@@ -23,8 +23,16 @@ import {
   LocalStewardAuthContext,
   type LocalStewardAuthValue,
 } from "../shell/StewardProvider";
+import {
+  configuredStewardTenantId,
+  DEFAULT_STEWARD_TENANT_ID,
+} from "../shell/steward-config";
 import { normalizeCloudApiKeyToken } from "./cloud-api-key-token";
 import { decodeJwtPayload } from "./jwt";
+import {
+  readStewardSessionRecovery,
+  STEWARD_SESSION_RECOVERY_CHANGE_EVENT,
+} from "./steward-session-recovery-marker";
 
 export type StewardSessionUser = {
   id: string;
@@ -130,11 +138,13 @@ function decodeStewardToken(token: string): {
 function readStewardSessionFromStorage(): StewardSessionUser {
   if (typeof window === "undefined") return null;
   try {
+    if (!readStewardRecoveryClean()) return null;
     const token = readStoredStewardToken();
     if (!token) return null;
     const decoded = decodeStewardToken(token);
     if (!decoded?.id) return null;
     if (decoded.exp && decoded.exp * 1000 < Date.now()) return null;
+    if (!readStewardRecoveryClean()) return null;
     return {
       id: decoded.id,
       email: decoded.email,
@@ -145,6 +155,12 @@ function readStewardSessionFromStorage(): StewardSessionUser {
     // signed-out (fail-closed) — never a fabricated session.
     return null;
   }
+}
+
+function readStewardRecoveryClean(): boolean {
+  const tenantId = configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID);
+  const recovery = readStewardSessionRecovery(tenantId);
+  return recovery.storageAvailable && recovery.receipts.length === 0;
 }
 
 /**
@@ -171,6 +187,9 @@ export function useSessionAuth(): SessionAuthState {
   const [storageUser, setStorageUser] = useState<StewardSessionUser>(
     readStewardSessionFromStorage,
   );
+  const [stewardRecoveryClean, setStewardRecoveryClean] = useState(
+    readStewardRecoveryClean,
+  );
   const [apiKeyUser, setApiKeyUser] = useState<StewardSessionUser>(
     readNativeApiKeySession,
   );
@@ -180,6 +199,7 @@ export function useSessionAuth(): SessionAuthState {
 
   useEffect(() => {
     const handler = () => {
+      setStewardRecoveryClean(readStewardRecoveryClean());
       setStorageUser(readStewardSessionFromStorage());
       setApiKeyUser(readNativeApiKeySession());
       setTestUser(readPlaywrightTestSession());
@@ -187,26 +207,33 @@ export function useSessionAuth(): SessionAuthState {
     handler();
     window.addEventListener("storage", handler);
     window.addEventListener("steward-token-sync", handler);
+    window.addEventListener(STEWARD_SESSION_RECOVERY_CHANGE_EVENT, handler);
     const timer = setTimeout(handler, 250);
     return () => {
       window.removeEventListener("storage", handler);
       window.removeEventListener("steward-token-sync", handler);
+      window.removeEventListener(
+        STEWARD_SESSION_RECOVERY_CHANGE_EVENT,
+        handler,
+      );
       clearTimeout(timer);
     };
   }, []);
 
-  const providerUser: StewardSessionUser = providerAuth.user
-    ? {
-        id: providerAuth.user.id,
-        email: providerAuth.user.email ?? "",
-        walletAddress: providerAuth.user.walletAddress,
-      }
-    : null;
+  const providerUser: StewardSessionUser =
+    stewardRecoveryClean && providerAuth.user
+      ? {
+          id: providerAuth.user.id,
+          email: providerAuth.user.email ?? "",
+          walletAddress: providerAuth.user.walletAddress,
+        }
+      : null;
 
-  const user = providerUser ?? storageUser ?? apiKeyUser ?? testUser;
+  const usableStorageUser = stewardRecoveryClean ? storageUser : null;
+  const user = providerUser ?? usableStorageUser ?? apiKeyUser ?? testUser;
   const authenticated =
-    providerAuth.isAuthenticated ||
-    storageUser !== null ||
+    (stewardRecoveryClean && providerAuth.isAuthenticated) ||
+    usableStorageUser !== null ||
     apiKeyUser !== null ||
     testUser !== null;
   const ready = !providerAuth.isLoading || isPlaywrightTestAuthEnabled();

@@ -19,8 +19,11 @@ import { enqueueStewardSessionMutation } from "../../lib/steward-session-mutatio
 import {
   beginStewardSessionRecovery,
   completeStewardSessionRecovery,
+  readStewardSessionRecovery,
+  rejectStewardSessionRecovery,
 } from "../../lib/steward-session-recovery-marker";
 import {
+  confirmTelegramAccountClaim,
   recoverStewardEmailSessionViaCookie,
   recoverStewardSessionViaCookie,
   refreshStewardSessionViaCookie,
@@ -371,6 +374,134 @@ describe("recoverStewardEmailSessionViaCookie", () => {
       window.removeEventListener("steward-token-sync", onSync);
     }
   });
+
+  it("never adopts or retires a pending login B receipt", async () => {
+    const accountA = tokenForEmail("person@example.com");
+    const loginBReceipt = beginStewardSessionRecovery("elizacloud", "provider");
+    const fetchMock = vi.fn(async () =>
+      jsonResponse({ ok: true, token: accountA }),
+    );
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    try {
+      await expect(
+        recoverStewardEmailSessionViaCookie("person@example.com", {
+          intervalMs: 10_000,
+          timeoutMs: 20_000,
+        }),
+      ).resolves.toBeNull();
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([
+        loginBReceipt.receipt,
+      ]);
+      expect(storage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    } finally {
+      rejectStewardSessionRecovery(loginBReceipt);
+    }
+  });
+
+  it("commits a clean recovery snapshot before its authority event and preserves reentrant login B", async () => {
+    const accountA = tokenForEmail("person@example.com");
+    globalThis.fetch = vi.fn(async () =>
+      jsonResponse({ ok: true, token: accountA }),
+    ) as unknown as typeof fetch;
+    let loginBReceipt:
+      | ReturnType<typeof beginStewardSessionRecovery>
+      | undefined;
+    let receiptsAtPublication: readonly string[] | undefined;
+    const onAuthority = () => {
+      receiptsAtPublication = readStewardSessionRecovery("elizacloud").receipts;
+      loginBReceipt = beginStewardSessionRecovery("elizacloud", "provider");
+    };
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, onAuthority, {
+      once: true,
+    });
+
+    try {
+      await expect(
+        recoverStewardEmailSessionViaCookie("person@example.com", {
+          intervalMs: 10_000,
+          timeoutMs: 20_000,
+        }),
+      ).resolves.toBeNull();
+    } finally {
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, onAuthority);
+    }
+
+    expect(receiptsAtPublication).toEqual([]);
+    expect(loginBReceipt).toBeDefined();
+    expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([
+      loginBReceipt?.receipt,
+    ]);
+    expect(storage.getItem(STEWARD_TOKEN_KEY)).toBe(accountA);
+  });
+
+  it("returns null when token-sync queues login B before the outer await resumes", async () => {
+    const accountA = tokenForEmail("person@example.com");
+    globalThis.fetch = vi.fn(async () =>
+      jsonResponse({ ok: true, token: accountA }),
+    ) as unknown as typeof fetch;
+    let loginBReceipt:
+      | ReturnType<typeof beginStewardSessionRecovery>
+      | undefined;
+    const onSync = () => {
+      queueMicrotask(() => {
+        loginBReceipt = beginStewardSessionRecovery("elizacloud", "provider");
+      });
+    };
+    window.addEventListener("steward-token-sync", onSync, { once: true });
+
+    try {
+      await expect(
+        recoverStewardEmailSessionViaCookie("person@example.com", {
+          intervalMs: 10_000,
+          timeoutMs: 20_000,
+        }),
+      ).resolves.toBeNull();
+    } finally {
+      window.removeEventListener("steward-token-sync", onSync);
+    }
+
+    expect(loginBReceipt?.preexistingReceipts).toEqual([]);
+    expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([
+      loginBReceipt?.receipt,
+    ]);
+    expect(storage.getItem(STEWARD_TOKEN_KEY)).toBe(accountA);
+  });
+
+  it("compensates recovery when snapshot receipt retirement fails", async () => {
+    const accountA = tokenForEmail("person@example.com");
+    const recovery = beginStewardSessionRecovery("elizacloud", "provider");
+    globalThis.fetch = vi.fn(async () =>
+      jsonResponse({ ok: true, token: accountA }),
+    ) as unknown as typeof fetch;
+    const remove = storage.removeItem.bind(storage);
+    storage.removeItem = (key) => {
+      if (key.endsWith(`:${recovery.receipt}`)) {
+        throw new DOMException("Storage denied", "SecurityError");
+      }
+      remove(key);
+    };
+    const authorityEvents: Event[] = [];
+    const onAuthority = (event: Event) => authorityEvents.push(event);
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, onAuthority);
+
+    try {
+      await expect(
+        recoverStewardEmailSessionViaCookie("person@example.com", {
+          intervalMs: 10,
+          timeoutMs: 50,
+        }),
+      ).resolves.toBeNull();
+      expect(storage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+      expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([
+        recovery.receipt,
+      ]);
+      expect(authorityEvents).toEqual([]);
+    } finally {
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, onAuthority);
+    }
+  });
 });
 
 describe("recoverStewardSessionViaCookie", () => {
@@ -607,5 +738,42 @@ describe("refreshStewardSessionViaCookie", () => {
       status: 401,
       code: "invalid_token",
     });
+  });
+});
+
+describe("confirmTelegramAccountClaim recovery", () => {
+  const continuation = "telegram-claim-test-token-00000001";
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    storage.clear();
+    vi.unstubAllGlobals();
+  });
+
+  it("retires its receipt on an explicit HTTP 500 response", async () => {
+    storage.setItem(STEWARD_TOKEN_KEY, "steward-token");
+    globalThis.fetch = vi.fn(async () =>
+      jsonResponse(
+        { error: "Telegram confirmation unavailable", code: "internal_error" },
+        500,
+      ),
+    ) as unknown as typeof fetch;
+
+    await expect(
+      confirmTelegramAccountClaim("steward-token", continuation),
+    ).rejects.toMatchObject({ status: 500, code: "internal_error" });
+    expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([]);
+  });
+
+  it("preserves its receipt when transport loses the response after dispatch", async () => {
+    storage.setItem(STEWARD_TOKEN_KEY, "steward-token");
+    globalThis.fetch = vi.fn(async () => {
+      throw new TypeError("response lost after commit");
+    }) as unknown as typeof fetch;
+
+    await expect(
+      confirmTelegramAccountClaim("steward-token", continuation),
+    ).rejects.toThrow("response lost after commit");
+    expect(readStewardSessionRecovery("elizacloud").receipts).toHaveLength(1);
   });
 });

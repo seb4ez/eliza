@@ -6,6 +6,7 @@
 
 import { setStorageValueIfCurrent } from "../bridge/storage-bridge";
 import {
+  type AgentProfileConnectionPersistenceOptions,
   getActiveProfile,
   loadAgentProfileRegistry,
   persistAgentProfileConnectionDurably,
@@ -24,7 +25,14 @@ const AGENT_PROFILE_STORAGE_KEY = "elizaos:agent-profiles";
 export async function persistActiveServerCredential(
   token: string,
   pairedApiBase?: string,
+  options: AgentProfileConnectionPersistenceOptions = {},
 ): Promise<void> {
+  if (options.validate?.() === false) {
+    throw new DOMException(
+      "Runtime credential publication was superseded.",
+      "AbortError",
+    );
+  }
   const activeServer = loadPersistedActiveServer();
   const fallbackRemote = pairedApiBase?.trim()
     ? createPersistedActiveServer({
@@ -64,11 +72,31 @@ export async function persistActiveServerCredential(
         }
       : null;
 
+  // A recovery transaction may not fall back to the single-record writer:
+  // that path cannot retain a registry+server compensator across the sibling
+  // pair-token commit. Ordinary pairing callers (no captured compensation)
+  // keep the historical single-record fallback.
+  if (!profile && options.captureCompensation) {
+    throw new Error(
+      "The active runtime profile required for transactional credential recovery is unavailable.",
+    );
+  }
+
   const persisted = profile
-    ? await persistAgentProfileConnectionDurably(profile, credentialTarget)
-    : await savePersistedActiveServerDurably(credentialTarget);
+    ? await persistAgentProfileConnectionDurably(
+        profile,
+        credentialTarget,
+        options,
+      )
+    : await savePersistedActiveServerDurably(credentialTarget, options);
   if (!persisted) {
     throw new Error("The authenticated runtime target could not be saved.");
+  }
+  if (options.validate?.() === false) {
+    throw new DOMException(
+      "Runtime credential publication was superseded.",
+      "AbortError",
+    );
   }
 }
 

@@ -28,14 +28,27 @@
  */
 
 import { ssoBridgeRepository } from "../../db/repositories/sso-bridge";
-import type { StewardTokenClaims } from "../auth/steward-client";
+import {
+  STEWARD_FUTURE_ISSUED_AT_TOLERANCE_SECONDS,
+  STEWARD_VERIFY_CLOCK_SKEW_SECONDS,
+  type StewardTokenClaims,
+} from "../auth/steward-client";
+import { STEWARD_REFRESH_AUTHORITY_TTL_SECONDS } from "../auth/steward-cookies";
 
 export const SSO_BRIDGE_CODE_TTL_SECONDS = 60;
 const SSO_BRIDGE_CODE_PREFIX = "esso_";
 
-/** Matches the Steward access-token TTL (steward-client.ts): once every
- * pre-logout token has expired, the marker has nothing left to block. */
-export const SSO_BRIDGE_LOGOUT_MARKER_TTL_SECONDS = 60 * 60;
+/**
+ * Keep a logout marker beyond the full opaque-refresh lifetime. The verifier
+ * skew and bounded future-iat allowance are retained as a conservative clock
+ * boundary between cookie issuance and marker storage; the final extra second
+ * keeps the repository's inclusive purge cutoff strictly outside that horizon.
+ */
+export const SSO_BRIDGE_LOGOUT_MARKER_TTL_SECONDS =
+  STEWARD_REFRESH_AUTHORITY_TTL_SECONDS +
+  STEWARD_VERIFY_CLOCK_SKEW_SECONDS +
+  STEWARD_FUTURE_ISSUED_AT_TOLERANCE_SECONDS +
+  1;
 
 const HEX_64_RE = /^[0-9a-f]{64}$/;
 
@@ -135,25 +148,90 @@ export async function consumeSsoBridgeCode(
 
 /** Stamp "this user explicitly logged out now" for the bridge to honor. */
 export async function markSsoBridgeLogout(stewardUserId: string): Promise<void> {
-  const now = new Date();
-  await ssoBridgeRepository.stampLogout(stewardUserId, now);
+  const { databaseNow } = await ssoBridgeRepository.stampLogout(stewardUserId);
   await ssoBridgeRepository.purgeLogoutMarkersOlderThan(
-    new Date(now.getTime() - SSO_BRIDGE_LOGOUT_MARKER_TTL_SECONDS * 1000),
+    new Date(databaseNow.getTime() - SSO_BRIDGE_LOGOUT_MARKER_TTL_SECONDS * 1000),
   );
 }
 
+export type SsoBridgeLogoutClassification =
+  | { status: "allowed" }
+  | { status: "definitely_revoked" }
+  | {
+      /**
+       * The signed second-resolution `iat` is newer than the marker but still
+       * inside the verifier's bounded future-clock allowance. It may be either
+       * a genuinely fresh login or a pre-logout token from a fast issuer. The
+       * token therefore stays blocked, but session-establishment routes must
+       * report a retryable reauthentication cooldown instead of claiming that
+       * the new login was itself revoked.
+       */
+      status: "ambiguous_cooldown";
+      /** First unix second whose newly minted token is unambiguously newer. */
+      retryAtEpochSeconds: number;
+      /** Whole seconds remaining before `retryAtEpochSeconds` (may be zero). */
+      retryAfterSeconds: number;
+    };
+
 /**
- * True when an explicit logout was stamped at-or-after the token's issuance —
- * the bridge (and the cookie-planting session-sync endpoint) must then refuse
- * the token even though its signature is still valid. Tokens minted by a NEW
- * post-logout login pass. Store failures THROW — callers translate that into
- * an unavailable response, never into "not logged out".
+ * Order a verified token against the last explicit logout without weakening
+ * the bounded future-iat defense.
+ *
+ * A token whose signed second is earlier than the marker's signed second is
+ * definitely revoked. The marker's own second and the accepted issuer-clock
+ * tolerance ahead are ambiguous: the token remains unusable, because
+ * accepting it could resurrect a pre-logout token from a fast issuer.
+ * Establishment routes may surface that ambiguity as a truthful cooldown and
+ * require a newly minted token after the boundary. Store failures THROW —
+ * callers translate that into an unavailable response, never into "allowed".
+ */
+export async function classifySsoBridgeLogout(
+  stewardUserId: string,
+  tokenIssuedAtSeconds: number,
+): Promise<SsoBridgeLogoutClassification> {
+  // Authentication/re-publication is a security decision and must observe the
+  // primary connection. A replica read could briefly resurrect a bridged token
+  // immediately after an acknowledged logout stamp.
+  const marker = await ssoBridgeRepository.getLogoutMarkerForWrite(stewardUserId);
+  if (!marker) return { status: "allowed" };
+
+  const markerMs = marker.logged_out_at.getTime();
+  const markerEpochSeconds = Math.floor(markerMs / 1000);
+  // Steward `iat` has only whole-second precision. A token carrying the same
+  // second as the marker may have been minted just before OR just after the
+  // sub-second logout commit, so it is not definitely revoked. It remains
+  // blocked below as ambiguous. Only an earlier signed second is provably old.
+  if (tokenIssuedAtSeconds < markerEpochSeconds) {
+    return { status: "definitely_revoked" };
+  }
+
+  const tokenIssuedAtMs = tokenIssuedAtSeconds * 1000;
+  const ambiguousThroughMs = markerMs + STEWARD_FUTURE_ISSUED_AT_TOLERANCE_SECONDS * 1000;
+  if (tokenIssuedAtMs <= ambiguousThroughMs) {
+    // `iat` has whole-second precision and `allowed` requires a strict `>`.
+    // Advance to the first whole second strictly beyond the ambiguity window.
+    const retryAtEpochSeconds = Math.floor(ambiguousThroughMs / 1000) + 1;
+    const retryAfterSeconds = Math.max(
+      0,
+      Math.ceil((retryAtEpochSeconds * 1000 - Date.now()) / 1000),
+    );
+    return {
+      status: "ambiguous_cooldown",
+      retryAtEpochSeconds,
+      retryAfterSeconds,
+    };
+  }
+
+  return { status: "allowed" };
+}
+
+/**
+ * Fail-closed compatibility predicate for ordinary authorization and refresh
+ * paths. Both definitely-revoked and time-ambiguous tokens remain blocked.
  */
 export async function isBlockedBySsoBridgeLogout(
   stewardUserId: string,
   tokenIssuedAtSeconds: number,
 ): Promise<boolean> {
-  const marker = await ssoBridgeRepository.getLogoutMarker(stewardUserId);
-  if (!marker) return false;
-  return tokenIssuedAtSeconds * 1000 <= marker.logged_out_at.getTime();
+  return (await classifySsoBridgeLogout(stewardUserId, tokenIssuedAtSeconds)).status !== "allowed";
 }

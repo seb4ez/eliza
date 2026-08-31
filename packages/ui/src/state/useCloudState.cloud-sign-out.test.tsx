@@ -74,6 +74,11 @@ vi.mock("../api", () => ({
     getBaseUrl: vi.fn(() => "https://api.eliza.app"),
     setBaseUrl: vi.fn(),
     setToken: vi.fn(),
+    stageSessionTarget: vi.fn(() => ({
+      publish: vi.fn(() => true),
+      restoreIfCurrent: vi.fn(() => true),
+      clearIfCurrent: vi.fn(() => true),
+    })),
     getCloudStatus: getCloudStatusMock,
     getCloudCredits: getCloudCreditsMock,
     cloudDisconnect: cloudDisconnectMock,

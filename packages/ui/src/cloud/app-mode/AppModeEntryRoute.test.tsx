@@ -3,13 +3,18 @@
 
 import { STEWARD_TOKEN_KEY } from "@elizaos/shared/steward-session-client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   loadPersistedActiveServer,
+  loadPersistedFirstRunComplete,
   savePersistedActiveServer,
 } from "../../state/persistence";
+import {
+  beginStewardSessionRecovery,
+  rejectStewardSessionRecovery,
+} from "../lib/steward-session-recovery-marker";
 import { LocalStewardAuthContext } from "../shell/StewardProviderShared";
 import { AppModeEntryRoute } from "./AppModeEntryRoute";
 import { type AppModeAgent, appModeNavigation } from "./app-mode";
@@ -24,11 +29,11 @@ function base64url(value: unknown): string {
 
 // A minimally-valid Steward JWT: readStewardSessionFromStorage only
 // base64-decodes the payload (userId + a future exp); no signature check.
-function stewardToken(): string {
+function stewardToken(userId = "u1"): string {
   return [
     base64url({ alg: "none", typ: "JWT" }),
     base64url({
-      userId: "u1",
+      userId,
       email: "a@b.test",
       exp: Math.floor(Date.now() / 1000) + 3600,
     }),
@@ -36,8 +41,8 @@ function stewardToken(): string {
   ].join(".");
 }
 
-function signIn(): string {
-  const token = stewardToken();
+function signIn(userId = "u1"): string {
+  const token = stewardToken(userId);
   localStorage.setItem(STEWARD_TOKEN_KEY, token);
   return token;
 }
@@ -68,7 +73,7 @@ interface StubRoutes {
   /** Response for GET /api/v1/eliza/agents. */
   agents: () => Response | Promise<Response>;
   /** Response for GET <cloud>/api/v1/eliza/personal (rowless personal entry). */
-  personal?: () => Response;
+  personal?: () => Response | Promise<Response>;
 }
 
 const realFetch = globalThis.fetch;
@@ -535,6 +540,79 @@ describe("AppModeEntryRoute — rowless personal entry", () => {
     expect(await screen.findByTestId("agent-app")).toBeTruthy();
     expect(loadPersistedActiveServer()?.id).toBe(`cloud:${PERSONAL_ID}`);
     expect(assignedUrls).toEqual([]);
+  });
+
+  it("never lets a slow account-A identity overwrite account B after a token swap", async () => {
+    const accountAId = PERSONAL_ID;
+    const accountBId = "personal:00000000-0000-5000-8000-000000000002";
+    signIn("account-a");
+    let resolveAccountA: ((response: Response) => void) | null = null;
+    const accountAResponse = new Promise<Response>((resolve) => {
+      resolveAccountA = resolve;
+    });
+    let personalRequestCount = 0;
+    stubNetwork({
+      agents: agentsOk([]),
+      personal: () => {
+        personalRequestCount += 1;
+        return personalRequestCount === 1
+          ? accountAResponse
+          : personalOk(accountBId)();
+      },
+    });
+    renderEntry();
+    await waitFor(() => expect(personalRequestCount).toBe(1));
+
+    act(() => {
+      window.localStorage.setItem(STEWARD_TOKEN_KEY, stewardToken("account-b"));
+      window.dispatchEvent(new CustomEvent("steward-token-sync"));
+    });
+
+    expect(await screen.findByTestId("agent-app")).toBeTruthy();
+    expect(loadPersistedActiveServer()?.id).toBe(`cloud:${accountBId}`);
+
+    await act(async () => {
+      resolveAccountA?.(personalOk(accountAId)());
+      await accountAResponse;
+    });
+    expect(loadPersistedActiveServer()?.id).toBe(`cloud:${accountBId}`);
+  });
+
+  it("never binds account A when login B begins during personal identity resolution", async () => {
+    signIn("account-a");
+    let releaseAccountA!: (response: Response) => void;
+    const accountAResponse = new Promise<Response>((resolve) => {
+      releaseAccountA = resolve;
+    });
+    let personalRequestCount = 0;
+    stubNetwork({
+      agents: agentsOk([]),
+      personal: () => {
+        personalRequestCount += 1;
+        return accountAResponse;
+      },
+    });
+    renderEntry();
+    await waitFor(() => expect(personalRequestCount).toBe(1));
+
+    let loginB!: ReturnType<typeof beginStewardSessionRecovery>;
+    act(() => {
+      loginB = beginStewardSessionRecovery("elizacloud", "provider");
+    });
+    try {
+      await act(async () => {
+        releaseAccountA(personalOk()());
+        await accountAResponse;
+      });
+      await waitFor(() => {
+        expect(loadPersistedActiveServer()).toBeNull();
+        expect(loadPersistedFirstRunComplete()).toBe(false);
+      });
+      expect(screen.queryByTestId("agent-app")).toBeNull();
+    } finally {
+      cleanup();
+      rejectStewardSessionRecovery(loginB);
+    }
   });
 
   it("an invalid identity response → /join, never a wrong-runtime chat boot", async () => {

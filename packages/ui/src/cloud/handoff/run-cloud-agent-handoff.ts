@@ -44,10 +44,15 @@ export function runCloudAgentHandoff(
   agentId: string,
   start: () => Promise<ConversationHandoffResult>,
   onSwitchSucceeded?: () => void | Promise<void>,
+  validateAuthority: () => boolean = () => true,
 ): void {
+  if (!validateAuthority()) return;
   dispatchCloudHandoffPhase({ agentId, phase: "migrating" });
   start()
     .then((result) => {
+      // A newer login owns every terminal phase, cleanup hook, and retry. The
+      // stale start thunk is responsible for compensating its exact target.
+      if (!validateAuthority()) return;
       dispatchCloudHandoffPhase({
         agentId,
         phase: result.status,
@@ -55,7 +60,7 @@ export function runCloudAgentHandoff(
         ...(result.error ? { error: result.error } : {}),
       });
       if (result.status === "timed-out" || result.status === "failed") {
-        armRetry(agentId, start, onSwitchSucceeded);
+        armRetry(agentId, start, onSwitchSucceeded, validateAuthority);
         return;
       }
       // Terminal SUCCESS (`switched`/`switched-empty`): the dedicated is live,
@@ -68,6 +73,7 @@ export function runCloudAgentHandoff(
       });
     })
     .catch((err: unknown) => {
+      if (!validateAuthority()) return;
       dispatchCloudHandoffPhase({
         agentId,
         phase: isInsufficientCreditsError(err)
@@ -75,7 +81,7 @@ export function runCloudAgentHandoff(
           : "failed",
         error: err instanceof Error ? err.message : String(err),
       });
-      armRetry(agentId, start, onSwitchSucceeded);
+      armRetry(agentId, start, onSwitchSucceeded, validateAuthority);
     });
 }
 
@@ -108,8 +114,9 @@ function armRetry(
   agentId: string,
   start: () => Promise<ConversationHandoffResult>,
   onSwitchSucceeded?: () => void | Promise<void>,
+  validateAuthority: () => boolean = () => true,
 ): void {
-  if (typeof window === "undefined") return;
+  if (typeof window === "undefined" || !validateAuthority()) return;
   // Bind the listener to an AbortController so it's removable two ways: when the
   // retry actually fires (one-shot), AND on a TTL timeout if it never does. The
   // `{ signal }` option means a single abort() detaches the listener — no need
@@ -119,11 +126,16 @@ function armRetry(
   const onRetry = (event: Event) => {
     const detail = (event as CustomEvent<CloudHandoffRetryDetail>).detail;
     if (detail?.agentId !== agentId) return;
+    if (!validateAuthority()) {
+      clearTimeout(ttl);
+      ac.abort();
+      return;
+    }
     clearTimeout(ttl);
     ac.abort();
     // Thread the gated delete through the retry: a handoff that fails first and
     // succeeds on retry must still delete the shared bridge on the success leg.
-    runCloudAgentHandoff(agentId, start, onSwitchSucceeded);
+    runCloudAgentHandoff(agentId, start, onSwitchSucceeded, validateAuthority);
   };
   window.addEventListener(CLOUD_HANDOFF_RETRY_EVENT, onRetry, {
     signal: ac.signal,

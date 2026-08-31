@@ -2,81 +2,62 @@
  * POST /api/auth/steward-refresh
  *
  * Server-side refresh-token rotation. The browser sends the request with
- * `credentials: 'include'`; the HttpOnly `steward-refresh-token` cookie
- * travels automatically. The route:
+ * `credentials: 'include'`; the selected v1/v2 HttpOnly refresh cookie travels
+ * automatically. The route:
  *
- *  1. Reads the `steward-refresh-token` cookie (HttpOnly — JS can never see
- *     it).
+ *  1. Reads one complete cookie namespace (HttpOnly — JS can never see the
+ *     refresh token), preferring v2 whenever any v2 authority exists.
  *  2. Forwards it to Steward `POST /auth/refresh`, which returns a fresh
  *     access token + rotated refresh token.
  *  3. Verifies the new access token (same path as
  *     `/api/auth/steward-session`).
- *  4. Sets new HttpOnly cookies (`steward-token`, `steward-refresh-token`)
- *     and the non-HttpOnly `steward-authed=1` marker, using environment-
- *     scoped names outside production.
+ *  4. Rotates only an already-established host-bound v2 namespace.
  *  5. Returns `{ ok, expiresAt }`. Trusted first-party browser origins also
  *     receive the short-lived access token so the SPA can hydrate its
  *     localStorage mirror while route auth remains synchronous.
  *
- * Origin/Referer CSRF check mirrors `/api/auth/steward-session`.
+ * Strict Origin plus Fetch Metadata checks mirror the cookie-writer lane of
+ * `/api/auth/steward-session`.
  *
  * This route is the only way to refresh once the localStorage copy of the
- * refresh token is removed. The legacy session-POST payload shape remains
- * accepted for updated callers holding the origin mutation lease, while
- * pre-protocol bundles fail closed before any cookie mutation.
+ * refresh token is removed. Historical v1 cookies are never rotated here:
+ * their Domain-era provenance is ambiguous, so clients must re-publish an
+ * independently held access token through `/api/auth/steward-session`.
  */
 
 import {
   STEWARD_CSRF_HEADER,
+  STEWARD_CSRF_HEADER_VALUE,
   STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
   type StewardSessionErrorCode,
 } from "@elizaos/shared/steward-session-client";
 import { type Context, Hono } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
-import {
-  browserOriginHost,
-  checkElizaMutatingRequestOrigin,
-  isPermittedElizaBrowserOrigin,
-} from "@/lib/auth/browser-origin-policy";
-import { cookieDomainForHost } from "@/lib/auth/cookie-domain";
+import { checkStewardCookieWriterRequest } from "@/lib/auth/browser-origin-policy";
+import { legacyCookieCleanupDomainForHost } from "@/lib/auth/cookie-domain";
 import {
   mintStewardTokenFromClaims,
   STEWARD_AUTH_UPSTREAM_TIMEOUT_MS,
   type StewardTokenClaims,
   type StewardVerifyEnv,
+  verifyStewardRefreshLineageToken,
   verifyStewardTokenCached,
 } from "@/lib/auth/steward-client";
-import { stewardCookieNames } from "@/lib/auth/steward-cookies";
+import {
+  legacyStewardCookieNames,
+  readStewardSessionMigrationCookieStateFromHeader,
+  STEWARD_REFRESH_AUTHORITY_TTL_SECONDS,
+  STEWARD_V2_AUTHORITY_MAX_AGE_SECONDS,
+  STEWARD_V2_AUTHORITY_TOMBSTONE,
+  stewardCookieNames,
+  stewardV2CookiesAreHostBound,
+} from "@/lib/auth/steward-cookies";
 import { isBlockedBySsoBridgeLogout } from "@/lib/services/sso-bridge-codes";
 import { signStewardMutatingRequest } from "@/lib/steward/sign";
 import { logger } from "@/lib/utils/logger";
 import type { AppEnv } from "@/types/cloud-worker-env";
 
-const STEWARD_REFRESH_COOKIE_MAX_AGE = 30 * 24 * 60 * 60;
 const BEARER_REFRESH_TTL_SECONDS = 60 * 60;
-
-function checkOrigin(
-  c: { req: { header: (name: string) => string | undefined } },
-  isProduction: boolean,
-): { ok: true } | { ok: false; reason: string } {
-  return checkElizaMutatingRequestOrigin(c.req, isProduction);
-}
-
-function shouldReturnClientToken(
-  c: { req: { header: (name: string) => string | undefined } },
-  isProduction: boolean,
-): boolean {
-  const origin =
-    browserOriginHost(c.req.header("origin")) ??
-    browserOriginHost(c.req.header("referer"));
-  const host = (c.req.header("host") ?? "").split(":")[0]?.toLowerCase() ?? "";
-  if (!origin) return false;
-  // The SPA still uses a localStorage access-token mirror for synchronous
-  // route auth. Cookie refresh must hydrate that mirror for every origin the
-  // CSRF check already accepts, otherwise valid HttpOnly-cookie sessions can
-  // bounce back to /login on previews/custom same-origin hosts.
-  return isPermittedElizaBrowserOrigin(origin, host, isProduction);
-}
 
 function readBearerToken(c: {
   req: { header: (name: string) => string | undefined };
@@ -103,7 +84,6 @@ type SsoLogoutBarrierResult = "allowed" | "blocked" | "unavailable";
 async function checkSsoLogoutBarrier(
   claims: StewardTokenClaims,
 ): Promise<SsoLogoutBarrierResult> {
-  if (!claims.bridged) return "allowed";
   try {
     return (await isBlockedBySsoBridgeLogout(claims.userId, claims.issuedAt))
       ? "blocked"
@@ -138,28 +118,73 @@ function isSameStewardIdentity(
   );
 }
 
-function deleteCurrentAccessCookies(
+function deleteLegacyCookieInOwnedScopes(
   c: Context<AppEnv>,
-  cookieNames: ReturnType<typeof stewardCookieNames>,
+  name: string,
 ): void {
-  const domain = cookieDomainForHost(c.req.header("host"));
-  const options = {
+  deleteCookie(c, name, { path: "/" });
+  const domain = legacyCookieCleanupDomainForHost(c.req.header("host"));
+  if (domain) deleteCookie(c, name, { path: "/", domain });
+}
+
+function tombstoneCurrentSession(c: Context<AppEnv>): void {
+  const v2Secure = stewardV2CookiesAreHostBound(c.env.ENVIRONMENT);
+  const v2Options = {
     path: "/",
-    ...(domain ? { domain } : {}),
+    ...(v2Secure ? { secure: true } : {}),
   };
-  deleteCookie(c, cookieNames.token, options);
-  deleteCookie(c, cookieNames.authed, options);
+  const v2 = stewardCookieNames(c.env.ENVIRONMENT);
+  const v1 = legacyStewardCookieNames(c.env.ENVIRONMENT);
+  deleteCookie(c, v2.token, v2Options);
+  deleteCookie(c, v2.refreshToken, v2Options);
+  deleteLegacyCookieInOwnedScopes(c, v1.token);
+  deleteLegacyCookieInOwnedScopes(c, v1.refreshToken);
+  deleteLegacyCookieInOwnedScopes(c, v1.authed);
+  setCookie(c, v2.authed, STEWARD_V2_AUTHORITY_TOMBSTONE, {
+    httpOnly: false,
+    secure: v2Secure,
+    sameSite: "Lax",
+    path: "/",
+    maxAge: STEWARD_V2_AUTHORITY_MAX_AGE_SECONDS,
+  });
+}
+
+function clearLegacyAccessCookies(c: Context<AppEnv>): void {
+  const v1 = legacyStewardCookieNames(c.env.ENVIRONMENT);
+  deleteLegacyCookieInOwnedScopes(c, v1.token);
+  deleteLegacyCookieInOwnedScopes(c, v1.authed);
 }
 
 function deleteCurrentRefreshCookie(
   c: Context<AppEnv>,
   cookieNames: ReturnType<typeof stewardCookieNames>,
+  isV2: boolean,
 ): void {
-  const domain = cookieDomainForHost(c.req.header("host"));
   deleteCookie(c, cookieNames.refreshToken, {
     path: "/",
-    ...(domain ? { domain } : {}),
+    ...(isV2 && stewardV2CookiesAreHostBound(c.env.ENVIRONMENT)
+      ? { secure: true }
+      : {}),
   });
+}
+
+function sessionMutationNamespace(
+  c: Context<AppEnv>,
+  cookieState: ReturnType<
+    typeof readStewardSessionMigrationCookieStateFromHeader
+  >,
+): "v2" | "v1" | null {
+  if (cookieState.ambiguous) return null;
+  const marker = c.req.header(STEWARD_CSRF_HEADER);
+  if (marker === STEWARD_SESSION_MUTATION_PROTOCOL_VALUE) return "v2";
+  if (
+    marker === STEWARD_CSRF_HEADER_VALUE &&
+    cookieState.v2Authority === "absent" &&
+    cookieState.source !== "v2"
+  ) {
+    return "v1";
+  }
+  return null;
 }
 
 let stewardRefreshMetricCounter = 0;
@@ -407,6 +432,23 @@ app.post("/", async (c) => {
       );
     }
 
+    // Re-read the original session generation after mint. The mint gives the
+    // replacement a fresh iat, so checking only that replacement could make a
+    // logout committed during the await look older and accidentally revive
+    // the session.
+    const finalLogoutBarrier = await checkSsoLogoutBarrier(claims);
+    if (finalLogoutBarrier === "unavailable") {
+      logRefresh("bearer-sso-marker-unavailable-final");
+      return c.json(
+        errorBody("SSO bridge unavailable", "sso_unavailable"),
+        503,
+      );
+    }
+    if (finalLogoutBarrier === "blocked") {
+      logRefresh("bearer-session-ended-final");
+      return c.json(errorBody("Session was signed out", "session_ended"), 401);
+    }
+
     logRefresh("ok-bearer");
     return c.json({
       ok: true,
@@ -416,7 +458,11 @@ app.post("/", async (c) => {
     });
   }
 
-  const originCheck = checkOrigin(c, isProduction);
+  const originCheck = checkStewardCookieWriterRequest(
+    c.req,
+    c.env.ENVIRONMENT,
+    isProduction,
+  );
   if (!originCheck.ok) {
     logRefresh("forbidden-origin");
     logger.warn("[steward-refresh] rejected cross-origin POST", {
@@ -426,19 +472,45 @@ app.post("/", async (c) => {
   }
 
   const cookieNames = stewardCookieNames(c.env.ENVIRONMENT);
+  const requestCookieState = readStewardSessionMigrationCookieStateFromHeader(
+    c.req.header("cookie") ?? null,
+    c.env.ENVIRONMENT,
+  );
+  const mutationMarker = c.req.header(STEWARD_CSRF_HEADER);
+  if (
+    requestCookieState.ambiguous &&
+    requestCookieState.v2Authority === "absent" &&
+    requestCookieState.source !== "v2" &&
+    (mutationMarker === STEWARD_SESSION_MUTATION_PROTOCOL_VALUE ||
+      mutationMarker === STEWARD_CSRF_HEADER_VALUE)
+  ) {
+    // The browser can legitimately send both the host-only and historical
+    // Domain copy during migration. Their values are never selected for auth
+    // or forwarding, but a same-origin cleanup request must still retire both
+    // scopes and close the v2 authority boundary.
+    tombstoneCurrentSession(c);
+    logRefresh("ambiguous-legacy-session-cleaned");
+    return c.json(
+      errorBody(
+        "Session upgrade requires a verified login token",
+        "session_mutation_protocol_required",
+      ),
+      409,
+    );
+  }
   // Read only this environment's named refresh cookie. Cookies are host-only;
   // the environment suffix remains a compatibility invariant and prevents a
   // preview accidentally treating an older unsuffixed cookie as its session.
-  const refreshToken = getCookie(c, cookieNames.refreshToken);
-  const accessToken = getCookie(c, cookieNames.token);
+  const refreshToken = requestCookieState.refreshToken;
+  const accessToken = requestCookieState.token;
   // Any cookie-backed request can become a writer: the access-only recovery
   // branch below removes a revoked account's cookies. Gate before either
   // branch so a legacy response for account A cannot arrive after login B and
   // delete or replace B's fixed-name cookies.
+  const mutationNamespace = sessionMutationNamespace(c, requestCookieState);
   if (
-    (refreshToken || accessToken) &&
-    c.req.header(STEWARD_CSRF_HEADER) !==
-      STEWARD_SESSION_MUTATION_PROTOCOL_VALUE
+    !mutationNamespace &&
+    (refreshToken || accessToken || requestCookieState.source === "v2")
   ) {
     logRefresh("session-mutation-protocol-required");
     return c.json(
@@ -449,14 +521,47 @@ app.post("/", async (c) => {
       409,
     );
   }
+  if (requestCookieState.source === "v1") {
+    // No refresh protocol may rotate ambient v1 cookie authority: a sibling
+    // user-content host could have planted those historical Domain cookies.
+    // A current client must re-publish its independently held, verified access
+    // token to POST /steward-session; only that route may carry a
+    // same-identity v1 refresh cookie into the host-bound namespace. Legacy
+    // clients can still establish v1 through independently authorized session
+    // and nonce POSTs, but cookie-only refresh fails closed.
+    logRefresh("legacy-session-upgrade-required");
+    return c.json(
+      errorBody(
+        "Session upgrade requires a verified login token",
+        "session_mutation_protocol_required",
+      ),
+      409,
+    );
+  }
   if (!refreshToken) {
+    if (!accessToken) {
+      if (requestCookieState.v2Authority === "active") {
+        // The long-lived authority marker must never outlive both credentials
+        // as a false authenticated signal. Retire it only after the current
+        // Web-Locked client and strict browser-origin gate have won; an
+        // ambiguous upstream rotation 401 deliberately does not use this path.
+        tombstoneCurrentSession(c);
+      } else if (
+        mutationNamespace !== null &&
+        requestCookieState.v2Authority === "absent" &&
+        getCookie(c, legacyStewardCookieNames(c.env.ENVIRONMENT).authed) !==
+          undefined
+      ) {
+        clearLegacyAccessCookies(c);
+      }
+    }
     // A session POST can commit its access cookie immediately before the
     // renderer is closed, while its auth result carries no refresh token (or
     // before the refresh cookie is stored). Durable login recovery must be
     // able to hydrate that already-verified first-party access cookie without
     // destructively treating the ordinary `steward-authed` bearer marker as a
     // dead refresh session. This read neither rotates nor clears cookies.
-    if (accessToken && shouldReturnClientToken(c, isProduction)) {
+    if (accessToken) {
       if (!stewardSecretConfigured(c.env)) {
         logRefresh("access-cookie-server-secret-missing");
         return c.json(
@@ -484,7 +589,11 @@ app.post("/", async (c) => {
         // This is a positive, user-scoped revocation signal rather than a
         // refresh-rotation loser. Remove only this environment's access and
         // marker cookies; never touch sibling-environment or refresh cookies.
-        deleteCurrentAccessCookies(c, cookieNames);
+        if (mutationNamespace === "v1") {
+          clearLegacyAccessCookies(c);
+        } else {
+          tombstoneCurrentSession(c);
+        }
         logRefresh("access-cookie-session-ended");
         return c.json(
           errorBody("Session was signed out", "session_ended"),
@@ -492,7 +601,57 @@ app.post("/", async (c) => {
         );
       }
       const expiresAt = claims.expiration;
+      const finalLogoutBarrier = await checkSsoLogoutBarrier(claims);
+      if (finalLogoutBarrier === "unavailable") {
+        logRefresh("access-cookie-sso-marker-unavailable-final");
+        return c.json(
+          errorBody("SSO bridge unavailable", "sso_unavailable"),
+          503,
+        );
+      }
+      if (finalLogoutBarrier === "blocked") {
+        if (mutationNamespace === "v1") {
+          clearLegacyAccessCookies(c);
+        } else {
+          tombstoneCurrentSession(c);
+        }
+        logRefresh("access-cookie-session-ended-final");
+        return c.json(
+          errorBody("Session was signed out", "session_ended"),
+          401,
+        );
+      }
+      // Calculate after the final asynchronous authority check so the cookie's
+      // Max-Age cannot outlive the signed JWT by time spent awaiting that
+      // barrier. The verifier deliberately permits bounded clock skew, so
+      // independently require positive cryptographic lifetime before
+      // re-publishing a QA cookie. Ordinary/bridged lineages retain the
+      // refresh-authority horizon below.
       const expiresIn = Math.max(0, expiresAt - Math.floor(Date.now() / 1000));
+      if (claims.stagingSessionBinding && expiresIn < 1) {
+        logRefresh("access-cookie-staging-session-expired");
+        return c.json(errorBody("Invalid token", "invalid_token"), 401);
+      }
+      if (mutationNamespace === "v2") {
+        const secure = stewardV2CookiesAreHostBound(c.env.ENVIRONMENT);
+        const accessCookieMaxAge = claims.stagingSessionBinding
+          ? expiresIn
+          : STEWARD_REFRESH_AUTHORITY_TTL_SECONDS;
+        setCookie(c, cookieNames.token, accessToken, {
+          httpOnly: true,
+          secure,
+          sameSite: "Lax",
+          path: "/",
+          maxAge: accessCookieMaxAge,
+        });
+        setCookie(c, cookieNames.authed, "1", {
+          httpOnly: false,
+          secure,
+          sameSite: "Lax",
+          path: "/",
+          maxAge: STEWARD_V2_AUTHORITY_MAX_AGE_SECONDS,
+        });
+      }
       logRefresh("ok-access-cookie");
       return c.json({
         ok: true,
@@ -521,8 +680,25 @@ app.post("/", async (c) => {
   // already replaced account A's access cookie but A's old refresh cookie
   // survived, the rotated A result must never overwrite B below.
   const currentAccessClaims = accessToken
-    ? await verifyStewardTokenCached(c.env, accessToken)
+    ? ((await verifyStewardTokenCached(c.env, accessToken)) ??
+      (await verifyStewardRefreshLineageToken(c.env, accessToken)))
     : null;
+
+  if (currentAccessClaims) {
+    const admissionBarrier = await checkSsoLogoutBarrier(currentAccessClaims);
+    if (admissionBarrier === "unavailable") {
+      logRefresh("cookie-sso-marker-unavailable");
+      return c.json(
+        errorBody("SSO bridge unavailable", "sso_unavailable"),
+        503,
+      );
+    }
+    if (admissionBarrier === "blocked") {
+      tombstoneCurrentSession(c);
+      logRefresh("cookie-session-ended");
+      return c.json(errorBody("Session was signed out", "session_ended"), 401);
+    }
+  }
 
   const stewardBaseUrl = resolveStewardBaseUrl(c.env);
   if (!stewardBaseUrl) {
@@ -610,7 +786,7 @@ app.post("/", async (c) => {
     // same-identity refresh-rotation loser: both signed identities are known
     // and disagree. Burn only the stale refresh cookie from this environment,
     // preserving account B's access + marker cookies and every sibling env.
-    deleteCurrentRefreshCookie(c, cookieNames);
+    deleteCurrentRefreshCookie(c, cookieNames, true);
     logRefresh("access-refresh-identity-mismatch");
     return c.json(
       errorBody(
@@ -621,19 +797,57 @@ app.post("/", async (c) => {
     );
   }
 
-  const ttl = claims.expiration
-    ? Math.max(0, claims.expiration - Math.floor(Date.now() / 1000))
-    : null;
-  const secure = c.env.NODE_ENV === "production";
-  const domain = cookieDomainForHost(c.req.header("host"));
+  // An opaque refresh with no access cookie cannot prove when its original
+  // session began. Admit its replacement with iat=0 so every still-live logout
+  // marker blocks it, even though Steward assigned the replacement a fresh
+  // iat after consuming the single-use refresh credential.
+  const publicationBarrierClaims = currentAccessClaims ?? {
+    ...claims,
+    issuedAt: 0,
+  };
+  if (!currentAccessClaims) {
+    const admissionBarrier = await checkSsoLogoutBarrier(
+      publicationBarrierClaims,
+    );
+    if (admissionBarrier === "unavailable") {
+      logRefresh("cookie-sso-marker-unavailable");
+      return c.json(
+        errorBody("SSO bridge unavailable", "sso_unavailable"),
+        503,
+      );
+    }
+    if (admissionBarrier === "blocked") {
+      tombstoneCurrentSession(c);
+      logRefresh("cookie-session-ended");
+      return c.json(errorBody("Session was signed out", "session_ended"), 401);
+    }
+  }
+
+  // Preserve that pre-refresh lineage through the final primary read. The
+  // signed access JWT remains an HttpOnly identity artefact for the same 30-day
+  // horizon as the opaque refresh cookie, but ordinary API auth still enforces
+  // its one-hour cryptographic expiry.
+  const finalBarrier = await checkSsoLogoutBarrier(publicationBarrierClaims);
+  if (finalBarrier === "unavailable") {
+    logRefresh("cookie-sso-marker-unavailable-final");
+    return c.json(errorBody("SSO bridge unavailable", "sso_unavailable"), 503);
+  }
+  if (finalBarrier === "blocked") {
+    tombstoneCurrentSession(c);
+    logRefresh("cookie-session-ended-final");
+    return c.json(errorBody("Session was signed out", "session_ended"), 401);
+  }
+
+  // Cookie-backed rotation reaches this point only for v2. Ambient v1 state
+  // returned above before verification or upstream consumption.
+  const secure = stewardV2CookiesAreHostBound(c.env.ENVIRONMENT);
 
   setCookie(c, cookieNames.token, token, {
     httpOnly: true,
     secure,
     sameSite: "Lax",
     path: "/",
-    ...(domain ? { domain } : {}),
-    ...(typeof ttl === "number" ? { maxAge: ttl } : {}),
+    maxAge: STEWARD_REFRESH_AUTHORITY_TTL_SECONDS,
   });
 
   if (typeof newRefreshToken === "string" && newRefreshToken.length > 0) {
@@ -642,8 +856,7 @@ app.post("/", async (c) => {
       secure,
       sameSite: "Lax",
       path: "/",
-      ...(domain ? { domain } : {}),
-      maxAge: STEWARD_REFRESH_COOKIE_MAX_AGE,
+      maxAge: STEWARD_REFRESH_AUTHORITY_TTL_SECONDS,
     });
   }
 
@@ -652,8 +865,7 @@ app.post("/", async (c) => {
     secure,
     sameSite: "Lax",
     path: "/",
-    ...(domain ? { domain } : {}),
-    maxAge: STEWARD_REFRESH_COOKIE_MAX_AGE,
+    maxAge: STEWARD_V2_AUTHORITY_MAX_AGE_SECONDS,
   });
 
   logRefresh("ok");
@@ -661,7 +873,7 @@ app.post("/", async (c) => {
     ok: true,
     expiresAt: refresh.data.expiresAt,
     expiresIn: refresh.data.expiresIn,
-    ...(shouldReturnClientToken(c, isProduction) ? { token } : {}),
+    token,
   });
 });
 

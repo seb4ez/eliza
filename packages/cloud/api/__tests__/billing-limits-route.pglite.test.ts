@@ -132,6 +132,10 @@ beforeAll(async () => {
         schemas.autoTopUpLegacyPaymentQuarantine,
       computeBillingRateSegments: schemas.computeBillingRateSegments,
       apps: schemas.apps,
+      // Cookie authentication now performs a strongly-consistent logout
+      // marker read before accepting a Steward session. Keep the route fixture
+      // representative instead of turning that fail-closed read into a 503.
+      ssoBridgeLogoutMarkers: schemas.ssoBridgeLogoutMarkers,
       appDeploymentStatusEnum: schemas.appDeploymentStatusEnum,
       appReviewStatusEnum: schemas.appReviewStatusEnum,
       userDatabaseStatusEnum: schemas.userDatabaseStatusEnum,
@@ -556,7 +560,7 @@ async function sessionCookie(stewardUserId: string): Promise<string> {
     3600,
   );
   if (!minted) throw new Error("test Steward token mint failed");
-  return `steward-token-test=${minted.token}`;
+  return `__Host-steward-token-v2-test=${minted.token}`;
 }
 
 async function getLimits(

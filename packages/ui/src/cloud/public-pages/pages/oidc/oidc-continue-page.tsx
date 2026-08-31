@@ -15,7 +15,7 @@
  * blaming the user's link.
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { Button } from "../../../../components/primitives";
 import { useCloudT } from "../../../shell/CloudI18nProvider";
@@ -32,6 +32,11 @@ export default function OidcContinuePage() {
   const [failure, setFailure] = useState<
     PreparedOidcResumeTarget["status"] | null
   >(null);
+  const operationRef = useRef<{
+    key: string;
+    promise: Promise<PreparedOidcResumeTarget>;
+  } | null>(null);
+  const effectGenerationRef = useRef(0);
 
   usePageTitle(
     t("cloud.oidcContinue.metaTitle", {
@@ -46,17 +51,34 @@ export default function OidcContinuePage() {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    let cancelled = false;
-
-    void prepareOidcResumeTarget(
+    const effectGeneration = effectGenerationRef.current + 1;
+    effectGenerationRef.current = effectGeneration;
+    const effectIsCurrent = () =>
+      effectGenerationRef.current === effectGeneration;
+    const operationKey = JSON.stringify([
       requestId,
       window.location.hostname,
       window.location.origin,
-    )
+    ]);
+    const operation =
+      operationRef.current?.key === operationKey
+        ? operationRef.current.promise
+        : prepareOidcResumeTarget(
+            requestId,
+            window.location.hostname,
+            window.location.origin,
+          );
+    operationRef.current = { key: operationKey, promise: operation };
+
+    void operation
       .then((target) => {
-        if (cancelled) return;
+        if (!effectIsCurrent()) return;
         if (target.status !== "ok") {
           setFailure(target.status);
+          return;
+        }
+        if (!target.authority.isCurrent()) {
+          setFailure("session_sync_failed");
           return;
         }
         // `replace` keeps the bounce out of history, so Back returns to the
@@ -66,11 +88,13 @@ export default function OidcContinuePage() {
       .catch(() => {
         // error-policy:J4 user-facing degrade — unexpected preparation errors
         // become a recoverable authentication screen, never an endless spinner.
-        if (!cancelled) setFailure("session_sync_failed");
+        if (effectIsCurrent()) setFailure("session_sync_failed");
       });
 
     return () => {
-      cancelled = true;
+      if (effectIsCurrent()) {
+        effectGenerationRef.current = effectGeneration + 1;
+      }
     };
   }, [requestId]);
 

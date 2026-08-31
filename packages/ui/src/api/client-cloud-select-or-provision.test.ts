@@ -149,7 +149,10 @@ describe("selectOrProvisionCloudAgent — never duplicate on a failed lookup", (
 
     expect(result.created).toBe(false);
     expect(result.agentId).toBe("agent-existing");
-    expect(resumeCloudCompatAgent).toHaveBeenCalledWith("agent-existing");
+    expect(resumeCloudCompatAgent).toHaveBeenCalledWith(
+      "agent-existing",
+      expect.objectContaining({ token: BASE_OPTS.authToken }),
+    );
     expect(createCloudCompatAgent).not.toHaveBeenCalled();
   });
 
@@ -728,7 +731,10 @@ describe("selectOrProvisionCloudAgent — never duplicate on a failed lookup", (
     expect(result.agentId).toBe("agent-new");
     expect(result.apiBase).toBe("https://agent-new.elizacloud.ai");
     expect(result.requiresAgentPairing).toBe(false);
-    expect(resumeCloudCompatAgent).toHaveBeenCalledWith("agent-new");
+    expect(resumeCloudCompatAgent).toHaveBeenCalledWith(
+      "agent-new",
+      expect.objectContaining({ token: BASE_OPTS.authToken }),
+    );
   });
 
   // The warm-pool path returns a brand-new agent already `running` with a

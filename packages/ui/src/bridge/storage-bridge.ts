@@ -17,12 +17,22 @@ import {
   registerStewardTokenPersistence,
   registerStewardTokenRemoval,
   STEWARD_TOKEN_KEY,
+  STEWARD_TOKEN_SCOPE_KEY,
+  type StewardTokenHostPersistenceContext,
 } from "@elizaos/shared/steward-session-client";
 import { MOBILE_RUNTIME_MODE_STORAGE_KEY } from "../first-run/mobile-runtime-mode";
 import { runAsPrivilegedShell } from "../surface-realm-channel";
 import {
+  type DesktopConnectionTransactionKind,
   type DesktopSecureStoreChangedEvent,
   type DesktopSecureStoreKind,
+  desktopConnectionTransactionAbort,
+  desktopConnectionTransactionBegin,
+  desktopConnectionTransactionCompensate,
+  desktopConnectionTransactionDecide,
+  desktopConnectionTransactionFinish,
+  desktopConnectionTransactionStage,
+  desktopConnectionTransactionStatus,
   desktopSecureStoreCommitReceipt,
   desktopSecureStoreCompareAndDelete,
   desktopSecureStoreCompareAndRestore,
@@ -129,6 +139,78 @@ const PROTECTED_STORAGE_KEY = new Map<DesktopSecureStoreKind, string>(
   Array.from(PROTECTED_STORAGE_KIND, ([key, kind]) => [kind, key]),
 );
 
+const STEWARD_TOKEN_RECORD_MARKER = "eliza.steward-token.v1";
+
+interface StewardTokenRecord {
+  marker: typeof STEWARD_TOKEN_RECORD_MARKER;
+  scope: string | null;
+  token: string;
+}
+
+function encodeProtectedStorageValue(
+  key: string,
+  value: string,
+  stewardScope?: string | null,
+): string {
+  if (
+    key !== STEWARD_TOKEN_KEY ||
+    isNativePlatform() ||
+    !isElectrobunRuntime()
+  ) {
+    return value;
+  }
+  const record: StewardTokenRecord = {
+    marker: STEWARD_TOKEN_RECORD_MARKER,
+    scope:
+      stewardScope === undefined
+        ? window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY)
+        : stewardScope,
+    token: value,
+  };
+  return JSON.stringify(record);
+}
+
+function decodeStewardTokenRecord(value: string): {
+  scope?: string | null;
+  token: string;
+} {
+  try {
+    const parsed = JSON.parse(value) as Partial<StewardTokenRecord>;
+    if (
+      parsed?.marker === STEWARD_TOKEN_RECORD_MARKER &&
+      typeof parsed.token === "string" &&
+      (parsed.scope === null || typeof parsed.scope === "string")
+    ) {
+      return { scope: parsed.scope, token: parsed.token };
+    }
+  } catch {
+    // Existing installations store a plain token. Preserve it and its legacy
+    // local scope until the next successful write upgrades the secure record.
+  }
+  return { token: value };
+}
+
+function synchronizeStewardTokenScope(scope: string | null): void {
+  runAsPrivilegedShell(() => {
+    if (scope === null) window.localStorage.removeItem(STEWARD_TOKEN_SCOPE_KEY);
+    else window.localStorage.setItem(STEWARD_TOKEN_SCOPE_KEY, scope);
+  });
+}
+
+function decodeProtectedStorageValue(
+  key: string,
+  value: string,
+): { scope?: string | null; value: string } {
+  if (key !== STEWARD_TOKEN_KEY) return { value };
+  const decoded = decodeStewardTokenRecord(value);
+  return {
+    ...(Object.hasOwn(decoded, "scope")
+      ? { scope: decoded.scope ?? null }
+      : {}),
+    value: decoded.token,
+  };
+}
+
 const protectedStorageCache = new Map<string, string>();
 const protectedStorageCacheValidatedAt = new Map<string, number>();
 const protectedStorageHostRevision = new Map<string, number>();
@@ -144,12 +226,14 @@ interface ProtectedStoreSetResult {
   predecessor?: string | null;
   rollbackReceipt: string | null;
   setRevision?: number;
+  storedValue?: string;
   stored: boolean;
 }
 
 interface ProtectedStoreRollbackAuthority {
   receipt: string;
   setRevision: number;
+  transactionReceipt?: RuntimeConnectionTransactionReceiptState;
 }
 
 interface ProtectedStoreCompensationSnapshot {
@@ -162,6 +246,12 @@ interface PersistedStorageValue {
   mutationVersion: number;
   previousValue?: string | null;
   rollbackAuthority: ProtectedStoreRollbackAuthority | null;
+  storedValue: string;
+}
+
+interface PersistStorageValueContext {
+  stewardScope?: string | null;
+  transaction?: RuntimeConnectionStorageTransaction;
 }
 
 export interface StorageWriteCompensation {
@@ -174,12 +264,60 @@ export interface StorageWriteValidationOptions {
    * this false: once A is removed, a newer marker must never resurrect A.
    */
   compensateOnValidationFailure?: boolean;
+  /** Opaque, identity-branded capability for the owning connection WAL. */
+  runtimeConnectionTransaction?: RuntimeConnectionStorageTransaction;
   validate?: () => boolean;
 }
 
 export interface StorageRemovalValidationOptions {
   validate?: () => boolean;
 }
+
+const RUNTIME_CONNECTION_STORAGE_TRANSACTION = Symbol(
+  "runtime-connection-storage-transaction",
+);
+
+export interface RuntimeConnectionStorageParticipant {
+  key: string;
+  value: string;
+}
+
+export interface RuntimeConnectionStorageTransaction {
+  readonly [RUNTIME_CONNECTION_STORAGE_TRANSACTION]: true;
+  readonly transactionId: string;
+}
+
+type RuntimeConnectionTransactionPhase =
+  | "prepared"
+  | "committed"
+  | "aborted"
+  | "finished";
+
+interface RuntimeConnectionTransactionReceiptState {
+  phase: RuntimeConnectionTransactionPhase;
+  transaction: RuntimeConnectionStorageTransactionState;
+}
+
+interface RuntimeConnectionTransactionReceiptEntry {
+  authority: ProtectedStoreRollbackAuthority;
+  kind: DesktopConnectionTransactionKind;
+  state: RuntimeConnectionTransactionReceiptState;
+}
+
+interface RuntimeConnectionStorageTransactionState
+  extends RuntimeConnectionStorageTransaction {
+  abortPromise: Promise<boolean> | null;
+  compensationPromise: Promise<boolean> | null;
+  epoch: string;
+  participants: Map<string, string>;
+  phase: RuntimeConnectionTransactionPhase;
+  receipts: Map<string, RuntimeConnectionTransactionReceiptEntry>;
+  sealedMutationVersions: Map<string, number | undefined> | null;
+  stewardPredecessorScope: { value: string | null } | null;
+}
+
+let activeRuntimeConnectionTransaction: RuntimeConnectionStorageTransactionState | null =
+  null;
 
 const DESKTOP_SECURE_STORE_RPC_ATTEMPTS = 3;
 export const PROTECTED_STORAGE_CACHE_LEASE_MS = 30_000;
@@ -192,6 +330,534 @@ class ProtectedStorageWriteSupersededError extends Error {
     super(`Desktop protected storage write was superseded for ${key}`);
     this.name = "ProtectedStorageWriteSupersededError";
   }
+}
+
+function runtimeConnectionTransactionCapability(
+  transaction: RuntimeConnectionStorageTransactionState | null | undefined,
+  key: string,
+): { epoch: string; transactionId: string } | null {
+  if (!transaction) return null;
+  const active = requireActiveRuntimeConnectionTransaction(transaction);
+  if (active.phase !== "prepared" && active.phase !== "committed") {
+    throw new Error("Runtime connection storage transaction is not usable");
+  }
+  if (!active.participants.has(key)) {
+    throw new Error(
+      `Protected storage key is not a runtime connection participant: ${key}`,
+    );
+  }
+  return { epoch: active.epoch, transactionId: active.transactionId };
+}
+
+function runtimeConnectionKindForKey(
+  key: string,
+): DesktopConnectionTransactionKind | null {
+  const kind = PROTECTED_STORAGE_KIND.get(key);
+  return kind === "runtime.agent_profiles" ||
+    kind === "runtime.active_server" ||
+    kind === "session.steward_token"
+    ? kind
+    : null;
+}
+
+async function retryDesktopConnectionTransactionRequest<T>(
+  operation: () => Promise<T | null>,
+  unavailableMessage: string,
+): Promise<T> {
+  let lastError: unknown = new Error(unavailableMessage);
+  for (
+    let attempt = 0;
+    attempt < DESKTOP_SECURE_STORE_RPC_ATTEMPTS;
+    attempt += 1
+  ) {
+    try {
+      const result = await operation();
+      if (result) return result;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError;
+}
+
+function requireActiveRuntimeConnectionTransaction(
+  transaction: RuntimeConnectionStorageTransaction,
+): RuntimeConnectionStorageTransactionState {
+  const active = activeRuntimeConnectionTransaction;
+  if (
+    !active ||
+    active !== transaction ||
+    transaction[RUNTIME_CONNECTION_STORAGE_TRANSACTION] !== true
+  ) {
+    throw new Error(
+      "Runtime connection storage transaction is no longer active",
+    );
+  }
+  return active;
+}
+
+export async function beginRuntimeConnectionStorageTransaction(
+  participants: readonly RuntimeConnectionStorageParticipant[],
+): Promise<RuntimeConnectionStorageTransaction | null> {
+  if (isNativePlatform() || !isElectrobunRuntime()) return null;
+  if (activeRuntimeConnectionTransaction) {
+    throw new Error(
+      "A runtime connection storage transaction is already active",
+    );
+  }
+  const mapped = participants.map((participant) => {
+    const kind = runtimeConnectionKindForKey(participant.key);
+    if (!kind) {
+      throw new Error(
+        `Protected storage key cannot join a runtime connection transaction: ${participant.key}`,
+      );
+    }
+    return { key: participant.key, kind, value: participant.value };
+  });
+  if (
+    new Set(mapped.map((participant) => participant.kind)).size !==
+    mapped.length
+  ) {
+    throw new Error(
+      "Runtime connection transaction contains duplicate participants",
+    );
+  }
+  const transactionId = crypto.randomUUID();
+  let result: { ok: true; epoch: string };
+  try {
+    result = await retryDesktopConnectionTransactionRequest(
+      () =>
+        desktopConnectionTransactionBegin(
+          transactionId,
+          mapped.map(({ kind, value }) => ({ kind, value })),
+        ),
+      "Desktop runtime connection transaction prepare is unavailable",
+    );
+  } catch (beginError) {
+    // BEGIN may have durably prepared the WAL even when every response was
+    // lost. Recover its owner-scoped epoch instead of abandoning an invisible
+    // host lock until the renderer reloads.
+    try {
+      const status = await retryDesktopConnectionTransactionRequest(
+        () => desktopConnectionTransactionStatus(transactionId),
+        "Desktop runtime connection transaction status is unavailable",
+      );
+      if (status.status !== "prepared") throw beginError;
+      result = { ok: true, epoch: status.epoch };
+    } catch (statusError) {
+      throw new AggregateError(
+        [beginError, statusError],
+        "Desktop runtime connection transaction prepare outcome is ambiguous",
+      );
+    }
+  }
+  const transaction: RuntimeConnectionStorageTransactionState = {
+    [RUNTIME_CONNECTION_STORAGE_TRANSACTION]: true,
+    abortPromise: null,
+    compensationPromise: null,
+    epoch: result.epoch,
+    participants: new Map(
+      mapped.map((participant) => [participant.key, participant.value]),
+    ),
+    phase: "prepared",
+    receipts: new Map(),
+    sealedMutationVersions: null,
+    stewardPredecessorScope: null,
+    transactionId,
+  };
+  activeRuntimeConnectionTransaction = transaction;
+  return transaction;
+}
+
+async function stageActiveRuntimeConnectionParticipant(
+  transaction: RuntimeConnectionStorageTransactionState | null | undefined,
+  key: string,
+  value: string,
+): Promise<void> {
+  if (!transaction) return;
+  requireActiveRuntimeConnectionTransaction(transaction);
+  if (transaction.phase !== "prepared") {
+    throw new Error(
+      "Runtime connection transaction is no longer accepting participants",
+    );
+  }
+  const kind = runtimeConnectionKindForKey(key);
+  if (!kind) return;
+  const existing = transaction.participants.get(key);
+  if (existing !== undefined) {
+    if (existing !== value) {
+      throw new Error("Runtime connection transaction participant changed");
+    }
+    return;
+  }
+  await retryDesktopConnectionTransactionRequest(
+    () =>
+      desktopConnectionTransactionStage(
+        transaction.transactionId,
+        transaction.epoch,
+        {
+          kind,
+          value,
+        },
+      ),
+    "Desktop runtime connection transaction staging is unavailable",
+  );
+  transaction.participants.set(key, value);
+}
+
+function registerRuntimeConnectionTransactionReceipt(
+  transaction: RuntimeConnectionStorageTransactionState | null | undefined,
+  key: string,
+  value: string,
+  authority: ProtectedStoreRollbackAuthority,
+): boolean {
+  if (transaction?.phase !== "prepared") return false;
+  requireActiveRuntimeConnectionTransaction(transaction);
+  const expected = transaction.participants.get(key);
+  const kind = runtimeConnectionKindForKey(key);
+  if (expected !== value || !kind) return false;
+  const existing = transaction.receipts.get(key);
+  if (existing) {
+    if (existing.authority.receipt !== authority.receipt) {
+      throw new Error("Runtime connection participant received two receipts");
+    }
+    authority.transactionReceipt = existing.state;
+    return true;
+  }
+  const state: RuntimeConnectionTransactionReceiptState = {
+    phase: "prepared",
+    transaction,
+  };
+  authority.transactionReceipt = state;
+  transaction.receipts.set(key, { authority, kind, state });
+  return true;
+}
+
+async function refreshRuntimeConnectionTransactionCache(
+  transaction: RuntimeConnectionStorageTransactionState,
+  useTransactionCapability = true,
+): Promise<void> {
+  const snapshots = await Promise.all(
+    Array.from(transaction.participants.keys(), async (key) => {
+      let scope: string | null | undefined;
+      const value = await protectedStoreGet(
+        key,
+        useTransactionCapability ? transaction : null,
+        (nextScope) => {
+          scope = nextScope;
+        },
+      );
+      return [key, value, scope] as const;
+    }),
+  );
+  for (const [key, value] of snapshots) {
+    if (value === null) invalidateProtectedStorageCache(key);
+    else cacheProtectedStorageValue(key, value);
+  }
+  const tokenSnapshot = snapshots.find(([key]) => key === STEWARD_TOKEN_KEY);
+  if (tokenSnapshot?.[2] !== undefined) {
+    // Token first, scope second: an intercalated synchronous read is at worst
+    // quarantined (B token + A scope), never old token A authorized by scope B.
+    synchronizeStewardTokenScope(tokenSnapshot[2]);
+  }
+}
+
+export async function decideRuntimeConnectionStorageTransaction(
+  transaction: RuntimeConnectionStorageTransaction,
+): Promise<void> {
+  const active = requireActiveRuntimeConnectionTransaction(transaction);
+  if (active.phase === "committed") return;
+  if (active.phase !== "prepared") {
+    throw new Error("Runtime connection storage transaction cannot commit");
+  }
+  const receipts = Array.from(active.participants.keys(), (key) => {
+    const receipt = active.receipts.get(key);
+    if (!receipt) {
+      throw new Error(
+        `Runtime connection transaction receipt is missing for ${key}`,
+      );
+    }
+    return {
+      kind: receipt.kind,
+      rollbackReceipt: receipt.authority.receipt,
+    };
+  });
+  const decision = await retryDesktopConnectionTransactionRequest(
+    () =>
+      desktopConnectionTransactionDecide(
+        active.transactionId,
+        active.epoch,
+        receipts,
+      ),
+    "Desktop runtime connection transaction decision is unavailable",
+  );
+  if (decision.epoch !== active.epoch) {
+    throw new Error("Desktop runtime connection transaction epoch changed");
+  }
+  const revisionByKind = new Map<DesktopConnectionTransactionKind, number>();
+  for (const entry of decision.revisions) {
+    if (
+      revisionByKind.has(entry.kind) ||
+      !Number.isSafeInteger(entry.revision) ||
+      entry.revision < 0
+    ) {
+      throw new Error(
+        "Desktop runtime connection transaction revisions are invalid",
+      );
+    }
+    revisionByKind.set(entry.kind, entry.revision);
+  }
+  if (revisionByKind.size !== active.receipts.size) {
+    throw new Error(
+      "Desktop runtime connection transaction revisions are incomplete",
+    );
+  }
+  active.phase = "committed";
+  for (const [key, receipt] of active.receipts) {
+    const revision = revisionByKind.get(receipt.kind);
+    if (revision === undefined) {
+      throw new Error(
+        "Desktop runtime connection transaction revision is missing",
+      );
+    }
+    receipt.authority.setRevision = revision;
+    receipt.state.phase = "committed";
+    acceptProtectedStorageHostRevision(key, revision);
+  }
+  // Read every participant first, then publish the cache as one synchronous
+  // batch. No participant cache becomes authoritative before the WAL decision.
+  await refreshRuntimeConnectionTransactionCache(active);
+}
+
+export async function finishRuntimeConnectionStorageTransaction(
+  transaction: RuntimeConnectionStorageTransaction,
+): Promise<void> {
+  const settled = transaction as RuntimeConnectionStorageTransactionState;
+  if (settled.phase === "finished") return;
+  if (settled.phase === "aborted") {
+    throw new Error("Runtime connection storage transaction was aborted");
+  }
+  const active = requireActiveRuntimeConnectionTransaction(transaction);
+  if (active.phase === "prepared") {
+    await decideRuntimeConnectionStorageTransaction(active);
+  }
+  if (active.phase !== "committed") {
+    throw new Error("Runtime connection storage transaction cannot finish");
+  }
+  try {
+    await retryDesktopConnectionTransactionRequest(
+      () =>
+        desktopConnectionTransactionFinish(active.transactionId, active.epoch),
+      "Desktop runtime connection transaction finalization is unavailable",
+    );
+  } catch (finishError) {
+    const status = await retryDesktopConnectionTransactionRequest(
+      () =>
+        desktopConnectionTransactionStatus(active.transactionId, active.epoch),
+      "Desktop runtime connection transaction status is unavailable",
+    );
+    if (status.status !== "finished") throw finishError;
+  }
+  active.phase = "finished";
+  for (const receipt of active.receipts.values()) {
+    receipt.state.phase = "finished";
+  }
+  active.sealedMutationVersions = new Map(
+    Array.from(active.participants.keys(), (key) => [
+      key,
+      protectedStorageMutationVersion.get(key),
+    ]),
+  );
+  activeRuntimeConnectionTransaction = null;
+}
+
+export async function abortRuntimeConnectionStorageTransaction(
+  transaction: RuntimeConnectionStorageTransaction,
+): Promise<boolean> {
+  const settled = transaction as RuntimeConnectionStorageTransactionState;
+  if (settled.phase === "aborted") return true;
+  if (settled.phase === "finished") return false;
+  if (settled.abortPromise) return settled.abortPromise;
+  const active = requireActiveRuntimeConnectionTransaction(transaction);
+  const operation = (async () => {
+    if (active.stewardPredecessorScope) {
+      // Publish/quarantine the legacy token's predecessor scope before the
+      // host can restore raw token A and clear its aborting WAL. A crash before
+      // this RPC still recovers committed bundle B/scope B; a crash after it
+      // observes only A/scope A (or fail-closed null), never A/scope B.
+      synchronizeStewardTokenScope(active.stewardPredecessorScope.value);
+    }
+    const receipts = Array.from(active.receipts.values(), (receipt) => ({
+      kind: receipt.kind,
+      rollbackReceipt: receipt.authority.receipt,
+    }));
+    const result = await retryDesktopConnectionTransactionRequest(
+      () =>
+        desktopConnectionTransactionAbort(
+          active.transactionId,
+          active.epoch,
+          receipts,
+        ),
+      "Desktop runtime connection transaction abort is unavailable",
+    ).catch(async (abortError) => {
+      const status = await retryDesktopConnectionTransactionRequest(
+        () =>
+          desktopConnectionTransactionStatus(
+            active.transactionId,
+            active.epoch,
+          ),
+        "Desktop runtime connection transaction status is unavailable",
+      );
+      if (status.status === "aborted") {
+        return { ok: true as const, aborted: true, committed: false };
+      }
+      if (status.status === "finished") {
+        return { ok: true as const, aborted: false, committed: true };
+      }
+      throw abortError;
+    });
+    if (!result.aborted) {
+      if (result.committed) {
+        active.phase = "finished";
+        for (const receipt of active.receipts.values()) {
+          receipt.state.phase = "finished";
+        }
+        active.sealedMutationVersions = new Map(
+          Array.from(active.participants.keys(), (key) => [
+            key,
+            protectedStorageMutationVersion.get(key),
+          ]),
+        );
+        activeRuntimeConnectionTransaction = null;
+      }
+      return false;
+    }
+    active.phase = "aborted";
+    for (const receipt of active.receipts.values()) {
+      receipt.state.phase = "aborted";
+    }
+    activeRuntimeConnectionTransaction = null;
+    await refreshRuntimeConnectionTransactionCache(active, false);
+    return true;
+  })();
+  settled.abortPromise = operation;
+  void operation.catch(() => {
+    if (settled.abortPromise === operation) settled.abortPromise = null;
+  });
+  return operation;
+}
+
+async function compensateFinishedRuntimeConnectionStorageTransaction(
+  transaction: RuntimeConnectionStorageTransactionState,
+): Promise<boolean> {
+  if (transaction.phase === "aborted") return true;
+  if (transaction.phase !== "finished") {
+    return abortRuntimeConnectionStorageTransaction(transaction);
+  }
+  if (transaction.compensationPromise) return transaction.compensationPromise;
+
+  // Snapshot all renderer mutation authorities synchronously before the first
+  // await. If C has even started locally after B was sealed, B's reverse
+  // authority is obsolete; the host independently revokes it for every later
+  // participant mutation, including same-byte ABA writes from other renderers.
+  const sealed = transaction.sealedMutationVersions;
+  if (
+    !sealed ||
+    Array.from(sealed).some(
+      ([key, version]) => protectedStorageMutationVersion.get(key) !== version,
+    )
+  ) {
+    return false;
+  }
+
+  const receipts = Array.from(transaction.receipts.values(), (receipt) => ({
+    expectedRevision: receipt.authority.setRevision,
+    kind: receipt.kind,
+    rollbackReceipt: receipt.authority.receipt,
+  }));
+  if (receipts.length !== transaction.participants.size) return false;
+
+  if (transaction.stewardPredecessorScope) {
+    // Same crash-safe ordering as forward abort: publish/quarantine legacy A's
+    // scope before the host can atomically reverse the secure token bundle.
+    synchronizeStewardTokenScope(transaction.stewardPredecessorScope.value);
+  }
+  const operation = (async () => {
+    let result: NonNullable<
+      Awaited<ReturnType<typeof desktopConnectionTransactionCompensate>>
+    >;
+    try {
+      result = await retryDesktopConnectionTransactionRequest(
+        () =>
+          desktopConnectionTransactionCompensate(
+            transaction.transactionId,
+            transaction.epoch,
+            receipts,
+          ),
+        "Desktop runtime connection transaction compensation is unavailable",
+      );
+    } catch (compensationError) {
+      // The reverse WAL may have committed and published all host revisions
+      // even if every COMPENSATE response was lost. Resolve that ambiguity
+      // from the owner/epoch-bound tombstone, then still publish A into the
+      // renderer caches and live client before resolving the compensation.
+      let status: NonNullable<
+        Awaited<ReturnType<typeof desktopConnectionTransactionStatus>>
+      >;
+      try {
+        status = await retryDesktopConnectionTransactionRequest(
+          () =>
+            desktopConnectionTransactionStatus(
+              transaction.transactionId,
+              transaction.epoch,
+            ),
+          "Desktop runtime connection transaction status is unavailable",
+        );
+      } catch (statusError) {
+        throw new AggregateError(
+          [compensationError, statusError],
+          "Desktop runtime connection compensation outcome is ambiguous",
+        );
+      }
+      if (status.status !== "compensated" || !status.revisions) {
+        throw compensationError;
+      }
+      result = {
+        ok: true,
+        compensated: true,
+        revisions: status.revisions,
+      };
+    }
+    const revisionByKind = new Map(
+      result.revisions.map((entry) => [entry.kind, entry.revision]),
+    );
+    if (revisionByKind.size !== receipts.length) {
+      throw new Error(
+        "Desktop runtime connection compensation revisions are incomplete",
+      );
+    }
+    transaction.phase = "aborted";
+    for (const [key, receipt] of transaction.receipts) {
+      const revision = revisionByKind.get(receipt.kind);
+      if (!Number.isSafeInteger(revision)) {
+        throw new Error(
+          "Desktop runtime connection compensation revision is invalid",
+        );
+      }
+      receipt.authority.setRevision = revision as number;
+      receipt.state.phase = "aborted";
+      acceptProtectedStorageHostRevision(key, revision);
+    }
+    await refreshRuntimeConnectionTransactionCache(transaction, false);
+    return true;
+  })();
+  transaction.compensationPromise = operation;
+  void operation.catch(() => {
+    if (transaction.compensationPromise === operation) {
+      transaction.compensationPromise = null;
+    }
+  });
+  return operation;
 }
 
 function invalidateProtectedStorageCache(key: string): void {
@@ -287,7 +953,7 @@ async function refreshProtectedStorageCacheLease(
     return "invalidated";
   }
   try {
-    const result = await desktopSecureStoreRevision(kind);
+    const result = await desktopSecureStoreRevision(kind, undefined);
     if (
       !result?.ok ||
       !Number.isSafeInteger(result.revision) ||
@@ -452,34 +1118,42 @@ function serializeProtectedStorageMutation<T>(
 function serializedProtectedStoreSet(
   key: string,
   value: string,
+  transaction?: RuntimeConnectionStorageTransactionState | null,
+  stewardScope?: string | null,
 ): Promise<ProtectedStoreSetResult> {
   return serializeProtectedStorageMutation(key, async () => {
+    const storedValue = encodeProtectedStorageValue(key, value, stewardScope);
     if (isNativePlatform()) {
-      return nativeProtectedStoreSetWithCompensation(key, value);
+      return {
+        ...(await nativeProtectedStoreSetWithCompensation(key, value)),
+        storedValue,
+      };
     }
-    const result = await protectedStoreSet(key, value);
+    const result = await protectedStoreSet(key, storedValue, transaction);
     if (!result.stored) {
       if (result.rollbackReceipt) {
-        await rollbackFailedDesktopProtectedStoreSet(key, result);
+        await rollbackFailedDesktopProtectedStoreSet(key, result, transaction);
       }
       return { stored: false, rollbackReceipt: null };
     }
     try {
-      if ((await protectedStoreGet(key)) === value) return result;
+      if ((await protectedStoreGet(key, transaction)) === value) {
+        return { ...result, storedValue };
+      }
     } catch (readbackError) {
       // Electrobun's set and get are separate renderer→host RPCs. A set may
       // therefore commit successfully before the readback transport fails.
       // Keep the opaque set receipt live long enough to undo that exact host
       // mutation; otherwise the caller sees a rejected login while the token
       // silently survives in the OS credential store and returns on restart.
-      await rollbackFailedDesktopProtectedStoreSet(key, result);
+      await rollbackFailedDesktopProtectedStoreSet(key, result, transaction);
       throw readbackError;
     }
 
     // A readable but mismatched value is also a failed publication. Roll the
     // exact write back when it still owns the slot; the host CAS preserves a
     // newer renderer mutation when this receipt has already gone stale.
-    await rollbackFailedDesktopProtectedStoreSet(key, result);
+    await rollbackFailedDesktopProtectedStoreSet(key, result, transaction);
     return { stored: false, rollbackReceipt: null };
   });
 }
@@ -512,7 +1186,11 @@ function applyProtectedStorageHostSnapshot(
   if (value === null) {
     invalidateProtectedStorageCache(key);
   } else {
-    cacheProtectedStorageValue(key, value);
+    const decoded = decodeProtectedStorageValue(key, value);
+    cacheProtectedStorageValue(key, decoded.value);
+    if (decoded.scope !== undefined) {
+      synchronizeStewardTokenScope(decoded.scope);
+    }
   }
 }
 
@@ -551,11 +1229,17 @@ function compareAndRestoreStorageValue(
       const result = await desktopSecureStoreCompareAndRestore(
         kind,
         rollbackReceipt,
+        undefined,
       );
       if (!result?.ok) {
         throw new Error("Desktop protected storage rejected rollback");
       }
-      applyProtectedStorageHostSnapshot(key, result.value, result.revision);
+      if (result.restored) {
+        applyProtectedStorageHostSnapshot(key, result.value, result.revision);
+      } else {
+        acceptProtectedStorageHostRevision(key, result.revision);
+        invalidateProtectedStorageCache(key);
+      }
       return result.restored;
     }
 
@@ -591,14 +1275,21 @@ export function isProtectedStorageHostRuntime(): boolean {
   return isProtectedStorageHost();
 }
 
-async function protectedStoreGet(key: string): Promise<string | null> {
+async function protectedStoreGet(
+  key: string,
+  transaction?: RuntimeConnectionStorageTransactionState | null,
+  receiveStewardScope?: (scope: string | null) => void,
+): Promise<string | null> {
   const kind = PROTECTED_STORAGE_KIND.get(key);
   if (!kind) return null;
   if (isNativePlatform()) {
     const { ElizaSecureStore } = await loadNativeSecureStore();
     const result = await ElizaSecureStore.get({ key: kind });
     if (result.ok) {
-      return typeof result.value === "string" ? result.value : null;
+      if (typeof result.value !== "string") return null;
+      const decoded = decodeProtectedStorageValue(key, result.value);
+      if (decoded.scope !== undefined) receiveStewardScope?.(decoded.scope);
+      return decoded.value;
     }
     if (result.error === "not_found") return null;
     throw new Error("Native protected storage is unavailable");
@@ -609,13 +1300,24 @@ async function protectedStoreGet(key: string): Promise<string | null> {
     // the invalidation already observed here, so it can never refill the cache
     // with the previous account's credential.
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      const result = await desktopSecureStoreGet(kind);
+      const capability = runtimeConnectionTransactionCapability(
+        transaction,
+        key,
+      );
+      const result = await desktopSecureStoreGet(
+        kind,
+        capability?.transactionId,
+        capability?.epoch,
+      );
       if (result && !acceptProtectedStorageHostRevision(key, result.revision)) {
         if (attempt < 2) continue;
         throw new Error("Desktop protected storage returned a stale snapshot");
       }
       if (result?.ok) {
-        return typeof result.value === "string" ? result.value : null;
+        if (typeof result.value !== "string") return null;
+        const decoded = decodeProtectedStorageValue(key, result.value);
+        if (decoded.scope !== undefined) receiveStewardScope?.(decoded.scope);
+        return decoded.value;
       }
       if (result?.reason === "not_found") return null;
       throw new Error("Desktop protected storage is unavailable");
@@ -627,6 +1329,7 @@ async function protectedStoreGet(key: string): Promise<string | null> {
 async function protectedStoreSet(
   key: string,
   value: string,
+  transaction?: RuntimeConnectionStorageTransactionState | null,
 ): Promise<ProtectedStoreSetResult> {
   const kind = PROTECTED_STORAGE_KIND.get(key);
   if (!kind) return { stored: false, rollbackReceipt: null };
@@ -649,7 +1352,17 @@ async function protectedStoreSet(
       attempt += 1
     ) {
       try {
-        result = await desktopSecureStoreSet(kind, value, mutationId);
+        const capability = runtimeConnectionTransactionCapability(
+          transaction,
+          key,
+        );
+        result = await desktopSecureStoreSet(
+          kind,
+          value,
+          mutationId,
+          capability?.transactionId,
+          capability?.epoch,
+        );
         if (result) break;
       } catch (error) {
         lastError = error;
@@ -751,8 +1464,13 @@ async function restoreNativeProtectedStorePredecessor(
 async function rollbackFailedDesktopProtectedStoreSet(
   key: string,
   result: ProtectedStoreSetResult,
+  transaction?: RuntimeConnectionStorageTransactionState | null,
 ): Promise<void> {
   if (isNativePlatform() || !isElectrobunRuntime() || !result.rollbackReceipt) {
+    return;
+  }
+  if (transaction) {
+    await abortRuntimeConnectionStorageTransaction(transaction);
     return;
   }
   const kind = PROTECTED_STORAGE_KIND.get(key);
@@ -762,6 +1480,7 @@ async function rollbackFailedDesktopProtectedStoreSet(
   const rollback = await desktopSecureStoreCompareAndRestore(
     kind,
     result.rollbackReceipt,
+    undefined,
   );
   if (!rollback?.ok) {
     throw new Error(
@@ -773,11 +1492,22 @@ async function rollbackFailedDesktopProtectedStoreSet(
 
 async function commitDesktopProtectedStoreReceipt(
   key: string,
-  rollbackReceipt: string,
+  authority: ProtectedStoreRollbackAuthority,
   expectedValue: string,
-  setRevision: number | undefined,
+  transaction?: RuntimeConnectionStorageTransactionState | null,
+  expectedStoredValue = expectedValue,
 ): Promise<void> {
   if (isNativePlatform() || !isElectrobunRuntime()) return;
+  if (
+    registerRuntimeConnectionTransactionReceipt(
+      transaction,
+      key,
+      expectedStoredValue,
+      authority,
+    )
+  ) {
+    return;
+  }
   const kind = PROTECTED_STORAGE_KIND.get(key);
   if (!kind) {
     throw new Error("Protected storage kind is not registered");
@@ -793,7 +1523,12 @@ async function commitDesktopProtectedStoreReceipt(
     attempt += 1
   ) {
     try {
-      committed = await desktopSecureStoreCommitReceipt(kind, rollbackReceipt);
+      committed = await desktopSecureStoreCommitReceipt(
+        kind,
+        authority.receipt,
+        authority.setRevision,
+        undefined,
+      );
       if (committed) break;
     } catch (error) {
       lastError = error;
@@ -803,7 +1538,7 @@ async function commitDesktopProtectedStoreReceipt(
     try {
       await reconcileAmbiguousDesktopProtectedStoreCommit(
         key,
-        { receipt: rollbackReceipt, setRevision },
+        authority,
         expectedValue,
       );
     } catch (reconciliationError) {
@@ -825,27 +1560,17 @@ async function commitDesktopProtectedStoreReceipt(
     );
   }
   acceptProtectedStorageHostRevision(key, committed.revision);
-  let authoritativeValue: string | null;
-  try {
-    authoritativeValue = await protectedStoreGet(key);
-  } catch (readbackError) {
-    if (committed.committed) {
-      try {
-        await reconcileAmbiguousDesktopProtectedStoreCommit(
-          key,
-          { receipt: rollbackReceipt, setRevision },
-          expectedValue,
-        );
-      } catch (reconciliationError) {
-        throw new AggregateError(
-          [readbackError, reconciliationError],
-          `Desktop protected storage could not safely reconcile commit readback for ${key}`,
-        );
-      }
-    }
-    throw readbackError;
+  if (!committed.committed) {
+    throw new ProtectedStorageWriteSupersededError(key);
   }
-  if (!committed.committed || authoritativeValue !== expectedValue) {
+  if (committed.publishable === false) {
+    throw new ProtectedStorageWriteSupersededError(key);
+  }
+  const authoritativeValue = decodeProtectedStorageValue(
+    key,
+    committed.value,
+  ).value;
+  if (authoritativeValue !== expectedValue) {
     throw new ProtectedStorageWriteSupersededError(key);
   }
 }
@@ -853,6 +1578,7 @@ async function commitDesktopProtectedStoreReceipt(
 async function compensateCommittedDesktopProtectedStoreReceipt(
   key: string,
   authority: ProtectedStoreRollbackAuthority & { expectedToken: string },
+  publishSnapshot = true,
 ): Promise<ProtectedStoreCompensationSnapshot> {
   if (isNativePlatform() || !isElectrobunRuntime()) {
     return { restored: false, value: null };
@@ -877,6 +1603,7 @@ async function compensateCommittedDesktopProtectedStoreReceipt(
         kind,
         authority.receipt,
         authority.setRevision,
+        undefined,
       );
       if (compensation) break;
     } catch (error) {
@@ -889,17 +1616,22 @@ async function compensateCommittedDesktopProtectedStoreReceipt(
       `Desktop protected storage could not compensate committed receipt for ${key}`,
     );
   }
-  applyProtectedStorageHostSnapshot(
-    key,
-    compensation.value,
-    compensation.revision,
-  );
+  if (publishSnapshot || compensation.restored) {
+    applyProtectedStorageHostSnapshot(
+      key,
+      compensation.value,
+      compensation.revision,
+    );
+  }
   // restored:false means a newer revision already owns the slot. That is the
   // correct CAS outcome and must never be overwritten by this older writer.
   return {
     restored: compensation.restored,
     revision: compensation.revision,
-    value: compensation.value,
+    value:
+      compensation.value === null
+        ? null
+        : decodeProtectedStorageValue(key, compensation.value).value,
   };
 }
 
@@ -923,11 +1655,15 @@ async function reconcileAmbiguousDesktopProtectedStoreCommit(
   if (Number.isSafeInteger(authority.setRevision)) {
     try {
       const compensation =
-        await compensateCommittedDesktopProtectedStoreReceipt(key, {
-          expectedToken: expectedValue,
-          receipt: authority.receipt,
-          setRevision: authority.setRevision as number,
-        });
+        await compensateCommittedDesktopProtectedStoreReceipt(
+          key,
+          {
+            expectedToken: expectedValue,
+            receipt: authority.receipt,
+            setRevision: authority.setRevision as number,
+          },
+          false,
+        );
       if (
         compensation.restored ||
         compensation.value !== expectedValue ||
@@ -956,6 +1692,7 @@ async function reconcileAmbiguousDesktopProtectedStoreCommit(
       rollback = await desktopSecureStoreCompareAndRestore(
         kind,
         authority.receipt,
+        undefined,
       );
       if (rollback) break;
     } catch (error) {
@@ -963,8 +1700,15 @@ async function reconcileAmbiguousDesktopProtectedStoreCommit(
     }
   }
   if (rollback?.ok) {
-    applyProtectedStorageHostSnapshot(key, rollback.value, rollback.revision);
-    if (rollback.restored || rollback.value !== expectedValue) return;
+    const rollbackValue =
+      rollback.value === null
+        ? null
+        : decodeProtectedStorageValue(key, rollback.value).value;
+    if (rollback.restored) {
+      applyProtectedStorageHostSnapshot(key, rollback.value, rollback.revision);
+      return;
+    }
+    if (rollbackValue !== expectedValue) return;
     rollbackError = new Error(
       `Desktop protected storage still contains the ambiguous value for ${key}`,
     );
@@ -1003,7 +1747,7 @@ async function protectedStoreDelete(key: string): Promise<void> {
     throw new Error("Native protected storage rejected deletion");
   }
   if (isElectrobunRuntime()) {
-    const result = await desktopSecureStoreDelete(kind);
+    const result = await desktopSecureStoreDelete(kind, undefined);
     if (result?.ok || result?.reason === "not_found") return;
     throw new Error("Desktop protected storage rejected deletion");
   }
@@ -1202,9 +1946,15 @@ export async function initializeStorageBridge(): Promise<void> {
   if (isProtectedStorageHost()) {
     for (const key of PROTECTED_STORAGE_KIND.keys()) {
       try {
-        const protectedValue = await protectedStoreGet(key);
+        let stewardScope: string | null | undefined;
+        const protectedValue = await protectedStoreGet(key, null, (scope) => {
+          stewardScope = scope;
+        });
         if (protectedValue !== null) {
           cacheProtectedStorageValue(key, protectedValue);
+          if (key === STEWARD_TOKEN_KEY && stewardScope !== undefined) {
+            synchronizeStewardTokenScope(stewardScope);
+          }
           originalRemoveItem(key);
           if (isNativePlatform()) {
             const { Preferences } = await loadPreferences();
@@ -1233,9 +1983,13 @@ export async function initializeStorageBridge(): Promise<void> {
         if (stored.rollbackReceipt) {
           await commitDesktopProtectedStoreReceipt(
             key,
-            stored.rollbackReceipt,
+            {
+              receipt: stored.rollbackReceipt,
+              setRevision: stored.setRevision as number,
+            },
             legacyValue,
-            stored.setRevision,
+            null,
+            stored.storedValue ?? legacyValue,
           );
         }
         if (protectedStorageMutationVersion.get(key) === migrationVersion) {
@@ -1328,9 +2082,13 @@ function setupStorageProxy(): void {
             if (stored.rollbackReceipt) {
               await commitDesktopProtectedStoreReceipt(
                 key,
-                stored.rollbackReceipt,
+                {
+                  receipt: stored.rollbackReceipt,
+                  setRevision: stored.setRevision as number,
+                },
                 value,
-                stored.setRevision,
+                null,
+                stored.storedValue ?? value,
               );
             }
             if (protectedStorageMutationVersion.get(key) === writeVersion) {
@@ -1492,7 +2250,10 @@ function setupStorageProxy(): void {
  */
 export async function getStorageValue(key: string): Promise<string | null> {
   if (isProtectedStorageHost() && PROTECTED_STORAGE_KIND.has(key)) {
-    const value = await protectedStoreGet(key);
+    let stewardScope: string | null | undefined;
+    const value = await protectedStoreGet(key, null, (scope) => {
+      stewardScope = scope;
+    });
     if (value === null) {
       // The secure host is authoritative. Falling back to a renderer-local
       // cache after `not_found` resurrects credentials removed by another
@@ -1501,6 +2262,9 @@ export async function getStorageValue(key: string): Promise<string | null> {
       return null;
     }
     cacheProtectedStorageValue(key, value);
+    if (key === STEWARD_TOKEN_KEY && stewardScope !== undefined) {
+      synchronizeStewardTokenScope(stewardScope);
+    }
     return value;
   }
   if (isNativePlatform() && SYNCED_KEYS.has(key)) {
@@ -1515,27 +2279,50 @@ export async function getStorageValue(key: string): Promise<string | null> {
 async function persistStorageValue(
   key: string,
   value: string,
+  context: PersistStorageValueContext = {},
 ): Promise<PersistedStorageValue> {
   if (isProtectedStorageHost() && PROTECTED_STORAGE_KIND.has(key)) {
+    const transaction = context.transaction
+      ? requireActiveRuntimeConnectionTransaction(context.transaction)
+      : null;
+    const preparedValue = encodeProtectedStorageValue(
+      key,
+      value,
+      context.stewardScope,
+    );
+    await stageActiveRuntimeConnectionParticipant(
+      transaction,
+      key,
+      preparedValue,
+    );
     const mutationVersion = markProtectedStorageMutation(key);
-    const result = await serializedProtectedStoreSet(key, value);
+    const result = await serializedProtectedStoreSet(
+      key,
+      value,
+      transaction,
+      context.stewardScope,
+    );
     if (!result.stored) {
       throw new Error(`Protected storage rejected write for ${key}`);
     }
-    if (protectedStorageMutationVersion.get(key) === mutationVersion) {
+    if (
+      !transaction &&
+      protectedStorageMutationVersion.get(key) === mutationVersion
+    ) {
       cacheProtectedStorageValue(key, value);
     }
     if (!result.rollbackReceipt) {
       return {
         mutationVersion,
         rollbackAuthority: null,
+        storedValue: result.storedValue ?? preparedValue,
         ...(Object.hasOwn(result, "predecessor")
           ? { previousValue: result.predecessor }
           : {}),
       };
     }
     if (!Number.isSafeInteger(result.setRevision)) {
-      await rollbackFailedDesktopProtectedStoreSet(key, result);
+      await rollbackFailedDesktopProtectedStoreSet(key, result, transaction);
       throw new Error(`Protected storage did not return a revision for ${key}`);
     }
     return {
@@ -1544,6 +2331,7 @@ async function persistStorageValue(
         receipt: result.rollbackReceipt,
         setRevision: result.setRevision as number,
       },
+      storedValue: result.storedValue ?? preparedValue,
     };
   }
   // Privileged: this is the shell-side persistence helper (session/auth/
@@ -1557,7 +2345,12 @@ async function persistStorageValue(
     const { Preferences } = await loadPreferences();
     await Preferences.set({ key, value });
   }
-  return { mutationVersion, previousValue, rollbackAuthority: null };
+  return {
+    mutationVersion,
+    previousValue,
+    rollbackAuthority: null,
+    storedValue: value,
+  };
 }
 
 /**
@@ -1567,13 +2360,17 @@ export async function setStorageValue(
   key: string,
   value: string,
 ): Promise<void> {
-  const { rollbackAuthority } = await persistStorageValue(key, value);
+  const { rollbackAuthority, storedValue } = await persistStorageValue(
+    key,
+    value,
+  );
   if (rollbackAuthority) {
     await commitDesktopProtectedStoreReceipt(
       key,
-      rollbackAuthority.receipt,
+      rollbackAuthority,
       value,
-      rollbackAuthority.setRevision,
+      null,
+      storedValue,
     );
   }
 }
@@ -1592,7 +2389,14 @@ export async function setStorageValueWithCompensation(
   if (options.validate?.() === false) return null;
   const compensateOnValidationFailure =
     options.compensateOnValidationFailure !== false;
-  const persisted = await persistStorageValue(key, value);
+  const transaction = options.runtimeConnectionTransaction
+    ? requireActiveRuntimeConnectionTransaction(
+        options.runtimeConnectionTransaction,
+      )
+    : null;
+  const persisted = await persistStorageValue(key, value, {
+    ...(transaction ? { transaction } : {}),
+  });
   const compensate = async (): Promise<boolean> => {
     if (
       protectedStorageMutationVersion.get(key) !== persisted.mutationVersion
@@ -1600,6 +2404,21 @@ export async function setStorageValueWithCompensation(
       return false;
     }
     if (persisted.rollbackAuthority) {
+      const transactionReceipt = persisted.rollbackAuthority.transactionReceipt;
+      if (transactionReceipt?.phase === "aborted") return true;
+      if (
+        transactionReceipt?.phase === "prepared" ||
+        transactionReceipt?.phase === "committed"
+      ) {
+        return abortRuntimeConnectionStorageTransaction(
+          transactionReceipt.transaction,
+        );
+      }
+      if (transactionReceipt?.phase === "finished") {
+        return compensateFinishedRuntimeConnectionStorageTransaction(
+          transactionReceipt.transaction,
+        );
+      }
       const compensation =
         await compensateCommittedDesktopProtectedStoreReceipt(key, {
           ...persisted.rollbackAuthority,
@@ -1616,20 +2435,25 @@ export async function setStorageValueWithCompensation(
 
   if (persisted.rollbackAuthority) {
     if (options.validate?.() === false && compensateOnValidationFailure) {
-      await compareAndRestoreStorageValue(
-        key,
-        value,
-        null,
-        persisted.rollbackAuthority.receipt,
-      );
+      if (transaction) {
+        await abortRuntimeConnectionStorageTransaction(transaction);
+      } else {
+        await compareAndRestoreStorageValue(
+          key,
+          value,
+          null,
+          persisted.rollbackAuthority.receipt,
+        );
+      }
       return null;
     }
     try {
       await commitDesktopProtectedStoreReceipt(
         key,
-        persisted.rollbackAuthority.receipt,
+        persisted.rollbackAuthority,
         value,
-        persisted.rollbackAuthority.setRevision,
+        transaction,
+        persisted.storedValue,
       );
     } catch (error) {
       if (error instanceof ProtectedStorageWriteSupersededError) return null;
@@ -1668,21 +2492,29 @@ export async function setStorageValueIfCurrent(
     if (!isNativePlatform() && isElectrobunRuntime()) {
       const kind = PROTECTED_STORAGE_KIND.get(key);
       if (!kind) throw new Error("Protected storage kind is not registered");
-      const snapshot = await desktopSecureStoreGet(kind);
+      const snapshot = await desktopSecureStoreGet(kind, undefined);
       if (!snapshot) {
         throw new Error("Desktop protected storage is unavailable");
       }
-      const snapshotValue = snapshot.ok
+      const snapshotStoredValue = snapshot.ok
         ? typeof snapshot.value === "string"
           ? snapshot.value
           : null
         : snapshot.reason === "not_found"
           ? null
           : undefined;
-      if (snapshotValue === undefined) {
+      if (snapshotStoredValue === undefined) {
         throw new Error("Desktop protected storage is unavailable");
       }
-      applyProtectedStorageHostSnapshot(key, snapshotValue, snapshot.revision);
+      applyProtectedStorageHostSnapshot(
+        key,
+        snapshotStoredValue,
+        snapshot.revision,
+      );
+      const snapshotValue =
+        snapshotStoredValue === null
+          ? null
+          : decodeProtectedStorageValue(key, snapshotStoredValue).value;
       if (
         snapshotValue !== expectedValue ||
         options.validate?.() === false ||
@@ -1692,6 +2524,7 @@ export async function setStorageValueIfCurrent(
       }
 
       const mutationId = createProtectedStorageMutationId();
+      const storedValue = encodeProtectedStorageValue(key, value);
       let transformed: Awaited<
         ReturnType<typeof desktopSecureStoreCompareAndSet>
       > = null;
@@ -1706,10 +2539,11 @@ export async function setStorageValueIfCurrent(
         try {
           transformed = await desktopSecureStoreCompareAndSet(
             kind,
-            expectedValue,
-            value,
+            snapshotStoredValue as string,
+            storedValue,
             snapshot.revision as number,
             mutationId,
+            undefined,
           );
           if (transformed) break;
         } catch (error) {
@@ -1720,10 +2554,11 @@ export async function setStorageValueIfCurrent(
         try {
           transformed = await desktopSecureStoreCompareAndSet(
             kind,
-            expectedValue,
-            value,
+            snapshotStoredValue as string,
+            storedValue,
             snapshot.revision as number,
             mutationId,
+            undefined,
           );
         } catch (error) {
           transformError = error;
@@ -1829,21 +2664,29 @@ export async function removeStorageValueIfCurrent(
     if (isElectrobunRuntime() && !isNativePlatform()) {
       const kind = PROTECTED_STORAGE_KIND.get(key);
       if (!kind) throw new Error("Protected storage kind is not registered");
-      const snapshot = await desktopSecureStoreGet(kind);
+      const snapshot = await desktopSecureStoreGet(kind, undefined);
       if (!snapshot) {
         throw new Error("Desktop protected storage is unavailable");
       }
-      const snapshotValue = snapshot.ok
+      const snapshotStoredValue = snapshot.ok
         ? typeof snapshot.value === "string"
           ? snapshot.value
           : null
         : snapshot.reason === "not_found"
           ? null
           : undefined;
-      if (snapshotValue === undefined) {
+      if (snapshotStoredValue === undefined) {
         throw new Error("Desktop protected storage is unavailable");
       }
-      applyProtectedStorageHostSnapshot(key, snapshotValue, snapshot.revision);
+      applyProtectedStorageHostSnapshot(
+        key,
+        snapshotStoredValue,
+        snapshot.revision,
+      );
+      const snapshotValue =
+        snapshotStoredValue === null
+          ? null
+          : decodeProtectedStorageValue(key, snapshotStoredValue).value;
       if (
         snapshotValue !== expectedValue ||
         options.validate?.() === false ||
@@ -1867,9 +2710,10 @@ export async function removeStorageValueIfCurrent(
         try {
           deletion = await desktopSecureStoreCompareAndDelete(
             kind,
-            expectedValue,
+            snapshotStoredValue,
             snapshot.revision as number,
             deletionMutationId,
+            undefined,
           );
           if (deletion) break;
         } catch (error) {
@@ -1884,9 +2728,10 @@ export async function removeStorageValueIfCurrent(
           // an unrelated renderer B deletion by revision arithmetic.
           deletion = await desktopSecureStoreCompareAndDelete(
             kind,
-            expectedValue,
+            snapshotStoredValue,
             snapshot.revision as number,
             deletionMutationId,
+            undefined,
           );
         } catch (error) {
           deletionError = error;
@@ -1953,83 +2798,140 @@ registerStewardTokenRemoval(async (options) => {
   await removeStorageValue(STEWARD_TOKEN_KEY);
   return true;
 });
-registerStewardTokenPersistence(async (token) => {
-  // The Shared writer validates its canonical localStorage facade after the
-  // awaited host commit. Install that facade synchronously even if an early
-  // native login races full bridge hydration; plaintext storage is never used.
-  setupStorageProxy();
-  const persisted = await persistStorageValue(STEWARD_TOKEN_KEY, token);
-  let committed = false;
-  let restoration: Promise<boolean> | null = null;
-
-  const restorePredecessor = (_validate?: () => boolean): Promise<boolean> => {
-    if (restoration) return restoration;
-    const operation = (async () => {
-      // Same-renderer native/browser ABA is fenced by the per-key generation.
-      // Electrobun additionally binds every rollback to its opaque host receipt
-      // and exact SET revision, so another renderer's same bytes cannot match.
-      // Once that exact CAS is acquired, the boolean remains true even if the
-      // caller's validator changes while the RPC is in flight; Shared uses it
-      // to restore subordinate state without guessing from same-value bytes.
-      if (
-        protectedStorageMutationVersion.get(STEWARD_TOKEN_KEY) !==
-        persisted.mutationVersion
-      ) {
-        return false;
+registerStewardTokenPersistence(
+  async (token, context: StewardTokenHostPersistenceContext) => {
+    // The Shared writer validates its canonical localStorage facade after the
+    // awaited host commit. Install that facade synchronously even if an early
+    // native login races full bridge hydration; plaintext storage is never used.
+    setupStorageProxy();
+    const transaction = context.hostContext
+      ? requireActiveRuntimeConnectionTransaction(
+          context.hostContext as RuntimeConnectionStorageTransaction,
+        )
+      : null;
+    if (transaction) {
+      const captured = transaction.stewardPredecessorScope;
+      if (captured && captured.value !== context.previousScope) {
+        throw new Error(
+          "Runtime connection transaction Steward predecessor scope changed",
+        );
       }
-      if (persisted.rollbackAuthority) {
-        if (committed) {
-          const compensation =
-            await compensateCommittedDesktopProtectedStoreReceipt(
-              STEWARD_TOKEN_KEY,
-              {
-                ...persisted.rollbackAuthority,
-                expectedToken: token,
-              },
+      transaction.stewardPredecessorScope = {
+        value: context.previousScope,
+      };
+    }
+    const persisted = await persistStorageValue(STEWARD_TOKEN_KEY, token, {
+      stewardScope: context.requiredScope,
+      ...(transaction ? { transaction } : {}),
+    });
+    let committed = false;
+    let commitAttempted = false;
+    let restoration: Promise<boolean> | null = null;
+
+    const restorePredecessor = (
+      _validate?: () => boolean,
+    ): Promise<boolean> => {
+      if (restoration) return restoration;
+      const operation = (async () => {
+        // Same-renderer native/browser ABA is fenced by the per-key generation.
+        // Electrobun additionally binds every rollback to its opaque host receipt
+        // and exact SET revision, so another renderer's same bytes cannot match.
+        // Once that exact CAS is acquired, the boolean remains true even if the
+        // caller's validator changes while the RPC is in flight; Shared uses it
+        // to restore subordinate state without guessing from same-value bytes.
+        if (
+          protectedStorageMutationVersion.get(STEWARD_TOKEN_KEY) !==
+          persisted.mutationVersion
+        ) {
+          return false;
+        }
+        if (persisted.rollbackAuthority) {
+          const transactionReceipt =
+            persisted.rollbackAuthority.transactionReceipt;
+          if (
+            transactionReceipt &&
+            (transactionReceipt.phase === "prepared" ||
+              transactionReceipt.phase === "committed")
+          ) {
+            return abortRuntimeConnectionStorageTransaction(
+              transactionReceipt.transaction,
             );
-          return compensation.restored;
+          }
+          if (transactionReceipt?.phase === "aborted") return true;
+          if (transactionReceipt?.phase === "finished") {
+            return compensateFinishedRuntimeConnectionStorageTransaction(
+              transactionReceipt.transaction,
+            );
+          }
+          if (committed || commitAttempted) {
+            const compensation =
+              await compensateCommittedDesktopProtectedStoreReceipt(
+                STEWARD_TOKEN_KEY,
+                {
+                  ...persisted.rollbackAuthority,
+                  expectedToken: token,
+                },
+                false,
+              );
+            if (compensation.restored) return true;
+            if (compensation.value !== token) return false;
+          }
+          return compareAndRestoreStorageValue(
+            STEWARD_TOKEN_KEY,
+            token,
+            null,
+            persisted.rollbackAuthority.receipt,
+          );
         }
         return compareAndRestoreStorageValue(
           STEWARD_TOKEN_KEY,
           token,
-          null,
-          persisted.rollbackAuthority.receipt,
+          persisted.previousValue ?? null,
         );
-      }
-      return compareAndRestoreStorageValue(
-        STEWARD_TOKEN_KEY,
-        token,
-        persisted.previousValue ?? null,
-      );
-    })();
-    restoration = operation;
-    void operation.catch(() => {
-      if (restoration === operation) restoration = null;
-    });
-    return operation;
-  };
+      })();
+      restoration = operation;
+      void operation.catch(() => {
+        if (restoration === operation) restoration = null;
+      });
+      return operation;
+    };
 
-  return {
-    async commit(validate) {
-      if (validate?.() === false) return;
-      if (!persisted.rollbackAuthority) {
+    return {
+      async commit(validate) {
+        if (validate?.() === false) return;
+        if (!persisted.rollbackAuthority) {
+          committed = true;
+          return;
+        }
+        commitAttempted = true;
+        await commitDesktopProtectedStoreReceipt(
+          STEWARD_TOKEN_KEY,
+          persisted.rollbackAuthority,
+          token,
+          transaction,
+          persisted.storedValue,
+        );
+        const transactionReceipt =
+          persisted.rollbackAuthority.transactionReceipt;
+        if (transactionReceipt?.phase === "prepared") {
+          // This durable WAL decision deliberately precedes Shared's
+          // finalizeBeforePublish hook. A process death after this line is
+          // recovered by rolling all three protected records forward; an
+          // in-process finalizer failure invokes restorePredecessor above, which
+          // first records phase=aborting and restores the three predecessors.
+          await decideRuntimeConnectionStorageTransaction(
+            transactionReceipt.transaction,
+          );
+        }
         committed = true;
-        return;
-      }
-      await commitDesktopProtectedStoreReceipt(
-        STEWARD_TOKEN_KEY,
-        persisted.rollbackAuthority.receipt,
-        token,
-        persisted.rollbackAuthority.setRevision,
-      );
-      committed = true;
-      // A newer renderer can plant its marker while the commit RPC awaits.
-      // Restore through this exact tombstone before shared code can publish.
-      if (validate?.() === false) await restorePredecessor();
-    },
-    restorePredecessor,
-  };
-});
+        // A newer renderer can plant its marker while the commit RPC awaits.
+        // Restore through this exact tombstone before shared code can publish.
+        if (validate?.() === false) await restorePredecessor();
+      },
+      restorePredecessor,
+    };
+  },
+);
 registerStewardTokenCompareAndRestore(async (expectedToken, restoreToken) => {
   if (
     isElectrobunRuntime() &&

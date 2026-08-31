@@ -9,12 +9,16 @@
  */
 
 import { StewardApiError } from "@stwd/sdk";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import type { ReactNode } from "react";
+import { type ReactNode, StrictMode } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { readStewardSessionRecovery } from "../../../lib/steward-session-recovery-marker";
+import {
+  beginStewardSessionRecovery,
+  completeStewardSessionRecovery,
+  readStewardSessionRecovery,
+} from "../../../lib/steward-session-recovery-marker";
 
 const callbackState = vi.hoisted(() => ({
   verifyEmailCallback:
@@ -41,6 +45,21 @@ function deferred<T>() {
     reject = rejectPromise;
   });
   return { promise, resolve, reject };
+}
+
+function jwtFor(userId: string): string {
+  const payload = btoa(JSON.stringify({ sub: userId, tenantId: "elizacloud" }))
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+  return `header.${payload}.signature`;
+}
+
+function setDocumentCookie(value: string): void {
+  Object.getOwnPropertyDescriptor(Document.prototype, "cookie")?.set?.call(
+    document,
+    value,
+  );
 }
 
 // Stub StewardAuthProvider with a marker that ALSO supplies the Steward context
@@ -118,7 +137,18 @@ beforeEach(() => {
   callbackState.publishComplete.mockReset();
   callbackState.isAuthenticated = false;
   sessionSpies.sync.mockReset();
-  sessionSpies.sync.mockResolvedValue(undefined);
+  sessionSpies.sync.mockImplementation(
+    async (
+      token: string,
+      _refreshToken?: string,
+      options?: {
+        finalizeBeforePublish?: () => (durableRestored: boolean) => void;
+      },
+    ) => {
+      window.localStorage.setItem("steward_session_token", token);
+      options?.finalizeBeforePublish?.();
+    },
+  );
   window.sessionStorage.clear();
   window.localStorage.clear();
 });
@@ -195,6 +225,139 @@ describe("EmailCallbackPage", () => {
     );
   });
 
+  it("finishes the single-flight magic-link publication through the StrictMode effect replay", async () => {
+    const verification = deferred<{
+      token: string;
+      refreshToken?: string;
+    }>();
+    callbackState.verifyEmailCallback.mockReturnValue(verification.promise);
+
+    render(
+      <StrictMode>
+        <MemoryRouter
+          initialEntries={[
+            "/auth/callback/email?token=strict-publication&email=strict-publication%40example.com",
+          ]}
+        >
+          <EmailCallbackPage />
+        </MemoryRouter>
+      </StrictMode>,
+    );
+
+    await waitFor(() =>
+      expect(callbackState.verifyEmailCallback).toHaveBeenCalledTimes(1),
+    );
+    await act(async () => {
+      verification.resolve({
+        token: "strict-publication-session-token",
+        refreshToken: "strict-publication-refresh-token",
+      });
+      await verification.promise;
+    });
+
+    expect(await screen.findByText("Signed in")).toBeTruthy();
+    expect(callbackState.verifyEmailCallback).toHaveBeenCalledTimes(1);
+    expect(sessionSpies.sync).toHaveBeenCalledTimes(1);
+    expect(callbackState.publishComplete).toHaveBeenCalledTimes(1);
+  });
+
+  it("plants callback A before verification so a completed login B cannot be overwritten", async () => {
+    const verification = deferred<{
+      token: string;
+      refreshToken?: string;
+    }>();
+    callbackState.verifyEmailCallback.mockReturnValue(verification.promise);
+
+    render(
+      <MemoryRouter
+        initialEntries={[
+          "/auth/callback/email?token=delayed-a&email=a%40example.com",
+        ]}
+      >
+        <EmailCallbackPage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() =>
+      expect(callbackState.verifyEmailCallback).toHaveBeenCalledOnce(),
+    );
+    const callbackA = readStewardSessionRecovery("elizacloud");
+    expect(callbackA.receipts).toHaveLength(1);
+    const loginB = beginStewardSessionRecovery("elizacloud", "provider");
+    window.localStorage.setItem("steward_session_token", "account-b-token");
+    completeStewardSessionRecovery(loginB);
+
+    verification.resolve({ token: "account-a-token" });
+
+    expect(
+      await screen.findByText(/newer sign-in superseded this email callback/i),
+    ).toBeTruthy();
+    expect(sessionSpies.sync).not.toHaveBeenCalled();
+    expect(callbackState.publishComplete).not.toHaveBeenCalled();
+    expect(window.localStorage.getItem("steward_session_token")).toBe(
+      "account-b-token",
+    );
+    expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([]);
+  });
+
+  it("publishes callback completion once when the first mount is replaced", async () => {
+    const verification = deferred<{
+      token: string;
+      refreshToken?: string;
+    }>();
+    callbackState.verifyEmailCallback.mockReturnValue(verification.promise);
+    const route =
+      "/auth/callback/email?token=remount-token&email=remount%40example.com";
+    const firstMount = render(
+      <MemoryRouter initialEntries={[route]}>
+        <EmailCallbackPage />
+      </MemoryRouter>,
+    );
+    await waitFor(() =>
+      expect(callbackState.verifyEmailCallback).toHaveBeenCalledTimes(1),
+    );
+    firstMount.unmount();
+
+    render(
+      <MemoryRouter initialEntries={[route]}>
+        <EmailCallbackPage />
+      </MemoryRouter>,
+    );
+    verification.resolve({ token: "remount-session-token" });
+
+    await waitFor(() =>
+      expect(callbackState.publishComplete).toHaveBeenCalledTimes(1),
+    );
+    expect(callbackState.verifyEmailCallback).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not reverify or republish a completed callback after remount", async () => {
+    callbackState.verifyEmailCallback.mockResolvedValue({
+      token: "completed-remount-session-token",
+    });
+    const route =
+      "/auth/callback/email?token=completed-remount&email=completed%40example.com";
+    const firstMount = render(
+      <MemoryRouter initialEntries={[route]}>
+        <EmailCallbackPage />
+      </MemoryRouter>,
+    );
+    await waitFor(() =>
+      expect(callbackState.publishComplete).toHaveBeenCalledTimes(1),
+    );
+    firstMount.unmount();
+
+    render(
+      <MemoryRouter initialEntries={[route]}>
+        <EmailCallbackPage />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText("Signed in")).toBeTruthy();
+    expect(callbackState.verifyEmailCallback).toHaveBeenCalledTimes(1);
+    expect(callbackState.publishComplete).toHaveBeenCalledTimes(1);
+  });
+
   it("identifies an upstream one-time-link rejection as expired or already used", async () => {
     callbackState.verifyEmailCallback.mockRejectedValue(
       new StewardApiError("Invalid or expired magic link", 410),
@@ -238,6 +401,106 @@ describe("EmailCallbackPage", () => {
     await waitFor(() =>
       expect(callbackState.verifyEmailCallback).toHaveBeenCalledTimes(2),
     );
+  });
+
+  it("retires callback recovery when verification fails before cookie dispatch", async () => {
+    callbackState.verifyEmailCallback.mockRejectedValue(
+      new Error("Verification transport unavailable"),
+    );
+
+    render(
+      <MemoryRouter
+        initialEntries={[
+          "/auth/callback/email?token=pre-dispatch-failure&email=pre-dispatch%40example.com",
+        ]}
+      >
+        <EmailCallbackPage />
+      </MemoryRouter>,
+    );
+
+    expect(
+      await screen.findByText("Verification transport unavailable"),
+    ).toBeTruthy();
+    expect(sessionSpies.sync).not.toHaveBeenCalled();
+    expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([]);
+  });
+
+  it("keeps a tab-closed email verification reservation block-only before cookie dispatch", async () => {
+    const verification = deferred<{
+      token: string;
+      refreshToken?: string;
+    }>();
+    callbackState.verifyEmailCallback.mockReturnValue(verification.promise);
+    setDocumentCookie("steward-authed=1; path=/");
+
+    const mounted = render(
+      <MemoryRouter
+        initialEntries={[
+          "/auth/callback/email?token=pre-cookie-email-link&email=pre-cookie%40example.com",
+        ]}
+      >
+        <EmailCallbackPage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() =>
+      expect(callbackState.verifyEmailCallback).toHaveBeenCalledOnce(),
+    );
+    const beforeClose = readStewardSessionRecovery("elizacloud");
+    expect(beforeClose).toMatchObject({
+      receipts: [expect.any(String)],
+      currentReceiptPhase: "reserved",
+      expectedIdentity: null,
+    });
+    expect(sessionSpies.sync).not.toHaveBeenCalled();
+    expect(window.localStorage.getItem("steward_session_token")).toBeNull();
+
+    mounted.unmount();
+    window.sessionStorage.clear();
+
+    expect(readStewardSessionRecovery("elizacloud")).toEqual(beforeClose);
+    expect(window.localStorage.getItem("steward_session_token")).toBeNull();
+    setDocumentCookie("steward-authed=; Max-Age=0; path=/");
+  });
+
+  it("retires callback recovery when steward-session returns 500 after a stale cookie", async () => {
+    setDocumentCookie("steward-authed=1; path=/");
+    callbackState.verifyEmailCallback.mockResolvedValue({
+      token: "fresh-callback-account-b",
+    });
+    sessionSpies.sync.mockRejectedValueOnce(
+      Object.assign(new Error("Session service unavailable"), { status: 500 }),
+    );
+    const syncEvents: Event[] = [];
+    const onSync = (event: Event) => syncEvents.push(event);
+    window.addEventListener("steward-token-sync", onSync);
+
+    try {
+      render(
+        <MemoryRouter
+          initialEntries={[
+            "/auth/callback/email?token=account-b-link&email=b%40example.com",
+          ]}
+        >
+          <EmailCallbackPage />
+        </MemoryRouter>,
+      );
+
+      expect(
+        await screen.findByText("Session service unavailable"),
+      ).toBeTruthy();
+      expect(sessionSpies.sync).toHaveBeenCalledWith(
+        "fresh-callback-account-b",
+        undefined,
+        expect.any(Object),
+      );
+      expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([]);
+      expect(window.localStorage.getItem("steward_session_token")).toBeNull();
+      expect(syncEvents).toEqual([]);
+    } finally {
+      window.removeEventListener("steward-token-sync", onSync);
+      setDocumentCookie("steward-authed=; Max-Age=0; path=/");
+    }
   });
 
   it("resends an expired callback as a fresh challenge and shows the cooldown", async () => {
@@ -291,7 +554,7 @@ describe("EmailCallbackPage", () => {
     render(
       <MemoryRouter
         initialEntries={[
-          "/auth/callback/email?token=one-time-token&email=person%40example.com",
+          "/auth/callback/email?token=backslash-state-token&email=person%40example.com",
         ]}
       >
         <EmailCallbackPage />
@@ -308,6 +571,7 @@ describe("EmailCallbackPage", () => {
       "private-session-token",
       "private-refresh-token",
       expect.objectContaining({
+        finalizeBeforePublish: expect.any(Function),
         mutationLease: expect.any(Object),
         validate: expect.any(Function),
       }),
@@ -320,13 +584,139 @@ describe("EmailCallbackPage", () => {
     ).not.toContain("private-session-token");
   });
 
+  it("retires callback A before publication and preserves reentrant login B", async () => {
+    callbackState.verifyEmailCallback.mockResolvedValue({
+      token: "callback-account-a",
+    });
+    let recoveryB: ReturnType<typeof beginStewardSessionRecovery> | undefined;
+    let receiptsAtPublication: readonly string[] | undefined;
+    sessionSpies.sync.mockImplementationOnce(
+      async (
+        token: string,
+        _refreshToken?: string,
+        options?: {
+          finalizeBeforePublish?: () => (durableRestored: boolean) => void;
+        },
+      ) => {
+        window.localStorage.setItem("steward_session_token", token);
+        expect(options?.finalizeBeforePublish?.()).toEqual(
+          expect.any(Function),
+        );
+        receiptsAtPublication =
+          readStewardSessionRecovery("elizacloud").receipts;
+        recoveryB = beginStewardSessionRecovery("elizacloud", "provider");
+      },
+    );
+
+    render(
+      <MemoryRouter
+        initialEntries={[
+          "/auth/callback/email?token=callback-a&email=a%40example.com",
+        ]}
+      >
+        <EmailCallbackPage />
+      </MemoryRouter>,
+    );
+
+    expect(
+      await screen.findByText(
+        "A newer sign-in superseded this email callback. Restore the latest browser session before continuing.",
+      ),
+    ).toBeTruthy();
+    expect(receiptsAtPublication).toEqual([]);
+    expect(recoveryB).toBeDefined();
+    expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([
+      recoveryB?.receipt,
+    ]);
+    expect(callbackState.publishComplete).not.toHaveBeenCalled();
+  });
+
+  it("does not finish callback A when token-sync queues login B", async () => {
+    callbackState.verifyEmailCallback.mockResolvedValue({
+      token: "callback-account-a",
+    });
+    let recoveryB: ReturnType<typeof beginStewardSessionRecovery> | undefined;
+    const onSync = () => {
+      queueMicrotask(() => {
+        recoveryB = beginStewardSessionRecovery("elizacloud", "provider");
+      });
+    };
+    window.addEventListener("steward-token-sync", onSync, { once: true });
+
+    try {
+      render(
+        <MemoryRouter
+          initialEntries={[
+            "/auth/callback/email?token=callback-a&email=a%40example.com",
+          ]}
+        >
+          <EmailCallbackPage />
+        </MemoryRouter>,
+      );
+
+      expect(
+        await screen.findByText(
+          "A newer sign-in superseded this email callback. Restore the latest browser session before continuing.",
+        ),
+      ).toBeTruthy();
+    } finally {
+      window.removeEventListener("steward-token-sync", onSync);
+    }
+
+    expect(recoveryB?.preexistingReceipts).toEqual([]);
+    expect(callbackState.publishComplete).not.toHaveBeenCalled();
+  });
+
+  it("never paints callback A success when completion queues login B", async () => {
+    callbackState.verifyEmailCallback.mockResolvedValue({
+      token: "completion-account-a",
+    });
+    callbackState.publishComplete.mockImplementationOnce(() => {
+      queueMicrotask(() => {
+        beginStewardSessionRecovery("elizacloud", "provider");
+      });
+    });
+
+    render(
+      <MemoryRouter
+        initialEntries={[
+          "/auth/callback/email?token=completion-a&email=completion%40example.com",
+        ]}
+      >
+        <EmailCallbackPage />
+      </MemoryRouter>,
+    );
+
+    expect(
+      await screen.findByText(
+        "A newer sign-in superseded this email callback. Restore the latest browser session before continuing.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText("Signed in")).toBeNull();
+  });
+
   it("keeps a durable ambiguity receipt when the tab closes after cookie dispatch", async () => {
     const cookieCommit = deferred<void>();
+    const accountBToken = jwtFor("tab-close-account-b");
     callbackState.verifyEmailCallback.mockResolvedValue({
-      token: "tab-close-session-token",
+      token: accountBToken,
       refreshToken: "tab-close-refresh-token",
     });
-    sessionSpies.sync.mockReturnValue(cookieCommit.promise);
+    sessionSpies.sync.mockImplementationOnce(
+      async (
+        token: string,
+        _refreshToken?: string,
+        options?: {
+          validate?: () => boolean;
+          finalizeBeforePublish?: () => (durableRestored: boolean) => void;
+        },
+      ) => {
+        await cookieCommit.promise;
+        if (options?.validate?.() === false) return;
+        window.localStorage.setItem("steward_session_token", token);
+        options?.finalizeBeforePublish?.();
+      },
+    );
 
     const mounted = render(
       <MemoryRouter
@@ -340,7 +730,14 @@ describe("EmailCallbackPage", () => {
 
     await waitFor(() => expect(sessionSpies.sync).toHaveBeenCalledTimes(1));
     const beforeClose = readStewardSessionRecovery("elizacloud");
-    expect(beforeClose.receipts).toHaveLength(1);
+    expect(beforeClose).toMatchObject({
+      receipts: [expect.any(String)],
+      currentReceiptPhase: "cookie_pending",
+      expectedIdentity: {
+        userId: "tab-close-account-b",
+        tenantId: "elizacloud",
+      },
+    });
 
     mounted.unmount();
     window.sessionStorage.clear();
@@ -543,6 +940,91 @@ describe("EmailCallbackPage", () => {
     expect(document.documentElement.dataset.emailCallbackDocument).toBe(
       "survived",
     );
+  });
+
+  it("blocks the manual success continuation when login B starts after callback A", async () => {
+    const user = userEvent.setup();
+    storePendingOAuthReturnTo(
+      new URLSearchParams({ returnTo: "/get-started" }),
+    );
+    callbackState.verifyEmailCallback.mockResolvedValue({
+      token: "verified-account-a",
+    });
+
+    render(
+      <MemoryRouter
+        initialEntries={[
+          "/auth/callback/email?token=manual-a&email=manual%40b.co",
+        ]}
+      >
+        <Routes>
+          <Route path="/auth/callback/email" element={<EmailCallbackPage />} />
+          <Route path="/get-started" element={<div>continued in place</div>} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    const continueButton = await screen.findByRole("button", {
+      name: "Continue",
+    });
+    beginStewardSessionRecovery("elizacloud", "provider");
+    await user.click(continueButton);
+
+    expect(screen.queryByText("continued in place")).toBeNull();
+    expect(
+      await screen.findByText(
+        "A newer sign-in superseded this email callback. Restore the latest browser session before continuing.",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("blocks the timed success continuation when login B starts after callback A", async () => {
+    vi.useFakeTimers();
+    storePendingOAuthReturnTo(
+      new URLSearchParams({ returnTo: "/get-started" }),
+    );
+    callbackState.verifyEmailCallback.mockResolvedValue({
+      token: "verified-timer-account-a",
+    });
+
+    try {
+      render(
+        <MemoryRouter
+          initialEntries={[
+            "/auth/callback/email?token=timer-a&email=timer%40b.co",
+          ]}
+        >
+          <Routes>
+            <Route
+              path="/auth/callback/email"
+              element={<EmailCallbackPage />}
+            />
+            <Route
+              path="/get-started"
+              element={<div>continued in place</div>}
+            />
+          </Routes>
+        </MemoryRouter>,
+      );
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(screen.getByRole("button", { name: "Continue" })).toBeTruthy();
+      beginStewardSessionRecovery("elizacloud", "provider");
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_500);
+      });
+
+      expect(screen.queryByText("continued in place")).toBeNull();
+      expect(
+        screen.getByText(
+          "A newer sign-in superseded this email callback. Restore the latest browser session before continuing.",
+        ),
+      ).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("rejects an incomplete callback and offers a safe keyboard-reachable recovery action", async () => {

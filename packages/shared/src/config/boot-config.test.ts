@@ -7,11 +7,13 @@
  * character catalog resolution, and env alias resolution end to end.
  */
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppBootConfig } from "./boot-config.js";
 import * as bootConfigEntry from "./boot-config.js";
 import {
+  BOOT_CONFIG_CHANGE_EVENT,
   DEFAULT_BOOT_CONFIG,
+  dispatchBootConfigChangeEvent,
   getBootConfig,
   resolveCharacterCatalog,
   setBootConfig,
@@ -35,6 +37,7 @@ describe("boot-config store-only entry", () => {
   });
 
   afterEach(() => {
+    vi.unstubAllGlobals();
     const slot = globalSlot();
     delete slot[BOOT_CONFIG_STORE_KEY];
     delete slot[BOOT_CONFIG_WINDOW_KEY];
@@ -50,6 +53,12 @@ describe("boot-config store-only entry", () => {
     it("forwards every runtime binding of boot-config-store by identity", () => {
       expect(bootConfigEntry.getBootConfig).toBe(getBootConfig);
       expect(bootConfigEntry.setBootConfig).toBe(setBootConfig);
+      expect(bootConfigEntry.dispatchBootConfigChangeEvent).toBe(
+        dispatchBootConfigChangeEvent,
+      );
+      expect(bootConfigEntry.BOOT_CONFIG_CHANGE_EVENT).toBe(
+        BOOT_CONFIG_CHANGE_EVENT,
+      );
       expect(bootConfigEntry.resolveCharacterCatalog).toBe(
         resolveCharacterCatalog,
       );
@@ -118,6 +127,21 @@ describe("boot-config store-only entry", () => {
 
       expect(getBootConfig()).toBe(next);
       expect(globalSlot()[BOOT_CONFIG_WINDOW_KEY]).toBe(next);
+    });
+
+    it("signals same-document consumers from the shared setter", () => {
+      const dispatchEvent = vi.fn();
+      vi.stubGlobal("window", { dispatchEvent });
+
+      setBootConfig({
+        branding: {},
+        apiToken: "eliza_owner-b",
+      });
+
+      expect(dispatchEvent).toHaveBeenCalledTimes(1);
+      expect(dispatchEvent.mock.calls[0]?.[0]).toMatchObject({
+        type: BOOT_CONFIG_CHANGE_EVENT,
+      });
     });
   });
 

@@ -86,6 +86,7 @@ describe("persistActiveServerCredential native durability", () => {
         accessToken: "paired-token",
       },
       authenticatedServer,
+      {},
     );
     expect(completed).toBe(false);
 

@@ -18,6 +18,7 @@ import type { UserWithOrganization } from "../../db/repositories/users";
 import type { ApiKey } from "../../db/schemas/api-keys";
 import type { AppContext, AuthedUser, Bindings } from "../../types/cloud-worker-env";
 import { ApiError, AuthenticationError, ForbiddenError } from "../api/cloud-worker-errors";
+import { isBlockedBySsoBridgeLogout } from "../services/sso-bridge-codes";
 import { logger } from "../utils/logger";
 import { timingSafeEqualSecret } from "./cron";
 import {
@@ -28,7 +29,11 @@ import {
 } from "./playwright-test-session";
 import { isRecentDestructiveAuth } from "./recent-auth";
 import { loadVerifiedStagingSessionUser } from "./staging-session-binding";
-import { isStagingSessionTokenCandidate, verifyStewardTokenCached } from "./steward-client";
+import {
+  isStagingSessionTokenCandidate,
+  type StewardTokenClaims,
+  verifyStewardTokenCached,
+} from "./steward-client";
 import { readStewardAccessCookieFromHeader } from "./steward-cookies";
 
 function readStewardCookie(c: AppContext): string | null {
@@ -41,6 +46,26 @@ function readBearer(c: AppContext): string | null {
   const auth = c.req.header("authorization");
   if (!auth?.startsWith("Bearer ")) return null;
   return auth.slice(7).trim() || null;
+}
+
+/**
+ * Every Steward user token needs a durable logout-marker read in addition to
+ * JWT verification. This also closes an ordinary host-only token left on the
+ * other origin after a paired-origin logout.
+ */
+async function isStewardSessionActive(claims: StewardTokenClaims): Promise<boolean> {
+  try {
+    return !(await isBlockedBySsoBridgeLogout(claims.userId, claims.issuedAt));
+  } catch (error) {
+    logger.error("[Auth] SSO logout-marker store unavailable", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw new ApiError(
+      503,
+      "service_unavailable",
+      "Session revocation is temporarily unavailable. Please retry.",
+    );
+  }
 }
 
 function looksLikeJwt(token: string): boolean {
@@ -118,6 +143,29 @@ function toAuthedUser(user: UserWithOrganization): AuthedUser {
     wallet_address: user.wallet_address ?? null,
     is_anonymous: user.is_anonymous,
   };
+}
+
+/**
+ * Resolve an already-verified Steward identity without provisioning or linking
+ * a user. Cleanup-only callers such as legacy logout use this read-only path so
+ * presenting an old session can end an existing session but can never trigger
+ * the normal getCurrentUser JIT synchronization side effect.
+ */
+export async function getExistingUserForVerifiedStewardClaims(
+  c: AppContext,
+  claims: StewardTokenClaims,
+): Promise<AuthedUser | null> {
+  let user: UserWithOrganization | null | undefined;
+  if (claims.stagingSessionBinding) {
+    user = await loadVerifiedStagingSessionUser({
+      binding: claims.stagingSessionBinding,
+      stewardUserId: claims.userId,
+    });
+  } else {
+    const { usersService } = await import("../services/users");
+    user = await usersService.getByStewardIdForWrite(claims.userId);
+  }
+  return user ? toAuthedUser(user) : null;
 }
 
 function trackApiKeyUsage(c: AppContext, id: string, increment: () => Promise<void>): void {
@@ -253,6 +301,10 @@ export async function getCurrentUser(c: AppContext): Promise<AuthedUser | null> 
     c.set("user", null);
     return null;
   }
+  if (!(await isStewardSessionActive(claims))) {
+    c.set("user", null);
+    return null;
+  }
 
   let user: UserWithOrganization | undefined | null;
   if (claims.stagingSessionBinding) {
@@ -371,6 +423,9 @@ export async function requireRecentSessionUserWithOrg(
   if (hasVerifiedPlaywrightTestSession(c, user)) return user;
   const token = readSessionCredential(c);
   const claims = token ? await verifyStewardTokenCached(c.env, token) : null;
+  if (claims && !(await isStewardSessionActive(claims))) {
+    throw AuthenticationError("The signed-in session is no longer valid");
+  }
   const nowSeconds = Math.floor(Date.now() / 1_000);
   if (
     !isRecentDestructiveAuth({
@@ -619,6 +674,7 @@ export async function revalidateSessionScope(
   const claims = await verifyStewardTokenCached(c.env, token).catch(() => null);
   if (!claims) return false;
   if (claims.userId !== cachedStewardUserId) return false;
+  if (!(await isStewardSessionActive(claims))) return false;
   if (!claims.stagingSessionBinding) return true;
   if (
     !cachedOrganizationId ||

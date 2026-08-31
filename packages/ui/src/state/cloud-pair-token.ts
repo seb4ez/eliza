@@ -13,6 +13,10 @@ import {
   cloudPairTokenKeyForAgent,
 } from "@elizaos/shared/contracts";
 import {
+  getStorageValue,
+  setStorageValueIfCurrent,
+} from "../bridge/storage-bridge";
+import {
   CLOUD_PAIR_LOCAL_STORAGE_KEY,
   CLOUD_PAIR_SESSION_STORAGE_KEY,
 } from "../components/auth/CloudPairRelay";
@@ -20,8 +24,10 @@ import { shellLocalStorage } from "../surface-realm-channel";
 import type { RuntimeConnectionPersistenceLease } from "./agent-profiles";
 import {
   type AgentProfile,
+  type AgentProfileRegistry,
   loadAgentProfileRegistry,
   saveAgentProfileRegistry,
+  withRuntimeConnectionPersistenceLock,
 } from "./agent-profiles";
 import {
   dedicatedAgentIdFromApiBase,
@@ -29,8 +35,12 @@ import {
 } from "./agent-session-recovery";
 import {
   loadPersistedActiveServer,
+  type PersistedActiveServer,
   scrubPersistedActiveServerToken,
 } from "./persistence";
+
+const ACTIVE_SERVER_STORAGE_KEY = "elizaos:active-server";
+const AGENT_PROFILE_STORAGE_KEY = "elizaos:agent-profiles";
 
 /**
  * Mirrors the write channel's `tryPersistBrowserStorage` shape: report whether
@@ -369,4 +379,261 @@ export function clearStalePairCredentialsForAgent(agentId: string): void {
     return rest;
   });
   if (changed) saveAgentProfileRegistry(registry);
+}
+
+export interface StalePairCredentialDurableClearOptions {
+  agentId: string;
+  /** Exact dedicated-agent bearer rejected by the runtime auth probe. */
+  rejectedToken: string;
+  /** Account generation + same-agent authority retained by the recovery hook. */
+  validate: () => boolean;
+}
+
+interface StrictPairStorageSnapshot {
+  key: string;
+  storage: Storage;
+  channel: "local" | "session";
+  value: string | null;
+}
+
+function readStrictPairStorageSnapshot(
+  storage: Storage,
+  key: string,
+  channel: StrictPairStorageSnapshot["channel"],
+): StrictPairStorageSnapshot | null {
+  try {
+    return { key, storage, channel, value: storage.getItem(key) };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Terminally remove one exact rejected pair bearer. A later compensation never
+ * restores it: once the runtime proved this bearer invalid, absence (or a B
+ * replacement) is the only safe successor state.
+ */
+function removeRejectedPairSnapshotIfCurrent(
+  snapshot: StrictPairStorageSnapshot,
+  rejectedToken: string,
+  validate: () => boolean,
+): boolean {
+  if (snapshot.value !== rejectedToken) return true;
+  if (!validate()) return false;
+  try {
+    if (snapshot.storage.getItem(snapshot.key) !== snapshot.value) return true;
+    if (!validate()) return false;
+    if (snapshot.channel === "local") {
+      shellLocalStorage.removeItem(snapshot.key);
+    } else {
+      snapshot.storage.removeItem(snapshot.key);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function parseActiveServerSnapshot(
+  raw: string | null,
+): PersistedActiveServer | null | undefined {
+  if (raw === null) return null;
+  try {
+    const parsed = JSON.parse(raw) as PersistedActiveServer;
+    return parsed?.id && parsed.kind && parsed.label ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function parseAgentProfileRegistrySnapshot(
+  raw: string | null,
+): AgentProfileRegistry | null | undefined {
+  if (raw === null) return null;
+  try {
+    const parsed = JSON.parse(raw) as AgentProfileRegistry;
+    return parsed?.version === 1 && Array.isArray(parsed.profiles)
+      ? parsed
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function rejectedTokenAbsentFromActiveServer(
+  raw: string | null,
+  agentId: string,
+  rejectedToken: string,
+): boolean {
+  const activeServer = parseActiveServerSnapshot(raw);
+  if (activeServer === undefined) return false;
+  return !(
+    activeServer &&
+    resolveDedicatedAgentId(activeServer) === agentId &&
+    activeServer.accessToken?.trim() === rejectedToken
+  );
+}
+
+function rejectedTokenAbsentFromProfiles(
+  raw: string | null,
+  agentId: string,
+  rejectedToken: string,
+): boolean {
+  const registry = parseAgentProfileRegistrySnapshot(raw);
+  if (registry === undefined) return false;
+  return !registry?.profiles.some(
+    (profile) =>
+      profileMatchesDedicatedAgent(profile, agentId) &&
+      profile.accessToken?.trim() === rejectedToken,
+  );
+}
+
+/**
+ * Durably retire one runtime-rejected dedicated-agent bearer.
+ *
+ * Pair, active-server and profile snapshots are captured and transformed under
+ * the same origin-wide runtime Web Lock used by every credential writer. Every
+ * transform is terminal and exact-CAS: losing the validator never compensates
+ * rejected A back into storage, while a newer B value never compares equal and
+ * therefore survives. Success is reported only after a host-authoritative
+ * reread proves the rejected bearer absent from every target-owned mirror.
+ */
+export async function clearStalePairCredentialsForAgentDurably(
+  options: StalePairCredentialDurableClearOptions,
+): Promise<boolean> {
+  const agentId = options.agentId.trim();
+  const rejectedToken = options.rejectedToken.trim();
+  if (!agentId || !rejectedToken || !options.validate()) return false;
+  if (typeof window === "undefined") return false;
+
+  try {
+    return await withRuntimeConnectionPersistenceLock(async () => {
+      if (!options.validate()) return false;
+
+      const pairKeys = [
+        cloudPairTokenKeyForAgent(agentId),
+        CLOUD_PAIR_LOCAL_STORAGE_KEY,
+      ];
+      const pairSnapshots = pairKeys.flatMap((key) => {
+        const local = readStrictPairStorageSnapshot(
+          window.localStorage,
+          key,
+          "local",
+        );
+        const session = readStrictPairStorageSnapshot(
+          window.sessionStorage,
+          key,
+          "session",
+        );
+        return local && session ? [local, session] : [];
+      });
+      if (pairSnapshots.length !== pairKeys.length * 2) return false;
+
+      const activeServerRaw = await getStorageValue(ACTIVE_SERVER_STORAGE_KEY);
+      if (!options.validate()) return false;
+      const registryRaw = await getStorageValue(AGENT_PROFILE_STORAGE_KEY);
+      if (!options.validate()) return false;
+
+      for (const snapshot of pairSnapshots) {
+        if (
+          !removeRejectedPairSnapshotIfCurrent(
+            snapshot,
+            rejectedToken,
+            options.validate,
+          )
+        ) {
+          break;
+        }
+      }
+
+      const activeServer = parseActiveServerSnapshot(activeServerRaw);
+      if (
+        options.validate() &&
+        activeServer &&
+        resolveDedicatedAgentId(activeServer) === agentId &&
+        activeServer.accessToken?.trim() === rejectedToken &&
+        activeServerRaw !== null
+      ) {
+        const { accessToken: _rejected, ...scrubbed } = activeServer;
+        await setStorageValueIfCurrent(
+          ACTIVE_SERVER_STORAGE_KEY,
+          activeServerRaw,
+          JSON.stringify(scrubbed),
+          {
+            validate: options.validate,
+            compensateOnValidationFailure: false,
+          },
+        );
+      }
+
+      const registry = parseAgentProfileRegistrySnapshot(registryRaw);
+      if (options.validate() && registry && registryRaw !== null) {
+        let changed = false;
+        const profiles = registry.profiles.map((profile) => {
+          if (
+            !profileMatchesDedicatedAgent(profile, agentId) ||
+            profile.accessToken?.trim() !== rejectedToken
+          ) {
+            return profile;
+          }
+          changed = true;
+          const { accessToken: _rejected, ...scrubbed } = profile;
+          return scrubbed;
+        });
+        if (changed) {
+          await setStorageValueIfCurrent(
+            AGENT_PROFILE_STORAGE_KEY,
+            registryRaw,
+            JSON.stringify({ ...registry, profiles }),
+            {
+              validate: options.validate,
+              compensateOnValidationFailure: false,
+            },
+          );
+        }
+      }
+
+      if (!options.validate()) return false;
+      const finalPairSnapshots = pairKeys.flatMap((key) => {
+        const local = readStrictPairStorageSnapshot(
+          window.localStorage,
+          key,
+          "local",
+        );
+        const session = readStrictPairStorageSnapshot(
+          window.sessionStorage,
+          key,
+          "session",
+        );
+        return local && session ? [local, session] : [];
+      });
+      if (finalPairSnapshots.length !== pairKeys.length * 2) return false;
+      const finalActiveServerRaw = await getStorageValue(
+        ACTIVE_SERVER_STORAGE_KEY,
+      );
+      if (!options.validate()) return false;
+      const finalRegistryRaw = await getStorageValue(AGENT_PROFILE_STORAGE_KEY);
+      if (!options.validate()) return false;
+
+      return (
+        finalPairSnapshots.every(
+          (snapshot) => snapshot.value?.trim() !== rejectedToken,
+        ) &&
+        rejectedTokenAbsentFromActiveServer(
+          finalActiveServerRaw,
+          agentId,
+          rejectedToken,
+        ) &&
+        rejectedTokenAbsentFromProfiles(
+          finalRegistryRaw,
+          agentId,
+          rejectedToken,
+        )
+      );
+    });
+  } catch {
+    // A refused Web Lock or protected-host write cannot authorize a terminal
+    // reauth/manage fallback. The owning hook degrades to retry (or idle for B).
+    return false;
+  }
 }

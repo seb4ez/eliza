@@ -8,6 +8,7 @@
 import {
   registerStewardTokenPersistence,
   STEWARD_TENANT_ID,
+  stewardAuthedCookieName,
 } from "@elizaos/shared/steward-session-client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -26,6 +27,19 @@ const STEWARD_TOKEN_KEY = "steward_session_token";
 const STEWARD_REFRESH_PATH = "/api/auth/steward-refresh";
 const CLOUD_AGENT_ID = "11111111-1111-4111-8111-111111111111";
 const CLOUD_AGENT_API_BASE = `https://api.eliza.app/api/v1/eliza/agents/${CLOUD_AGENT_ID}`;
+
+function failWindowStorageEnumeration(): ReturnType<typeof vi.spyOn> {
+  let methodOwner: object | null = window.localStorage;
+  while (methodOwner && !Object.hasOwn(methodOwner, "key")) {
+    methodOwner = Object.getPrototypeOf(methodOwner) as object | null;
+  }
+  if (!methodOwner) throw new Error("jsdom Storage.key owner was not found");
+  return vi
+    .spyOn(methodOwner as Pick<Storage, "key">, "key")
+    .mockImplementation(() => {
+      throw new Error("recovery enumeration unavailable");
+    });
+}
 
 /** Build a minimal (unsigned) JWT whose payload carries the given `exp`. */
 function makeJwt(expSecondsFromNow: number | null): string {
@@ -78,6 +92,7 @@ function fakeClientWithStagedAuthority() {
         return true;
       };
       return {
+        isCurrent: vi.fn(() => live && revision === installedRevision),
         publish: vi.fn(() => live && revision === installedRevision),
         restoreIfCurrent: vi.fn(() => consume()),
         clearIfCurrent: vi.fn(() => {
@@ -105,6 +120,7 @@ describe("applyRestoredConnection — cloud Steward token refresh at restore", (
 
   beforeEach(() => {
     localStorage.clear();
+    window.localStorage.clear();
     fetchMock = vi.fn();
     globalThis.fetch = fetchMock as unknown as typeof fetch;
   });
@@ -113,8 +129,9 @@ describe("applyRestoredConnection — cloud Steward token refresh at restore", (
     vi.useRealTimers();
     globalThis.fetch = realFetch;
     // biome-ignore lint/suspicious/noDocumentCookie: jsdom has no Cookie Store API.
-    document.cookie = "steward-authed=; Max-Age=0; path=/";
+    document.cookie = `${stewardAuthedCookieName("local")}=; Max-Age=0; path=/`;
     localStorage.clear();
+    window.localStorage.clear();
     vi.restoreAllMocks();
   });
 
@@ -209,7 +226,7 @@ describe("applyRestoredConnection — cloud Steward token refresh at restore", (
   it("does not publish a cookie-recovered bearer after startup stopped waiting", async () => {
     vi.useFakeTimers();
     // biome-ignore lint/suspicious/noDocumentCookie: jsdom has no Cookie Store API.
-    document.cookie = "steward-authed=1; path=/";
+    document.cookie = `${stewardAuthedCookieName("local")}=1; path=/`;
     const fresh = makeJwt(3600);
     let resolveFetch!: (value: {
       ok: boolean;
@@ -246,6 +263,48 @@ describe("applyRestoredConnection — cloud Steward token refresh at restore", (
 
     expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
     expect(client.setToken).toHaveBeenLastCalledWith(null);
+  });
+
+  it("preserves the shared binding when cookie-only refresh returns null after login B begins", async () => {
+    // biome-ignore lint/suspicious/noDocumentCookie: jsdom has no Cookie Store API.
+    document.cookie = `${stewardAuthedCookieName("local")}=1; path=/`;
+    savePersistedActiveServer(cloudServer());
+    let resolveFetch!: (value: {
+      ok: boolean;
+      status: number;
+      json: () => Promise<Record<string, never>>;
+    }) => void;
+    fetchMock.mockReturnValue(
+      new Promise((resolve) => {
+        resolveFetch = resolve;
+      }),
+    );
+    const client = fakeClientWithStagedAuthority();
+    const restore = applyRestoredConnection({
+      restoredActiveServer: cloudServer(),
+      clientRef: client,
+    });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const loginB = beginStewardSessionRecovery(STEWARD_TENANT_ID, "provider");
+
+    try {
+      // No commit callback runs for this terminal-looking empty refresh. The
+      // admission-generation fence must still recognize B and prevent A's
+      // caller from clearing the shared account binding.
+      resolveFetch({
+        ok: false,
+        status: 401,
+        json: async () => ({}),
+      });
+      const result = await restore;
+
+      expect(result.status).toBe("steward-recovery-pending");
+      expect(loadPersistedActiveServer()).toEqual(cloudServer());
+      expect(client.setToken).toHaveBeenLastCalledWith(null);
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    } finally {
+      rejectStewardSessionRecovery(loginB);
+    }
   });
 
   it("stops publishing restored client state when refresh authority changes during the durable write", async () => {
@@ -316,6 +375,100 @@ describe("applyRestoredConnection — cloud Steward token refresh at restore", (
 
     expect(client.setToken).toHaveBeenLastCalledWith("account-b");
     expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(expired);
+  });
+
+  it("quarantines account A when a durable account-B receipt already exists", async () => {
+    const accountA = makeJwt(3600);
+    localStorage.setItem(STEWARD_TOKEN_KEY, accountA);
+    const loginB = beginStewardSessionRecovery(STEWARD_TENANT_ID, "provider");
+    const client = fakeClientWithStagedAuthority();
+
+    try {
+      const result = await applyRestoredConnection({
+        restoredActiveServer: cloudServer({ accessToken: accountA }),
+        clientRef: client,
+      });
+
+      expect(result.status).toBe("steward-recovery-pending");
+      expect(client.stageSessionTarget).not.toHaveBeenCalled();
+      expect(client.setBaseUrl).not.toHaveBeenCalled();
+      expect(client.setToken).not.toHaveBeenCalledWith(accountA);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(accountA);
+    } finally {
+      rejectStewardSessionRecovery(loginB);
+    }
+  });
+
+  it("quarantines account A when recovery storage cannot prove receipt absence", async () => {
+    const accountA = makeJwt(3600);
+    localStorage.setItem(STEWARD_TOKEN_KEY, accountA);
+    window.localStorage.setItem("unrelated-recovery-enumeration-fixture", "1");
+    // Spy on jsdom's Storage prototype rather than one accessor result: the
+    // production module may observe another wrapper for the same origin.
+    const storageKeySpy = failWindowStorageEnumeration();
+    const client = fakeClientWithStagedAuthority();
+
+    const result = await applyRestoredConnection({
+      restoredActiveServer: cloudServer({ accessToken: accountA }),
+      clientRef: client,
+    });
+
+    expect(storageKeySpy).toHaveBeenCalled();
+    expect(result.status).toBe("steward-recovery-pending");
+    expect(client.stageSessionTarget).not.toHaveBeenCalled();
+    expect(client.setToken).not.toHaveBeenCalledWith(accountA);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(accountA);
+  });
+
+  it("clears only its staged account-A target when login B begins during the fast-path await", async () => {
+    const accountA = makeJwt(3600);
+    localStorage.setItem(STEWARD_TOKEN_KEY, accountA);
+    const client = fakeClientWithStagedAuthority();
+
+    const restore = applyRestoredConnection({
+      restoredActiveServer: cloudServer({ accessToken: accountA }),
+      clientRef: client,
+    });
+    const loginB = beginStewardSessionRecovery(STEWARD_TENANT_ID, "provider");
+
+    try {
+      const result = await restore;
+      expect(result.status).toBe("steward-recovery-pending");
+      expect(client.setToken).toHaveBeenLastCalledWith(null);
+      expect(client.setToken).not.toHaveBeenLastCalledWith(accountA);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(accountA);
+    } finally {
+      rejectStewardSessionRecovery(loginB);
+    }
+  });
+
+  it("does not clear account B when that newer client target supersedes staged A", async () => {
+    const accountA = makeJwt(3600);
+    localStorage.setItem(STEWARD_TOKEN_KEY, accountA);
+    const client = fakeClientWithStagedAuthority();
+
+    const restore = applyRestoredConnection({
+      restoredActiveServer: cloudServer({ accessToken: accountA }),
+      clientRef: client,
+    });
+    const loginB = beginStewardSessionRecovery(STEWARD_TENANT_ID, "provider");
+    client.installNewerTarget(
+      "https://api.eliza.app/api/v1/eliza/agents/22222222-2222-4222-8222-222222222222",
+      "account-b",
+    );
+
+    try {
+      const result = await restore;
+      expect(result.status).toBe("steward-recovery-pending");
+      expect(client.setToken).toHaveBeenLastCalledWith("account-b");
+      expect(client.setToken).not.toHaveBeenLastCalledWith(accountA);
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(accountA);
+    } finally {
+      rejectStewardSessionRecovery(loginB);
+    }
   });
 
   it("does NOT refresh a comfortably-valid stored JWT (instant restore)", async () => {

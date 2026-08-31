@@ -182,6 +182,19 @@ export function isStreamGenerationError(
   return value instanceof StreamGenerationError;
 }
 
+/** Exact caller authority retired while a logical REST request was in flight. */
+export class RequestAuthoritySupersededError extends Error {
+  constructor() {
+    super("Request authority was superseded.");
+    this.name = "RequestAuthoritySupersededError";
+  }
+}
+
+function assertRequestAuthorityCurrent(validate?: () => boolean): void {
+  if (validate?.() !== false) return;
+  throw new RequestAuthoritySupersededError();
+}
+
 const CHAT_TURN_STATUS_KINDS: ReadonlySet<ChatTurnStatus["kind"]> = new Set<
   ChatTurnStatus["kind"]
 >([
@@ -865,6 +878,8 @@ function sleepUnlessAborted(
 
 /** Opaque authority for one staged, revision-fenced client target pair. */
 export interface SessionTargetAuthority {
+  /** Non-mutating proof that this exact revision/base/token pair still owns the client. */
+  isCurrent(): boolean;
   publish(): boolean;
   restoreIfCurrent(): boolean;
   clearIfCurrent(): boolean;
@@ -1425,6 +1440,11 @@ export class ElizaClient {
       return true;
     };
     return {
+      isCurrent: () =>
+        live &&
+        this.authorityRevision === installedRevision &&
+        this.getBaseUrl() === normalizedBase &&
+        this.getRestAuthToken() === normalizedToken,
       publish: () => {
         if (!live) return false;
         if (published) return true;
@@ -1694,8 +1714,11 @@ export class ElizaClient {
        *  swallowed → spinner with no progress). Implies `allowNonOk` for the
        *  202. */
       skipResume?: boolean;
+      /** Exact authority fence checked around every transport and retry. */
+      validate?: () => boolean;
     },
   ): Promise<Response> {
+    assertRequestAuthorityCurrent(options?.validate);
     if (!this.apiAvailable) {
       throw new ApiError({
         kind: "network",
@@ -1707,8 +1730,11 @@ export class ElizaClient {
     // setBaseUrl cannot attribute another host's 404 to the new binding.
     let requestBase = this.baseUrl;
     let requestUrl = this.rawRequestUrl(path);
-    let token =
-      this.apiToken ?? (await hydrateAndroidLocalAgentTokenForUrl(requestUrl));
+    let token = this.apiToken;
+    if (!token) {
+      token = await hydrateAndroidLocalAgentTokenForUrl(requestUrl);
+      assertRequestAuthorityCurrent(options?.validate);
+    }
     // One bounded classification loop: EVERY response — first attempt or any
     // retry — re-enters the same 401/202/warming classifier, so the states
     // compose in any order (warming → 202, 401 → warming, …). The token is a
@@ -1718,9 +1744,11 @@ export class ElizaClient {
     let authRetried = false;
     let notifiedWaiting = false;
     const notifyWaiting = () => {
+      assertRequestAuthorityCurrent(options?.validate);
       if (!notifiedWaiting) {
         notifiedWaiting = true;
         options?.onResuming?.();
+        assertRequestAuthorityCurrent(options?.validate);
       }
     };
     let resumeRetries = 0;
@@ -1729,8 +1757,9 @@ export class ElizaClient {
     const logicalRequestDeadline =
       Date.now() + (options?.timeoutMs ?? defaultFetchTimeoutMs(path, init));
     let requestAttempt = 0;
-    const requestOnce = () =>
-      this.rawRequestOnce(
+    const requestOnce = async () => {
+      assertRequestAuthorityCurrent(options?.validate);
+      const response = await this.rawRequestOnce(
         path,
         requestUrl,
         init,
@@ -1738,33 +1767,44 @@ export class ElizaClient {
         token,
         ++requestAttempt,
       );
+      assertRequestAuthorityCurrent(options?.validate);
+      return response;
+    };
+    const returnIfCurrent = <T>(value: T): T => {
+      assertRequestAuthorityCurrent(options?.validate);
+      return value;
+    };
     let res = await requestOnce();
     // Personal-Eliza cutover repoint happens once, before classification: a
     // structural Shared rejection can rebind this client to the dedicated
     // runtime, after which the re-issued request (fresh base/url/token) enters
     // the same 401/202/warming loop below.
-    if (
-      await this.repointAfterPersonalElizaCutover(
-        res,
-        requestBase,
-        token,
-        init?.signal,
-      )
-    ) {
+    assertRequestAuthorityCurrent(options?.validate);
+    const repointedAfterCutover = await this.repointAfterPersonalElizaCutover(
+      res,
+      requestBase,
+      token,
+      init?.signal,
+    );
+    assertRequestAuthorityCurrent(options?.validate);
+    if (repointedAfterCutover) {
       requestBase = this.baseUrl;
       requestUrl = this.rawRequestUrl(path);
       token = this.apiToken;
       res = await requestOnce();
     }
     while (true) {
+      assertRequestAuthorityCurrent(options?.validate);
       // 401: one token refresh per logical request, wherever in the retry
       // sequence it appears (a warming retry can race token expiry).
       if (res.status === 401 && !authRetried) {
         authRetried = true;
+        assertRequestAuthorityCurrent(options?.validate);
         const hydratedToken = await hydrateAndroidLocalAgentTokenForUrl(
           requestUrl,
           { force: true },
         );
+        assertRequestAuthorityCurrent(options?.validate);
         const retryToken = hydratedToken ?? (!token ? this.apiToken : null);
         if (retryToken && retryToken !== token) {
           token = retryToken;
@@ -1781,9 +1821,11 @@ export class ElizaClient {
         // Status/readiness poll opts out of the wait-and-retry loop: it wants
         // the live 202 progress body back immediately so it can render honest
         // progress (#14040 sub-defect 2). Return the 202 response untouched.
-        if (options?.skipResume) return res;
+        if (options?.skipResume) return returnIfCurrent(res);
         if (resumeRetries < RESUME_MAX_RETRIES && !init?.signal?.aborted) {
+          assertRequestAuthorityCurrent(options?.validate);
           await sleepUnlessAborted(resumeRetryDelayMs(res), init?.signal);
+          assertRequestAuthorityCurrent(options?.validate);
           if (!init?.signal?.aborted) {
             resumeRetries += 1;
             res = await requestOnce();
@@ -1796,6 +1838,7 @@ export class ElizaClient {
         // empty reply. allowNonOk callers and aborted requests still get the
         // raw response.
         if (!options?.allowNonOk && !init?.signal?.aborted) {
+          assertRequestAuthorityCurrent(options?.validate);
           throw new ApiError({
             kind: "http",
             path,
@@ -1806,9 +1849,10 @@ export class ElizaClient {
             retryAfter: resumeRetryDelayMs(res) / 1000,
           });
         }
-        return res;
+        return returnIfCurrent(res);
       }
-      if (res.ok) return res;
+      if (res.ok) return returnIfCurrent(res);
+      assertRequestAuthorityCurrent(options?.validate);
       const rawText = await this.readBodyText(
         res,
         path,
@@ -1825,6 +1869,7 @@ export class ElizaClient {
         // its optional diagnostic body cannot be read for a non-abort reason.
         return "";
       });
+      assertRequestAuthorityCurrent(options?.validate);
       let body: Record<string, unknown> | null = null;
       if (rawText) {
         try {
@@ -1877,6 +1922,7 @@ export class ElizaClient {
           init?.signal != null && options?.timeoutMs === undefined;
         if (lifecycleBound || now < logicalRequestDeadline) {
           notifyWaiting();
+          assertRequestAuthorityCurrent(options?.validate);
           await sleepUnlessAborted(
             lifecycleBound
               ? warmingRetryDelayMs(retryAfter)
@@ -1886,6 +1932,7 @@ export class ElizaClient {
                 ),
             init?.signal,
           );
+          assertRequestAuthorityCurrent(options?.validate);
           if (
             !init?.signal?.aborted &&
             (lifecycleBound || Date.now() < logicalRequestDeadline)
@@ -1928,7 +1975,9 @@ export class ElizaClient {
             warmingRetryDelayMs(retryAfter),
             warmingDeadline - now,
           );
+          assertRequestAuthorityCurrent(options?.validate);
           await sleepUnlessAborted(delay, init?.signal);
+          assertRequestAuthorityCurrent(options?.validate);
           if (!init?.signal?.aborted) {
             res = await requestOnce();
             continue;
@@ -1946,6 +1995,7 @@ export class ElizaClient {
         // the flattened message/code drop, e.g. `welcomeBonusWithheld`.
         data: body,
       });
+      assertRequestAuthorityCurrent(options?.validate);
       // Structural agent-gone from a bound cloud agent host: drop the dead
       // binding at the request choke point so background callers (lifeops
       // activity-signals, status probes with allowNonOk, …) stop hammering a
@@ -1958,11 +2008,13 @@ export class ElizaClient {
         throw error;
       }
       // allowNonOk callers still need a Response whose body is unread.
-      return new Response(rawText, {
-        status: res.status,
-        statusText: res.statusText,
-        headers: res.headers,
-      });
+      return returnIfCurrent(
+        new Response(rawText, {
+          status: res.status,
+          statusText: res.statusText,
+          headers: res.headers,
+        }),
+      );
     }
   }
 
@@ -2056,10 +2108,17 @@ export class ElizaClient {
     path: string,
     requestUrl: string,
     init: RequestInit | undefined,
-    options: { allowNonOk?: boolean; timeoutMs?: number } | undefined,
+    options:
+      | {
+          allowNonOk?: boolean;
+          timeoutMs?: number;
+          validate?: () => boolean;
+        }
+      | undefined,
     token: string | null,
     requestAttempt: number,
   ): Promise<Response> {
+    assertRequestAuthorityCurrent(options?.validate);
     const timeoutMs = options?.timeoutMs ?? defaultFetchTimeoutMs(path, init);
     const abortController = new AbortController();
     let timedOut = false;
@@ -2091,8 +2150,14 @@ export class ElizaClient {
         requestAttempt,
       );
       const transport = await this.rawRequestTransport(requestUrl);
-      return await transport.request(requestUrl, requestInit, { timeoutMs });
+      assertRequestAuthorityCurrent(options?.validate);
+      const response = await transport.request(requestUrl, requestInit, {
+        timeoutMs,
+      });
+      assertRequestAuthorityCurrent(options?.validate);
+      return response;
     } catch (err) {
+      if (err instanceof RequestAuthoritySupersededError) throw err;
       // error-policy:J2 context-adding rethrow — throwRawRequestError wraps
       // the transport failure with path/timeout/abort context and throws.
       return this.throwRawRequestError(
@@ -2329,8 +2394,11 @@ export class ElizaClient {
        * responses go through the normal strict-parse path unchanged.
        */
       on202?: (body: unknown) => T;
+      /** Exact authority fence propagated into rawRequest retry transport. */
+      validate?: () => boolean;
     },
   ): Promise<T> {
+    assertRequestAuthorityCurrent(options?.validate);
     const res = await this.rawRequest(
       path,
       {
@@ -2342,7 +2410,9 @@ export class ElizaClient {
       },
       options,
     );
+    assertRequestAuthorityCurrent(options?.validate);
     if (res.status === 204) {
+      assertRequestAuthorityCurrent(options?.validate);
       return undefined as T;
     }
     // 202 resume-progress (status poll only): read the body with the SAME
@@ -2351,7 +2421,9 @@ export class ElizaClient {
     // and hand it to the caller's mapper. The proxy body is advisory, so a
     // non-JSON 202 is tolerated (mapper still gets `undefined`).
     if (res.status === 202 && options?.on202) {
+      assertRequestAuthorityCurrent(options?.validate);
       const raw = await this.readBodyText(res, path, options?.timeoutMs, init);
+      assertRequestAuthorityCurrent(options?.validate);
       let body: unknown;
       if (raw !== "") {
         try {
@@ -2360,14 +2432,21 @@ export class ElizaClient {
           // error-policy:J3 untrusted 202 progress body defaults to an explicit starting progress state.
         }
       }
-      return options.on202(body);
+      assertRequestAuthorityCurrent(options?.validate);
+      const mapped = options.on202(body);
+      assertRequestAuthorityCurrent(options?.validate);
+      return mapped;
     }
+    assertRequestAuthorityCurrent(options?.validate);
     const text = await this.readBodyText(res, path, options?.timeoutMs, init);
+    assertRequestAuthorityCurrent(options?.validate);
     if (text === "") {
+      assertRequestAuthorityCurrent(options?.validate);
       return undefined as T;
     }
+    let parsed: T;
     try {
-      return JSON.parse(text) as T;
+      parsed = JSON.parse(text) as T;
     } catch (err) {
       throw new ApiError({
         kind: "parse",
@@ -2380,6 +2459,8 @@ export class ElizaClient {
         cause: err,
       });
     }
+    assertRequestAuthorityCurrent(options?.validate);
+    return parsed;
   }
 
   // --- WebSocket ---

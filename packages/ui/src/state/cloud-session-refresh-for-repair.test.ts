@@ -7,6 +7,8 @@
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+const mockCloudApiBase = vi.hoisted(() => vi.fn(() => "https://eliza.app"));
+
 // Stub the heavy client-cloud + shared-session imports: every test injects its
 // own refreshFn/readToken/writeToken/hasCookie, so the module-default imports
 // are never exercised. Mocking them keeps this a fast, isolated unit test and
@@ -19,6 +21,9 @@ vi.mock("@elizaos/shared/steward-session-client", () => ({
   readStoredStewardToken: () => null,
   STEWARD_REFRESH_ENDPOINT: "/api/auth/steward-refresh",
   writeStoredStewardToken: () => {},
+}));
+vi.mock("../config/boot-config", () => ({
+  getBootConfig: () => ({ cloudApiBase: mockCloudApiBase() }),
 }));
 
 import {
@@ -52,7 +57,11 @@ function makeDeps(
   };
 }
 
-afterEach(() => vi.clearAllMocks());
+afterEach(() => {
+  vi.clearAllMocks();
+  mockCloudApiBase.mockReturnValue("https://eliza.app");
+  delete (globalThis as { Capacitor?: unknown }).Capacitor;
+});
 
 describe("ensureCloudSessionForRepair", () => {
   it("fast-path: returns the existing app-origin token without refreshing", async () => {
@@ -63,12 +72,83 @@ describe("ensureCloudSessionForRepair", () => {
     expect(deps.writeToken).not.toHaveBeenCalled();
   });
 
+  it("force-refreshes a present expired-lineage token from the live cookie", async () => {
+    const deps = makeDeps({
+      readToken: vi.fn(() => "expired.jwt"),
+      forceRefresh: true,
+      validate: vi.fn(() => true),
+    });
+
+    await expect(ensureCloudSessionForRepair(deps)).resolves.toBe("fresh.jwt");
+    expect(deps.refreshFn).toHaveBeenCalledTimes(1);
+    expect(deps.writeToken).toHaveBeenCalledWith("fresh.jwt", {
+      validate: expect.any(Function),
+    });
+  });
+
+  it("refreshes an expired native bearer without a cookie against the configured Cloud API", async () => {
+    (globalThis as { Capacitor?: unknown }).Capacitor = {
+      isNativePlatform: () => true,
+    };
+    mockCloudApiBase.mockReturnValue("https://staging.eliza.app");
+    let storedToken = "expired.account-a.jwt";
+    const writeToken = vi.fn(async (token: string) => {
+      storedToken = token;
+    });
+    const refreshFn: NonNullable<EnsureCloudSessionForRepairDeps["refreshFn"]> =
+      vi.fn(async (options) => {
+        expect(options?.endpoint).toBe(
+          "https://api-staging.eliza.app/api/auth/steward-refresh",
+        );
+        const session = { token: "fresh.account-a.jwt" };
+        await options?.commitRefreshedSession?.(session, {
+          validate: () => true,
+        });
+        return session;
+      });
+    const deps = makeDeps({
+      forceRefresh: true,
+      hasCookie: vi.fn(() => false),
+      readToken: vi.fn(() => storedToken),
+      refreshFn,
+      writeToken,
+      validate: () => true,
+    });
+
+    await expect(ensureCloudSessionForRepair(deps)).resolves.toBe(
+      "fresh.account-a.jwt",
+    );
+    expect(deps.hasCookie).not.toHaveBeenCalled();
+    expect(refreshFn).toHaveBeenCalledTimes(1);
+    expect(writeToken).toHaveBeenCalledTimes(1);
+    expect(storedToken).toBe("fresh.account-a.jwt");
+  });
+
+  it("keeps an opaque native bearer unchanged without refresh or cookie", async () => {
+    (globalThis as { Capacitor?: unknown }).Capacitor = {
+      isNativePlatform: () => true,
+    };
+    const deps = makeDeps({
+      hasCookie: vi.fn(() => false),
+      readToken: vi.fn(() => "opaque-native-session"),
+    });
+
+    await expect(ensureCloudSessionForRepair(deps)).resolves.toBe(
+      "opaque-native-session",
+    );
+    expect(deps.hasCookie).not.toHaveBeenCalled();
+    expect(deps.refreshFn).not.toHaveBeenCalled();
+    expect(deps.writeToken).not.toHaveBeenCalled();
+  });
+
   it("recovers the session from the host cookie and persists it", async () => {
     const deps = makeDeps();
     const token = await ensureCloudSessionForRepair(deps);
     expect(token).toBe("fresh.jwt");
     expect(deps.refreshFn).toHaveBeenCalledTimes(1);
-    expect(deps.writeToken).toHaveBeenCalledWith("fresh.jwt");
+    expect(deps.writeToken).toHaveBeenCalledWith("fresh.jwt", {
+      validate: expect.any(Function),
+    });
   });
 
   it("persists and publishes only while the refresh authority remains live", async () => {
@@ -213,6 +293,8 @@ describe("ensureCloudSessionForRepair", () => {
       refreshFn: vi.fn(async () => ({ token: "  fresh.jwt  " })),
     });
     expect(await ensureCloudSessionForRepair(recovered)).toBe("fresh.jwt");
-    expect(recovered.writeToken).toHaveBeenCalledWith("fresh.jwt");
+    expect(recovered.writeToken).toHaveBeenCalledWith("fresh.jwt", {
+      validate: expect.any(Function),
+    });
   });
 });

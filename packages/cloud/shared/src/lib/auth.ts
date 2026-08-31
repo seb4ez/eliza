@@ -1,6 +1,6 @@
 // Defines cloud shared auth behavior for backend service consumers.
 import type { Organization } from "../db/schemas/organizations";
-import { AuthenticationError, ForbiddenError } from "./api/errors";
+import { ApiError, AuthenticationError, ForbiddenError } from "./api/errors";
 import {
   isPlaywrightTestAuthEnabled,
   PLAYWRIGHT_TEST_SESSION_COOKIE_NAME,
@@ -11,6 +11,7 @@ import { loadVerifiedStagingSessionUser } from "./auth/staging-session-binding";
 import {
   invalidateStewardTokenCache,
   isStagingSessionTokenCandidate,
+  type StewardTokenClaims,
   type StewardVerifyEnv,
   verifyStewardTokenCached,
 } from "./auth/steward-client";
@@ -22,6 +23,7 @@ import { getCookieValueFromHeader } from "./http/cookie-header";
 import { getCloudAwareEnv } from "./runtime/cloud-bindings";
 import { adminService } from "./services/admin";
 import { apiKeysService } from "./services/api-keys";
+import { isBlockedBySsoBridgeLogout } from "./services/sso-bridge-codes";
 import { userSessionsService } from "./services/user-sessions";
 import { usersService } from "./services/users";
 import { ensureDefaultCharacter, syncUserFromSteward } from "./steward-sync";
@@ -30,6 +32,33 @@ import { logger } from "./utils/logger";
 
 // Re-export Organization type for convenience
 export type { Organization };
+
+class StewardLogoutMarkerUnavailableError extends ApiError {
+  constructor() {
+    super({
+      status: 503,
+      code: "service_unavailable",
+      message: "Session revocation is temporarily unavailable. Please retry.",
+    });
+    this.name = "StewardLogoutMarkerUnavailableError";
+  }
+}
+
+/**
+ * A Steward token remains cryptographically valid after a paired-origin
+ * logout, so every verified user session must also pass the durable logout
+ * marker. This includes an ordinary host-only token left on the other origin.
+ */
+async function isStewardSessionActive(claims: StewardTokenClaims): Promise<boolean> {
+  try {
+    return !(await isBlockedBySsoBridgeLogout(claims.userId, claims.issuedAt));
+  } catch (error) {
+    logger.error("[AUTH] SSO logout-marker store unavailable", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw new StewardLogoutMarkerUnavailableError();
+  }
+}
 
 function getStewardVerifyEnv(): StewardVerifyEnv {
   const env = getCloudAwareEnv();
@@ -108,9 +137,10 @@ async function getPlaywrightTestUserFromHeader(
  * Get the current authenticated user from the Steward session cookie.
  *
  * Performance optimized with Redis caching:
- * 1. Check Redis cache first (avoids JWT verify AND DB call)
- * 2. On cache miss: verify JWT (jose, HS256), fetch from DB, cache result
- * 3. Session tracking is non-blocking
+ * 1. Verify the JWT through the warm Steward verification cache
+ * 2. Check Redis user cache (avoids the DB call)
+ * 3. On a user-cache miss: fetch from DB, cache result
+ * 4. Session tracking is non-blocking
  *
  * Flow (on cache miss):
  * 1. Read `steward-token` cookie
@@ -141,6 +171,7 @@ export async function getCurrentUserFromRequest(
       const claims = await verifyStewardTokenCached(getStewardVerifyEnv(), stewardToken);
       const binding = claims?.stagingSessionBinding;
       if (!claims || !binding) return null;
+      if (!(await isStewardSessionActive(claims))) return null;
 
       return await loadVerifiedStagingSessionUser({
         binding,
@@ -151,7 +182,14 @@ export async function getCurrentUserFromRequest(
     const tokenHash = hashSessionToken(stewardToken);
     const cacheKey = CacheKeys.session.user(tokenHash);
 
-    // Check Redis cache first - avoids JWT AND DB calls
+    // Verification is required even for a user-cache hit: the cached user does
+    // not carry the signed `issuedAt` authority needed to enforce a paired-
+    // origin logout marker. The verifier itself is warm-cached.
+    logger.debug("[AUTH] Verifying steward session cookie");
+    const stewardClaims = await verifyStewardTokenCached(getStewardVerifyEnv(), stewardToken);
+    if (!stewardClaims || !(await isStewardSessionActive(stewardClaims))) return null;
+
+    // Check Redis user cache after credential authority has been revalidated.
     const cachedUser = await redisCache.get<UserWithOrganization>(cacheKey);
     if (cachedUser) {
       logger.debug("[AUTH] Cache hit for user session");
@@ -160,10 +198,6 @@ export async function getCurrentUserFromRequest(
       }
       return cachedUser;
     }
-
-    logger.debug("[AUTH] Verifying steward session cookie");
-    const stewardClaims = await verifyStewardTokenCached(getStewardVerifyEnv(), stewardToken);
-    if (!stewardClaims) return null;
 
     let user = await usersService.getByStewardId(stewardClaims.userId);
     if (!user) {
@@ -214,6 +248,7 @@ export async function getCurrentUserFromRequest(
 
     return user;
   } catch (error) {
+    if (error instanceof StewardLogoutMarkerUnavailableError) throw error;
     logger.error("[AUTH] Error:", error instanceof Error ? error.message : error);
     return null;
   }
@@ -403,6 +438,9 @@ export async function requireAuthOrApiKey(request: Request): Promise<AuthResult>
     if (looksLikeJwt(bearerValue)) {
       const stewardClaims = await verifyStewardTokenCached(getStewardVerifyEnv(), bearerValue);
       if (stewardClaims) {
+        if (!(await isStewardSessionActive(stewardClaims))) {
+          throw new AuthenticationError("Session has ended");
+        }
         let user: UserWithOrganization | undefined | null;
         if (stewardClaims.stagingSessionBinding) {
           user = await loadVerifiedStagingSessionUser({
@@ -497,6 +535,7 @@ export async function getUserFromRequest(request: Request): Promise<UserWithOrga
     const token = authHeader.slice(7);
     const stewardClaims = await verifyStewardTokenCached(getStewardVerifyEnv(), token);
     if (stewardClaims) {
+      if (!(await isStewardSessionActive(stewardClaims))) return null;
       if (stewardClaims.stagingSessionBinding) {
         return await loadVerifiedStagingSessionUser({
           binding: stewardClaims.stagingSessionBinding,

@@ -5,6 +5,7 @@
 
 import {
   STEWARD_CSRF_HEADER,
+  STEWARD_CSRF_HEADER_VALUE,
   STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
   type StewardSessionErrorCode,
   type StewardSessionRequest,
@@ -13,13 +14,16 @@ import {
   sanitizeTelegramAccountClaimContinuation,
 } from "@elizaos/shared/steward-session-client";
 import { type Context, Hono } from "hono";
-import { deleteCookie, getCookie, setCookie } from "hono/cookie";
+import { deleteCookie, setCookie } from "hono/cookie";
 import { getAuditDispatcher } from "@/api-app/services/audit-dispatcher-singleton";
 import {
-  checkElizaMutatingRequestOrigin,
+  checkStewardCookieWriterRequest,
   hasElizaNonSimpleRequestMarker,
 } from "@/lib/auth/browser-origin-policy";
-import { cookieDomainForHost } from "@/lib/auth/cookie-domain";
+import {
+  cookieDomainForHost,
+  legacyCookieCleanupDomainForHost,
+} from "@/lib/auth/cookie-domain";
 import { primeVerifiedUserSessionCache } from "@/lib/auth/session-user-cache";
 import { loadVerifiedStagingSessionUser } from "@/lib/auth/staging-session-binding";
 import {
@@ -27,14 +31,25 @@ import {
   type StewardVerifyEnv,
   verifyStewardTokenCached,
 } from "@/lib/auth/steward-client";
-import { stewardCookieNames } from "@/lib/auth/steward-cookies";
+import {
+  legacyStewardCookieNames,
+  readStewardSessionMigrationCookieStateFromHeader,
+  STEWARD_REFRESH_AUTHORITY_TTL_SECONDS,
+  STEWARD_V2_AUTHORITY_MAX_AGE_SECONDS,
+  STEWARD_V2_AUTHORITY_TOMBSTONE,
+  stewardCookieNames,
+  stewardV2CookiesAreHostBound,
+} from "@/lib/auth/steward-cookies";
 import {
   getIpKey,
   getRequestIp,
   RateLimitPresets,
   rateLimit,
 } from "@/lib/middleware/rate-limit-hono-cloudflare";
-import { isBlockedBySsoBridgeLogout } from "@/lib/services/sso-bridge-codes";
+import {
+  classifySsoBridgeLogout,
+  type SsoBridgeLogoutClassification,
+} from "@/lib/services/sso-bridge-codes";
 import {
   StewardPhoneOwnershipError,
   verifyStewardBearerPhone,
@@ -52,24 +67,6 @@ import type { AppEnv } from "@/types/cloud-worker-env";
 
 function stewardSecretConfigured(env: StewardVerifyEnv): boolean {
   return Boolean(env.STEWARD_SESSION_SECRET || env.STEWARD_JWT_SECRET);
-}
-
-const STEWARD_REFRESH_COOKIE_MAX_AGE = 30 * 24 * 60 * 60;
-
-/**
- * CSRF check. Modern browsers always send Origin on cross-origin POST/DELETE
- * (Fetch spec) and on same-origin POST too since 2020. We REQUIRE Origin or
- * Referer on every mutating request — no header-less fallthrough. Tooling
- * (curl, server-to-server, e2e tests, native app) must send an explicit
- * `Origin: http://localhost:8787` (in dev) or the configured prod host. This
- * closes the legacy-browser / extension CSRF hole flagged by the prior SSO
- * audit.
- */
-function checkOrigin(
-  c: { req: { header: (name: string) => string | undefined } },
-  isProduction: boolean,
-): { ok: true } | { ok: false; reason: string } {
-  return checkElizaMutatingRequestOrigin(c.req, isProduction);
 }
 
 /**
@@ -117,6 +114,43 @@ function errorBody(
   return { error: message, code };
 }
 
+function logoutCooldownMessage(retryAfterSeconds: number): string {
+  if (retryAfterSeconds <= 0) {
+    return "You signed out moments ago. Sign in again to create a new session.";
+  }
+  const unit = retryAfterSeconds === 1 ? "second" : "seconds";
+  return `You signed out moments ago. Wait ${retryAfterSeconds} ${unit}, then sign in again to create a new session.`;
+}
+
+function rejectLogoutClassification(
+  c: Context<AppEnv>,
+  classification: Exclude<SsoBridgeLogoutClassification, { status: "allowed" }>,
+  metricSuffix: "admission" | "final",
+): Response {
+  if (classification.status === "definitely_revoked") {
+    logStewardAuth(
+      metricSuffix === "final" ? "session-ended-final" : "session-ended",
+      null,
+    );
+    return c.json(errorBody("Session was signed out", "session_ended"), 401);
+  }
+
+  logStewardAuth(
+    metricSuffix === "final" ? "logout-cooldown-final" : "logout-cooldown",
+    null,
+  );
+  c.header("Retry-After", String(classification.retryAfterSeconds));
+  return c.json(
+    {
+      error: logoutCooldownMessage(classification.retryAfterSeconds),
+      code: "logout_cooldown" as const,
+      retryAfterSeconds: classification.retryAfterSeconds,
+      retryAtEpochSeconds: classification.retryAtEpochSeconds,
+    },
+    409,
+  );
+}
+
 function effectiveStewardTenantId(
   claims: StewardTokenClaims,
   expectedTenantId: string | undefined,
@@ -139,6 +173,56 @@ function isSameStewardIdentity(
   );
 }
 
+function sessionMutationNamespace(
+  c: Context<AppEnv>,
+  cookieState: ReturnType<
+    typeof readStewardSessionMigrationCookieStateFromHeader
+  >,
+): "v2" | "v1" | null {
+  if (cookieState.ambiguous) return null;
+  const marker = c.req.header(STEWARD_CSRF_HEADER);
+  if (marker === STEWARD_SESSION_MUTATION_PROTOCOL_VALUE) return "v2";
+  // API deploys before Pages. The currently served pre-protocol bundle sends
+  // the generic CSRF marker (`1`), so keep it on the v1 namespace while v2 is
+  // wholly absent. Only the Web-Locked protocol activates v2. Once activated,
+  // old tabs fail closed and their already-in-flight v1 responses stay inert.
+  if (
+    marker === STEWARD_CSRF_HEADER_VALUE &&
+    cookieState.v2Authority === "absent" &&
+    cookieState.source !== "v2"
+  ) {
+    return "v1";
+  }
+  return null;
+}
+
+function sessionCleanupMutationNamespace(
+  c: Context<AppEnv>,
+  cookieState: ReturnType<
+    typeof readStewardSessionMigrationCookieStateFromHeader
+  >,
+): "v2" | "v1" | null {
+  const marker = c.req.header(STEWARD_CSRF_HEADER);
+  if (marker === STEWARD_SESSION_MUTATION_PROTOCOL_VALUE) return "v2";
+  if (
+    marker === STEWARD_CSRF_HEADER_VALUE &&
+    cookieState.v2Authority === "absent" &&
+    cookieState.source !== "v2"
+  ) {
+    return "v1";
+  }
+  return null;
+}
+
+function deleteLegacyCookieInOwnedScopes(
+  c: Context<AppEnv>,
+  name: string,
+): void {
+  deleteCookie(c, name, { path: "/" });
+  const domain = legacyCookieCleanupDomainForHost(c.req.header("host"));
+  if (domain) deleteCookie(c, name, { path: "/", domain });
+}
+
 const app = new Hono<AppEnv>();
 
 // Pre-auth session-mint endpoint: the global Redis bucket is the primary
@@ -158,7 +242,12 @@ app.use(
 app.post("/", async (c) => {
   try {
     const isProduction = c.env.NODE_ENV === "production";
-    const originCheck = checkOrigin(c, isProduction);
+    const originCheck = checkStewardCookieWriterRequest(
+      c.req,
+      c.env.ENVIRONMENT,
+      isProduction,
+      { allowCanonicalOidcSameSite: true },
+    );
     if (!originCheck.ok) {
       logStewardAuth("forbidden-origin", null);
       logger.warn("[steward-auth] rejected cross-origin POST", {
@@ -176,10 +265,12 @@ app.post("/", async (c) => {
         403,
       );
     }
-    if (
-      c.req.header(STEWARD_CSRF_HEADER) !==
-      STEWARD_SESSION_MUTATION_PROTOCOL_VALUE
-    ) {
+    const requestCookieState = readStewardSessionMigrationCookieStateFromHeader(
+      c.req.header("cookie") ?? null,
+      c.env.ENVIRONMENT,
+    );
+    const mutationNamespace = sessionMutationNamespace(c, requestCookieState);
+    if (!mutationNamespace) {
       logStewardAuth("session-mutation-protocol-required", null);
       return c.json(
         errorBody(
@@ -307,43 +398,30 @@ app.post("/", async (c) => {
       );
     }
 
-    // Cross-host logout barrier — BRIDGE-ISSUED tokens only. After an explicit
-    // logout, the app origin's surviving bridge-minted token must not re-plant
-    // the domain-wide cookies via its background session sync (that would
-    // silently undo the logout the user just performed). A stamped token
-    // issued at-or-before the user's last explicit logout is refused with a
-    // DISTINCT code the client honors as a real revocation (it clears its
-    // stored session instead of retrying). Ordinary tokens never reach the
-    // marker store: this path must keep minting through an infrastructure
-    // outage (see the Redis-outage suite), and a token that never crossed the
-    // bridge has the same security posture it had before the bridge existed.
-    if (claims.bridged) {
-      let blockedByLogout: boolean;
-      try {
-        blockedByLogout = await isBlockedBySsoBridgeLogout(
-          claims.userId,
-          claims.issuedAt,
-        );
-      } catch (error) {
-        // error-policy:J1 marker-store outage fails CLOSED for bridge-issued
-        // tokens, translated to the same 503 the bridge legs return — no
-        // cookies get planted while the logout barrier is unreadable.
-        logStewardAuth("sso-marker-unavailable", null);
-        logger.error("[steward-auth] SSO logout-marker store unavailable", {
-          error: error instanceof Error ? error.message : String(error),
-        });
-        return c.json(
-          errorBody("SSO bridge unavailable", "sso_unavailable"),
-          503,
-        );
-      }
-      if (blockedByLogout) {
-        logStewardAuth("session-ended", null);
-        return c.json(
-          errorBody("Session was signed out", "session_ended"),
-          401,
-        );
-      }
+    // Cross-host logout is one user-session boundary, regardless of which
+    // side originally minted the token. A direct token can survive host-bound
+    // cookie deletion on the paired origin just as a bridge-issued token can;
+    // both therefore consult the same durable marker before planting cookies.
+    let logoutClassification: SsoBridgeLogoutClassification;
+    try {
+      logoutClassification = await classifySsoBridgeLogout(
+        claims.userId,
+        claims.issuedAt,
+      );
+    } catch (error) {
+      // error-policy:J1 marker-store outage fails CLOSED for every session:
+      // no host may re-plant cookies while global logout authority is unreadable.
+      logStewardAuth("sso-marker-unavailable", null);
+      logger.error("[steward-auth] SSO logout-marker store unavailable", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return c.json(
+        errorBody("SSO bridge unavailable", "sso_unavailable"),
+        503,
+      );
+    }
+    if (logoutClassification.status !== "allowed") {
+      return rejectLogoutClassification(c, logoutClassification, "admission");
     }
 
     let verifiedPhone: string | undefined;
@@ -486,10 +564,18 @@ app.post("/", async (c) => {
       ? Math.max(0, claims.expiration - Math.floor(Date.now() / 1000))
       : null;
 
-    const secure = c.env.NODE_ENV === "production";
-    const domain = cookieDomainForHost(c.req.header("host"));
+    const isV2Mutation = mutationNamespace === "v2";
+    const secure = isV2Mutation
+      ? stewardV2CookiesAreHostBound(c.env.ENVIRONMENT)
+      : c.env.NODE_ENV === "production";
+    const domain = isV2Mutation
+      ? undefined
+      : cookieDomainForHost(c.req.header("host"));
 
-    const cookieNames = stewardCookieNames(c.env.ENVIRONMENT);
+    const cookieNames =
+      mutationNamespace === "v2"
+        ? stewardCookieNames(c.env.ENVIRONMENT)
+        : legacyStewardCookieNames(c.env.ENVIRONMENT);
     const incomingRefreshToken =
       typeof refreshToken === "string" && refreshToken.length > 0
         ? refreshToken
@@ -500,8 +586,8 @@ app.post("/", async (c) => {
       !claims.bridged &&
       !claims.stagingSessionBinding
     ) {
-      const currentRefreshToken = getCookie(c, cookieNames.refreshToken);
-      const currentAccessToken = getCookie(c, cookieNames.token);
+      const currentRefreshToken = requestCookieState.refreshToken;
+      const currentAccessToken = requestCookieState.token;
       if (currentRefreshToken && currentAccessToken !== token) {
         const currentClaims = currentAccessToken
           ? await verifyStewardTokenCached(c.env, currentAccessToken)
@@ -515,6 +601,50 @@ app.post("/", async (c) => {
           );
       }
     }
+    const refreshTokenToInstall =
+      incomingRefreshToken ??
+      (mutationNamespace === "v2" &&
+      requestCookieState.source === "v1" &&
+      !claims.bridged &&
+      !claims.stagingSessionBinding &&
+      !accessOnlyRefreshMustBeDeleted
+        ? (requestCookieState.refreshToken ?? null)
+        : null);
+
+    // The admission check precedes potentially slow identity/phone sync and
+    // prior-cookie identity verification. Re-read the primary only after all
+    // of those awaits and immediately before configuring response cookies so
+    // a logout stamped during any of them wins.
+    try {
+      logoutClassification = await classifySsoBridgeLogout(
+        claims.userId,
+        claims.issuedAt,
+      );
+    } catch (error) {
+      logStewardAuth("sso-marker-unavailable-final", null);
+      logger.error(
+        "[steward-auth] SSO logout-marker store unavailable at cookie commit",
+        {
+          error: error instanceof Error ? error.message : String(error),
+        },
+      );
+      return c.json(
+        errorBody("SSO bridge unavailable", "sso_unavailable"),
+        503,
+      );
+    }
+    if (logoutClassification.status !== "allowed") {
+      return rejectLogoutClassification(c, logoutClassification, "final");
+    }
+
+    // A renewable session retains its signed access JWT for the opaque
+    // refresh-authority horizon so a later rotation/logout can still prove
+    // identity lineage after the JWT's one-hour authorization window. A QA
+    // session is deliberately non-renewable, so retaining that token for 30
+    // days would outlive its source-bound session contract for no purpose.
+    const accessCookieMaxAge = claims.stagingSessionBinding
+      ? Math.max(1, ttl ?? 1)
+      : STEWARD_REFRESH_AUTHORITY_TTL_SECONDS;
 
     setCookie(c, cookieNames.token, token, {
       httpOnly: true,
@@ -522,7 +652,7 @@ app.post("/", async (c) => {
       sameSite: "Lax",
       path: "/",
       ...(domain ? { domain } : {}),
-      ...(typeof ttl === "number" ? { maxAge: ttl } : {}),
+      maxAge: accessCookieMaxAge,
     });
 
     if (
@@ -540,16 +670,20 @@ app.post("/", async (c) => {
       // established account B.
       deleteCookie(c, cookieNames.refreshToken, {
         path: "/",
+        ...(isV2Mutation && secure ? { secure: true } : {}),
         ...(domain ? { domain } : {}),
       });
-    } else if (incomingRefreshToken) {
-      setCookie(c, cookieNames.refreshToken, incomingRefreshToken, {
+    } else if (refreshTokenToInstall) {
+      // Activating v2 from a same-identity v1 session must carry its opaque
+      // HttpOnly refresh authority forward. Otherwise the new v2 marker would
+      // suppress the only renewable credential immediately after migration.
+      setCookie(c, cookieNames.refreshToken, refreshTokenToInstall, {
         httpOnly: true,
         secure,
         sameSite: "Lax",
         path: "/",
         ...(domain ? { domain } : {}),
-        maxAge: STEWARD_REFRESH_COOKIE_MAX_AGE,
+        maxAge: STEWARD_REFRESH_AUTHORITY_TTL_SECONDS,
       });
     }
 
@@ -560,9 +694,9 @@ app.post("/", async (c) => {
       path: "/",
       ...(domain ? { domain } : {}),
       maxAge:
-        claims.stagingSessionBinding && typeof ttl === "number"
-          ? ttl
-          : STEWARD_REFRESH_COOKIE_MAX_AGE,
+        mutationNamespace === "v2"
+          ? STEWARD_V2_AUTHORITY_MAX_AGE_SECONDS
+          : STEWARD_REFRESH_AUTHORITY_TTL_SECONDS,
     });
 
     logStewardAuth("ok", ttl);
@@ -611,7 +745,11 @@ app.post("/", async (c) => {
 
 app.delete("/", (c) => {
   const isProduction = c.env.NODE_ENV === "production";
-  const originCheck = checkOrigin(c, isProduction);
+  const originCheck = checkStewardCookieWriterRequest(
+    c.req,
+    c.env.ENVIRONMENT,
+    isProduction,
+  );
   if (!originCheck.ok) {
     logStewardAuth("forbidden-origin-delete", null);
     return c.json({ error: "Forbidden" }, 403);
@@ -620,10 +758,15 @@ app.delete("/", (c) => {
     logStewardAuth("csrf-marker-missing-delete", null);
     return c.json({ error: "Forbidden", code: "csrf_marker_required" }, 403);
   }
-  if (
-    c.req.header(STEWARD_CSRF_HEADER) !==
-    STEWARD_SESSION_MUTATION_PROTOCOL_VALUE
-  ) {
+  const requestCookieState = readStewardSessionMigrationCookieStateFromHeader(
+    c.req.header("cookie") ?? null,
+    c.env.ENVIRONMENT,
+  );
+  const mutationNamespace = sessionCleanupMutationNamespace(
+    c,
+    requestCookieState,
+  );
+  if (!mutationNamespace) {
     logStewardAuth("session-mutation-protocol-required-delete", null);
     return c.json(
       errorBody(
@@ -633,15 +776,45 @@ app.delete("/", (c) => {
       409,
     );
   }
-  const domain = cookieDomainForHost(c.req.header("host"));
-  const opts = domain ? { path: "/", domain } : { path: "/" };
-  // Production's cookieNames resolve to the same unsuffixed names as
-  // LEGACY_STEWARD_COOKIES, so a single set of deleteCookie calls covers both
-  // eras. The separate legacy clear block was redundant (#14130).
-  const names = stewardCookieNames(c.env.ENVIRONMENT);
-  deleteCookie(c, names.token, opts);
-  deleteCookie(c, names.refreshToken, opts);
-  deleteCookie(c, names.authed, opts);
+  const v1 = legacyStewardCookieNames(c.env.ENVIRONMENT);
+  const v2 = stewardCookieNames(c.env.ENVIRONMENT);
+  const v2Secure = stewardV2CookiesAreHostBound(c.env.ENVIRONMENT);
+  if (mutationNamespace === "v1") {
+    deleteLegacyCookieInOwnedScopes(c, v1.token);
+    deleteLegacyCookieInOwnedScopes(c, v1.refreshToken);
+    deleteLegacyCookieInOwnedScopes(c, v1.authed);
+    // Closing a legacy session also closes the v2 authority boundary. Without
+    // this tombstone, a late/cached v1 response could make migration observable
+    // again after logout.
+    setCookie(c, v2.authed, STEWARD_V2_AUTHORITY_TOMBSTONE, {
+      httpOnly: false,
+      secure: v2Secure,
+      sameSite: "Lax",
+      path: "/",
+      maxAge: STEWARD_V2_AUTHORITY_MAX_AGE_SECONDS,
+    });
+    logStewardAuth("deleted-v1", null);
+    return c.json({ ok: true });
+  }
+
+  const v2DeleteOpts = {
+    path: "/",
+    ...(v2Secure ? { secure: true } : {}),
+  };
+  deleteCookie(c, v2.token, v2DeleteOpts);
+  deleteCookie(c, v2.refreshToken, v2DeleteOpts);
+  deleteLegacyCookieInOwnedScopes(c, v1.token);
+  deleteLegacyCookieInOwnedScopes(c, v1.refreshToken);
+  deleteLegacyCookieInOwnedScopes(c, v1.authed);
+  // Never delete the v2 authority marker: a persistent tombstone is what makes
+  // a late v1 login response inert instead of reopening the migration fallback.
+  setCookie(c, v2.authed, STEWARD_V2_AUTHORITY_TOMBSTONE, {
+    httpOnly: false,
+    secure: v2Secure,
+    sameSite: "Lax",
+    path: "/",
+    maxAge: STEWARD_V2_AUTHORITY_MAX_AGE_SECONDS,
+  });
   logStewardAuth("deleted", null);
   return c.json({ ok: true });
 });

@@ -5,6 +5,7 @@
  * destination `/join` (ordinary Eliza Cloud login).
  */
 
+import { readStoredStewardToken } from "@elizaos/shared/steward-session-client";
 import { AlertTriangle, CheckCircle2, Loader2 } from "lucide-react";
 import type { ReactNode } from "react";
 import { useContext, useEffect, useMemo, useRef, useState } from "react";
@@ -18,9 +19,11 @@ import { Button } from "../../../../components/primitives";
 import { enqueueStewardSessionMutation } from "../../../lib/steward-session-mutation-queue";
 import {
   beginStewardSessionRecovery,
-  completeStewardSessionRecovery,
-  isStewardSessionRecoveryReceiptLive,
+  createStewardSessionRecoveryCommittedAuthority,
+  createStewardSessionRecoveryPublicationFence,
+  markStewardSessionRecoveryCookiePending,
   rejectStewardSessionRecovery,
+  type StewardSessionRecoveryCommittedAuthority,
 } from "../../../lib/steward-session-recovery-marker";
 import { useCloudT } from "../../../shell/CloudI18nProvider";
 import {
@@ -32,6 +35,7 @@ import {
   DEFAULT_STEWARD_TENANT_ID,
 } from "../../../shell/steward-config";
 import { resolveBrowserStewardApiUrl } from "../../../shell/steward-url";
+import { clearSsoLoggedOut } from "../../../sso-bridge/sso-bridge";
 import {
   consumePendingOAuthReturnTo,
   defaultLoginReturnTo,
@@ -46,6 +50,8 @@ type ResendStatus = "idle" | "sending" | "sent" | "error";
 
 const EMAIL_RESEND_COOLDOWN_MS = 30_000;
 const STEWARD_TENANT_ID = configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID);
+const EMAIL_CALLBACK_SUPERSEDED_MESSAGE =
+  "A newer sign-in superseded this email callback. Restore the latest browser session before continuing.";
 
 type EmailVerificationResult = {
   token: string;
@@ -86,7 +92,22 @@ const pendingEmailVerifications = new Map<
   string,
   Promise<EmailVerificationResult>
 >();
-const pendingEmailSessionCommits = new Map<string, Promise<void>>();
+interface EmailCallbackCommittedAuthority
+  extends StewardSessionRecoveryCommittedAuthority {
+  claimTerminalPublication(destination: string): {
+    destination: string;
+    shouldPublish: boolean;
+  };
+}
+const pendingEmailSessionCommits = new Map<
+  string,
+  Promise<EmailCallbackCommittedAuthority>
+>();
+const completedEmailSessionCommits = new Map<
+  string,
+  EmailCallbackCommittedAuthority
+>();
+const MAX_COMPLETED_EMAIL_SESSION_COMMITS = 8;
 
 function verifyEmailCallbackSingleFlight(
   verify: (token: string, email: string) => Promise<EmailVerificationResult>,
@@ -116,70 +137,133 @@ function isDefiniteSessionMutationRejection(error: unknown): boolean {
     error !== null && typeof error === "object" && "status" in error
       ? Reflect.get(error, "status")
       : undefined;
-  return (
-    typeof status === "number" &&
-    status >= 400 &&
-    status < 500 &&
-    status !== 408
-  );
+  return typeof status === "number";
 }
 
 /**
  * StrictMode/provider remounts share the complete one-time-link transaction,
  * not just its upstream verification. The durable receipt is planted before
  * the first cookie mutation, and the origin lock remains held through
- * canonical token publication and exact receipt completion.
+ * canonical token publication at the exact receipt-commit boundary.
  */
 function commitEmailCallbackSessionSingleFlight(
   verify: (token: string, email: string) => Promise<EmailVerificationResult>,
   token: string,
   email: string,
-): Promise<void> {
+): Promise<EmailCallbackCommittedAuthority> {
   const key = `${email}\0${token}`;
+  const completed = completedEmailSessionCommits.get(key);
+  if (completed) {
+    if (completed.isCurrent()) return Promise.resolve(completed);
+    completedEmailSessionCommits.delete(key);
+    return Promise.reject(new Error(EMAIL_CALLBACK_SUPERSEDED_MESSAGE));
+  }
   const pending = pendingEmailSessionCommits.get(key);
   if (pending) return pending;
 
+  // Plant A's intent before the one-time verifier is dispatched. If verify A
+  // stalls while login B starts, B must remain the newer generation; creating
+  // A's receipt only after the response would invert that authority order.
+  const recoveryReceipt = beginStewardSessionRecovery(
+    STEWARD_TENANT_ID,
+    "provider",
+  );
+  let cookieMutationDispatched = false;
+  let receiptRejected = false;
+  const rejectReceiptIfSafe = (error: unknown) => {
+    if (
+      !receiptRejected &&
+      (!cookieMutationDispatched || isDefiniteSessionMutationRejection(error))
+    ) {
+      receiptRejected = true;
+      rejectStewardSessionRecovery(recoveryReceipt);
+    }
+  };
   const commit = verifyEmailCallbackSingleFlight(verify, token, email)
     .then(async (result) => {
-      // This synchronous, fail-closed write must precede the cookie POST. If
-      // localStorage is unavailable, the one-time verification may have been
-      // consumed but no browser/server session mutation is dispatched.
-      const recoveryReceipt = beginStewardSessionRecovery(
-        STEWARD_TENANT_ID,
-        "provider",
-      );
       try {
+        const publication =
+          createStewardSessionRecoveryPublicationFence(recoveryReceipt);
+        const callbackOwnsPublication = publication.validate;
         const committed = await enqueueStewardSessionMutation(
           async (mutationLease) => {
-            if (!isStewardSessionRecoveryReceiptLive(recoveryReceipt)) {
+            if (!callbackOwnsPublication()) {
               return false;
             }
+            markStewardSessionRecoveryCookiePending(
+              recoveryReceipt,
+              result.token,
+            );
+            cookieMutationDispatched = true;
             await syncStewardSessionCookie(result.token, result.refreshToken, {
               mutationLease,
-              validate: () =>
-                isStewardSessionRecoveryReceiptLive(recoveryReceipt),
+              validate: callbackOwnsPublication,
+              finalizeBeforePublish: publication.finalizeBeforePublish,
             });
-            if (!isStewardSessionRecoveryReceiptLive(recoveryReceipt)) {
+            if (
+              !publication.isFinalized() ||
+              !callbackOwnsPublication() ||
+              readStoredStewardToken() !== result.token
+            ) {
               return false;
             }
-            completeStewardSessionRecovery(recoveryReceipt);
-            return true;
+            clearSsoLoggedOut();
+            if (!publication.publishChange() || !callbackOwnsPublication()) {
+              return false;
+            }
+            window.dispatchEvent(
+              new CustomEvent("steward-token-sync", {
+                detail: { token: result.token },
+              }),
+            );
+            return (
+              callbackOwnsPublication() &&
+              readStoredStewardToken() === result.token
+            );
           },
         );
         if (!committed) {
-          throw new Error(
-            "A newer sign-in superseded this email callback. Restore the latest browser session before continuing.",
-          );
+          throw new Error(EMAIL_CALLBACK_SUPERSEDED_MESSAGE);
         }
+        const authority = createStewardSessionRecoveryCommittedAuthority(
+          recoveryReceipt,
+          result.token,
+        );
+        if (!authority.isCurrent()) {
+          throw new Error(EMAIL_CALLBACK_SUPERSEDED_MESSAGE);
+        }
+        let terminalDestination: string | null = null;
+        const committedAuthority: EmailCallbackCommittedAuthority = {
+          isCurrent: authority.isCurrent,
+          claimTerminalPublication: (destination) => {
+            const shouldPublish = terminalDestination === null;
+            terminalDestination ??= destination;
+            return { destination: terminalDestination, shouldPublish };
+          },
+        };
+        completedEmailSessionCommits.delete(key);
+        completedEmailSessionCommits.set(key, committedAuthority);
+        while (
+          completedEmailSessionCommits.size >
+          MAX_COMPLETED_EMAIL_SESSION_COMMITS
+        ) {
+          const oldestKey = completedEmailSessionCommits.keys().next().value;
+          if (typeof oldestKey !== "string") break;
+          completedEmailSessionCommits.delete(oldestKey);
+        }
+        return committedAuthority;
       } catch (error) {
-        // A transport error, 5xx, or interrupted continuation cannot prove
-        // that cookies were not committed. Keep the receipt for cookie-first
-        // recovery; only an explicit 4xx rejection retires this exact intent.
-        if (isDefiniteSessionMutationRejection(error)) {
-          rejectStewardSessionRecovery(recoveryReceipt);
-        }
+        // Before cookie dispatch, any failure proves that no server-side
+        // session mutation can have committed. Once dispatched, only a failure
+        // without an HTTP response is ambiguous; any typed response status
+        // proves the route rejected the mutation before committing it.
+        rejectReceiptIfSafe(error);
         throw error;
       }
+    })
+    .catch((error) => {
+      rejectReceiptIfSafe(error);
+      throw error;
     })
     .finally(() => {
       if (pendingEmailSessionCommits.get(key) === commit) {
@@ -231,8 +315,14 @@ function EmailCallbackContent() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const auth = useContext(LocalStewardAuthContext);
-  const attemptedRef = useRef(false);
+  const commitOperationRef = useRef<{
+    key: string;
+    promise: Promise<EmailCallbackCommittedAuthority>;
+  } | null>(null);
+  const verificationEffectGenerationRef = useRef(0);
   const successDestinationRef = useRef<string | null>(null);
+  const successAuthorityRef =
+    useRef<StewardSessionRecoveryCommittedAuthority | null>(null);
   const [status, setStatus] = useState<CallbackStatus>("verifying");
   const [error, setError] = useState<string | null>(null);
   const [resendStatus, setResendStatus] = useState<ResendStatus>("idle");
@@ -262,8 +352,15 @@ function EmailCallbackContent() {
   }, [resendAvailableAt]);
 
   useEffect(() => {
-    if (attemptedRef.current) return;
-    attemptedRef.current = true;
+    const effectGeneration = verificationEffectGenerationRef.current + 1;
+    verificationEffectGenerationRef.current = effectGeneration;
+    const effectIsCurrent = () =>
+      verificationEffectGenerationRef.current === effectGeneration;
+    const retireEffect = () => {
+      if (effectIsCurrent()) {
+        verificationEffectGenerationRef.current = effectGeneration + 1;
+      }
+    };
 
     if (!auth) {
       setStatus("error");
@@ -273,18 +370,39 @@ function EmailCallbackContent() {
             "Sign-in is unavailable. Start sign-in again from the app.",
         }),
       );
-      return;
+      return retireEffect;
     }
 
-    const finishSuccess = () => {
-      const destination = resolveEmailCallbackDestination(
+    const finishSuccess = async (
+      authority: EmailCallbackCommittedAuthority,
+    ): Promise<boolean> => {
+      if (!authority.isCurrent()) return false;
+      const candidateDestination = resolveEmailCallbackDestination(
         returnTo,
         consumePendingOAuthReturnTo(),
       );
+      if (!authority.isCurrent()) return false;
+      const terminal = authority.claimTerminalPublication(candidateDestination);
+      const destination = terminal.destination;
       successDestinationRef.current = destination;
-      clearStoredAppAuthorizeReturnTo();
-      if (email) publishStewardEmailLoginComplete(email, destination);
+      if (terminal.shouldPublish) clearStoredAppAuthorizeReturnTo();
+      if (!authority.isCurrent()) return false;
+      if (email && terminal.shouldPublish) {
+        publishStewardEmailLoginComplete(email, destination);
+        if (!authority.isCurrent()) return false;
+      }
+      // Completion consumers can enqueue login B without mutating recovery
+      // storage synchronously. Yield once, then install terminal UI only if A
+      // still owns the exact generation/token at this continuation boundary.
+      await Promise.resolve();
+      if (!effectIsCurrent() || !authority.isCurrent()) return false;
+      successAuthorityRef.current = authority;
+      if (!authority.isCurrent()) {
+        successAuthorityRef.current = null;
+        return false;
+      }
       setStatus("success");
+      return true;
     };
 
     const token = searchParams.get("token");
@@ -296,7 +414,7 @@ function EmailCallbackContent() {
           defaultValue: "This sign-in link is missing its token or email.",
         }),
       );
-      return;
+      return retireEffect;
     }
 
     void (async () => {
@@ -306,19 +424,33 @@ function EmailCallbackContent() {
         // The module-level single-flight survives StrictMode/provider remounts;
         // a component-local ref does not, and two concurrent POSTs can consume
         // the same one-time link before either mount observes authentication.
-        await commitEmailCallbackSessionSingleFlight(
-          auth.verifyEmailCallback,
-          token,
-          callbackEmail,
-        );
-        finishSuccess();
+        const operationKey = `${callbackEmail}\0${token}`;
+        const commitOperation =
+          commitOperationRef.current?.key === operationKey
+            ? commitOperationRef.current.promise
+            : commitEmailCallbackSessionSingleFlight(
+                auth.verifyEmailCallback,
+                token,
+                callbackEmail,
+              );
+        commitOperationRef.current = {
+          key: operationKey,
+          promise: commitOperation,
+        };
+        const authority = await commitOperation;
+        if (!effectIsCurrent()) return;
+        if (!authority.isCurrent() || !(await finishSuccess(authority))) {
+          throw new Error(EMAIL_CALLBACK_SUPERSEDED_MESSAGE);
+        }
       } catch (err) {
+        if (!effectIsCurrent()) return;
         // error-policy:J4 expected rejected/expired one-time links render a
         // distinct recovery message; unexpected failures retain their detail.
         setStatus("error");
         setError(describeVerificationError(err, t));
       }
     })();
+    return retireEffect;
   }, [auth, email, returnTo, searchParams, t]);
 
   async function handleResend() {
@@ -351,14 +483,28 @@ function EmailCallbackContent() {
 
   useEffect(() => {
     if (status !== "success") return;
+    const authority = successAuthorityRef.current;
+    if (!authority?.isCurrent()) {
+      setStatus("error");
+      setError(EMAIL_CALLBACK_SUPERSEDED_MESSAGE);
+      return;
+    }
     const destination = successDestinationRef.current ?? defaultLoginReturnTo();
     const redirectTimer = setTimeout(() => {
+      if (!authority.isCurrent()) {
+        setStatus("error");
+        setError(EMAIL_CALLBACK_SUPERSEDED_MESSAGE);
+        return;
+      }
       navigate(destination, { replace: true });
     }, 1500);
     return () => clearTimeout(redirectTimer);
   }, [navigate, status]);
 
-  if (status === "error") {
+  const successSuperseded =
+    status === "success" && successAuthorityRef.current?.isCurrent() !== true;
+
+  if (status === "error" || successSuperseded) {
     return (
       <Frame>
         <div className="bg-accent p-4 text-accent-foreground">
@@ -369,7 +515,9 @@ function EmailCallbackContent() {
             defaultValue: "Sign-in failed",
           })}
         </h1>
-        <p className="max-w-xs text-center text-sm text-muted">{error}</p>
+        <p className="max-w-xs text-center text-sm text-muted">
+          {successSuperseded ? EMAIL_CALLBACK_SUPERSEDED_MESSAGE : error}
+        </p>
         {resendStatus === "sent" && (
           <p className="text-center text-sm text-muted" role="status">
             {t("cloud.emailCallback.resent", {
@@ -450,7 +598,14 @@ function EmailCallbackContent() {
         <p className="text-sm text-muted">{successCopy}</p>
         <Button
           className="mt-2"
-          onClick={() => navigate(destination, { replace: true })}
+          onClick={() => {
+            if (!successAuthorityRef.current?.isCurrent()) {
+              setStatus("error");
+              setError(EMAIL_CALLBACK_SUPERSEDED_MESSAGE);
+              return;
+            }
+            navigate(destination, { replace: true });
+          }}
         >
           {buttonCopy}
         </Button>

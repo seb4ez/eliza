@@ -14,7 +14,10 @@
  */
 
 import { beforeEach, describe, expect, mock, test } from "bun:test";
-import { STEWARD_SESSION_MUTATION_PROTOCOL_VALUE } from "@elizaos/shared/steward-session-client";
+import {
+  STEWARD_CSRF_HEADER_VALUE,
+  STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+} from "@elizaos/shared/steward-session-client";
 
 process.env.NODE_ENV ||= "test";
 
@@ -77,6 +80,10 @@ const LOGOUT_USER = {
 
 mock.module("@/lib/auth/workers-hono-auth", () => ({
   ...realAuth,
+  getExistingUserForVerifiedStewardClaims: async (
+    _c: unknown,
+    claims: { userId: string },
+  ) => (claims.userId === "steward-user-1" ? LOGOUT_USER : null),
   getCurrentUser: async (c: {
     req: { header: (n: string) => string | undefined };
   }) =>
@@ -93,6 +100,7 @@ mock.module("@/lib/auth", () => ({
 
 const markSsoBridgeLogout = mock(async () => {});
 mock.module("@/lib/services/sso-bridge-codes", () => ({
+  classifySsoBridgeLogout: mock(async () => ({ status: "allowed" as const })),
   isBlockedBySsoBridgeLogout: mock(async () => false),
   markSsoBridgeLogout,
 }));
@@ -135,7 +143,8 @@ function attributedHeaders(): Record<string, string> {
   return {
     "cf-connecting-ip": CF_IP,
     "x-forwarded-for": SPOOFED_XFF,
-    origin: "https://staging.elizacloud.ai",
+    origin: "https://staging.eliza.app",
+    "sec-fetch-site": "same-origin",
     "content-type": "application/json",
     "x-eliza-csrf": STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
   };
@@ -203,6 +212,7 @@ describe("auth audit events attribute the Cloudflare-attested IP", () => {
         headers: {
           ...attributedHeaders(),
           cookie: "steward-token-staging=logout-token",
+          "x-eliza-csrf": STEWARD_CSRF_HEADER_VALUE,
         },
       }),
       ENV,

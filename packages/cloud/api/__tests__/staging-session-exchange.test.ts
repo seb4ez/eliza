@@ -13,6 +13,7 @@ import {
   describe,
   expect,
   setDefaultTimeout,
+  setSystemTime,
   spyOn,
   test,
 } from "bun:test";
@@ -21,6 +22,11 @@ import { STEWARD_SESSION_MUTATION_PROTOCOL_VALUE } from "@elizaos/shared/steward
 import { eq, sql } from "drizzle-orm";
 import { Hono } from "hono";
 import { decodeJwt, decodeProtectedHeader, jwtVerify, SignJWT } from "jose";
+import {
+  STEWARD_REFRESH_AUTHORITY_TTL_SECONDS,
+  STEWARD_V2_AUTHORITY_MAX_AGE_SECONDS,
+  stewardCookieNames,
+} from "@/lib/auth/steward-cookies";
 
 const PROCESS_ENV_KEYS = [
   "CACHE_ENABLED",
@@ -76,6 +82,7 @@ const RAW_SANDBOX_API_KEY = `eliza_${"12".repeat(32)}`;
 const SANDBOX_API_KEY_HASH = createHash("sha256")
   .update(RAW_SANDBOX_API_KEY)
   .digest("hex");
+const STAGING_COOKIE_NAMES = stewardCookieNames("staging");
 
 type RouteApp = typeof import("../auth/staging-session-exchange/route").default;
 type LegacySsoApp = typeof import("../auth/sso-bridge/route").default;
@@ -321,12 +328,62 @@ async function syncSessionCookie(
         "content-type": "application/json",
         host: API_HOST,
         origin: APP_ORIGIN,
+        "sec-fetch-site": "same-origin",
         "x-eliza-csrf": STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
       },
       body: JSON.stringify({ token, refreshToken }),
     },
     BASE_ENV as never,
   );
+}
+
+async function refreshSessionCookie(cookie: string): Promise<Response> {
+  return await stewardRefreshApp.request(
+    `${API_ORIGIN}/`,
+    {
+      method: "POST",
+      headers: {
+        host: API_HOST,
+        origin: APP_ORIGIN,
+        "sec-fetch-site": "same-origin",
+        "x-eliza-csrf": STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+        cookie,
+      },
+    },
+    BASE_ENV as never,
+  );
+}
+
+interface ParsedSetCookie {
+  raw: string;
+  value: string;
+  maxAge: number | null;
+}
+
+function parseSetCookie(
+  response: Response,
+  name: string,
+): ParsedSetCookie | null {
+  const raw = response.headers
+    .getSetCookie()
+    .find((cookie) => cookie.startsWith(`${name}=`));
+  if (!raw) return null;
+  const pair = raw.split(";", 1)[0] ?? "";
+  const maxAge = raw.match(/(?:^|;\s*)Max-Age=(-?\d+)/i)?.[1];
+  return {
+    raw,
+    value: pair.slice(name.length + 1),
+    maxAge: maxAge === undefined ? null : Number(maxAge),
+  };
+}
+
+function activeSessionCookieHeader(response: Response): string {
+  const access = parseSetCookie(response, STAGING_COOKIE_NAMES.token);
+  const marker = parseSetCookie(response, STAGING_COOKIE_NAMES.authed);
+  if (!access?.value || marker?.value !== "1") {
+    throw new Error("staging session response did not establish v2 cookies");
+  }
+  return `${STAGING_COOKIE_NAMES.token}=${access.value}; ${STAGING_COOKIE_NAMES.authed}=${marker.value}`;
 }
 
 async function mintDerivedToken(): Promise<string> {
@@ -422,7 +479,7 @@ async function resolveFromOuterCookieCache(
   return await runWithCloudBindingsAsync(env, async () =>
     getCurrentUserFromRequest(
       new Request(`${API_ORIGIN}/api/v1/models`, {
-        headers: { cookie: `steward-token-staging=${token}` },
+        headers: { cookie: `__Host-steward-token-v2-staging=${token}` },
       }),
     ),
   );
@@ -963,6 +1020,7 @@ describe("mint authentication and existing-subject eligibility", () => {
           .update(schemas.apiKeys)
           .set({ deleted_at: new Date() })
           .where(eq(schemas.apiKeys.id, API_KEY_ID)),
+      expectedStatus: 401,
     },
     {
       name: "inactive user",
@@ -1390,14 +1448,129 @@ describe("rollback and legacy downgrade isolation", () => {
 
   test("cookie sync binds the primary QA user and clears any renewable session", async () => {
     const token = await mintDerivedToken();
+    const tokenClaims = decodeJwt(token);
+    const beforeSync = Math.floor(Date.now() / 1000);
     const response = await syncSessionCookie(token);
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ ok: true, userId: USER_ID });
     const cookies = response.headers.getSetCookie().join("\n");
-    expect(cookies).toContain("steward-token-staging=");
-    expect(cookies).toContain("steward-refresh-token-staging=");
+    expect(cookies).toContain("__Host-steward-token-v2-staging=");
+    expect(cookies).toContain("__Host-steward-refresh-token-v2-staging=");
     expect(cookies).not.toContain("must-not-survive-qa-session");
-    expect(cookies).not.toContain("Max-Age=2592000");
+    const accessCookie = parseSetCookie(response, STAGING_COOKIE_NAMES.token);
+    expect(accessCookie?.value).toBe(token);
+    expect(accessCookie?.maxAge).toBeGreaterThan(0);
+    expect(accessCookie?.maxAge).toBeLessThanOrEqual(3600);
+    expect(accessCookie?.maxAge).toBeLessThanOrEqual(
+      (tokenClaims.exp ?? 0) - beforeSync,
+    );
+    expect(accessCookie?.maxAge).not.toBe(
+      STEWARD_REFRESH_AUTHORITY_TTL_SECONDS,
+    );
+    expect(accessCookie?.maxAge).not.toBe(STEWARD_V2_AUTHORITY_MAX_AGE_SECONDS);
+
+    const refreshCookie = parseSetCookie(
+      response,
+      STAGING_COOKIE_NAMES.refreshToken,
+    );
+    expect(refreshCookie?.value).toBe("");
+    expect(refreshCookie?.maxAge).toBe(0);
+  });
+
+  test("cookie refresh preserves the same non-renewable QA JWT with bounded access retention", async () => {
+    const token = await mintDerivedToken();
+    const tokenClaims = decodeJwt(token);
+    const tokenExpiration = tokenClaims.exp;
+    if (typeof tokenExpiration !== "number") {
+      throw new Error("staging session token has no expiration");
+    }
+    const synced = await syncSessionCookie(token);
+    expect(synced.status).toBe(200);
+    const retiredRefresh = parseSetCookie(
+      synced,
+      STAGING_COOKIE_NAMES.refreshToken,
+    );
+    expect(retiredRefresh?.value).toBe("");
+    expect(retiredRefresh?.maxAge).toBe(0);
+    const cookieHeader = activeSessionCookieHeader(synced);
+
+    const beforeRefresh = Math.floor(Date.now() / 1000);
+    const refreshed = await refreshSessionCookie(cookieHeader);
+    expect(refreshed.status).toBe(200);
+    const body = (await refreshed.json()) as {
+      token: string;
+      expiresAt: number;
+      expiresIn: number;
+    };
+    expect(body.token).toBe(token);
+    expect(body.expiresAt).toBe(tokenExpiration);
+
+    const accessCookie = parseSetCookie(refreshed, STAGING_COOKIE_NAMES.token);
+    expect(accessCookie?.value).toBe(token);
+    expect(accessCookie?.maxAge).toBe(body.expiresIn);
+    expect(accessCookie?.maxAge).toBeGreaterThan(0);
+    expect(accessCookie?.maxAge).toBeLessThanOrEqual(3600);
+    expect(accessCookie?.maxAge).toBeLessThanOrEqual(
+      tokenExpiration - beforeRefresh,
+    );
+    expect(accessCookie?.maxAge).not.toBe(
+      STEWARD_REFRESH_AUTHORITY_TTL_SECONDS,
+    );
+    expect(accessCookie?.maxAge).not.toBe(STEWARD_V2_AUTHORITY_MAX_AGE_SECONDS);
+    expect(
+      parseSetCookie(refreshed, STAGING_COOKIE_NAMES.refreshToken),
+    ).toBeNull();
+  });
+
+  test("cookie refresh decreases QA retention without extending its original expiry", async () => {
+    const initialNowMs = Date.now();
+    setSystemTime(initialNowMs);
+    try {
+      const token = await mintDerivedToken();
+      const tokenClaims = decodeJwt(token);
+      const tokenExpiration = tokenClaims.exp;
+      if (typeof tokenExpiration !== "number") {
+        throw new Error("staging session token has no expiration");
+      }
+      const syncedAt = Math.floor(Date.now() / 1000);
+      const synced = await syncSessionCookie(token);
+      expect(synced.status).toBe(200);
+      const initialAccessCookie = parseSetCookie(
+        synced,
+        STAGING_COOKIE_NAMES.token,
+      );
+      expect(initialAccessCookie?.maxAge).toBeGreaterThan(600);
+      const initialCookieExpiry = syncedAt + (initialAccessCookie?.maxAge ?? 0);
+
+      setSystemTime(initialNowMs + 10 * 60 * 1000);
+      const refreshedAt = Math.floor(Date.now() / 1000);
+      const refreshed = await refreshSessionCookie(
+        activeSessionCookieHeader(synced),
+      );
+      expect(refreshed.status).toBe(200);
+      const body = (await refreshed.json()) as {
+        token: string;
+        expiresAt: number;
+        expiresIn: number;
+      };
+      const refreshedAccessCookie = parseSetCookie(
+        refreshed,
+        STAGING_COOKIE_NAMES.token,
+      );
+      expect(refreshedAccessCookie?.maxAge).toBeGreaterThan(0);
+      expect(refreshedAccessCookie?.maxAge).toBeLessThan(
+        initialAccessCookie?.maxAge ?? 0,
+      );
+      const refreshedCookieExpiry =
+        refreshedAt + (refreshedAccessCookie?.maxAge ?? 0);
+      expect(body.token).toBe(token);
+      expect(body.expiresAt).toBe(tokenExpiration);
+      expect(refreshedAccessCookie?.maxAge).toBe(body.expiresIn);
+      expect(refreshedCookieExpiry).toBeLessThanOrEqual(initialCookieExpiry);
+      expect(refreshedCookieExpiry).toBe(tokenExpiration);
+    } finally {
+      setSystemTime();
+    }
   });
 });
 
@@ -1498,7 +1671,7 @@ describe("full/thin verifier env and outer cookie-cache revocation", () => {
       req: {
         header: (name: string) =>
           name.toLowerCase() === "cookie"
-            ? `steward-token-staging=${token}`
+            ? `__Host-steward-token-v2-staging=${token}`
             : undefined,
       },
     } as never);

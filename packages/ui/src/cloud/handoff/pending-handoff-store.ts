@@ -55,6 +55,57 @@ export function clearPendingCloudHandoff(): void {
   runAsPrivilegedShell(() => storage()?.removeItem(STORAGE_KEY));
 }
 
+function pendingCloudHandoffEquals(
+  left: PendingCloudHandoff | null,
+  right: PendingCloudHandoff | null,
+): boolean {
+  if (left === null || right === null) return left === right;
+  return (
+    left.sharedAgentId === right.sharedAgentId &&
+    left.dedicatedAgentId === right.dedicatedAgentId &&
+    left.sharedApiBase === right.sharedApiBase &&
+    left.cloudApiBase === right.cloudApiBase &&
+    left.startedAt === right.startedAt
+  );
+}
+
+/** True only while the complete persisted marker still belongs to `expected`. */
+export function isPendingCloudHandoffCurrent(
+  expected: PendingCloudHandoff | null,
+): boolean {
+  return pendingCloudHandoffEquals(loadPendingCloudHandoff(), expected);
+}
+
+/**
+ * Removes a marker only when every immutable field still matches. A stale
+ * account-A completion therefore cannot erase account B's newer resume marker.
+ */
+export function clearPendingCloudHandoffIfCurrent(
+  expected: PendingCloudHandoff,
+): boolean {
+  const store = storage();
+  if (!store || !pendingCloudHandoffEquals(loadPendingCloudHandoff(), expected))
+    return false;
+  runAsPrivilegedShell(() => store.removeItem(STORAGE_KEY));
+  return true;
+}
+
+/**
+ * Replaces the exact expected marker (including `null`) with `next`. This is a
+ * renderer-local CAS: JavaScript cannot interleave between the comparison and
+ * synchronous localStorage write, so a newer marker is never overwritten.
+ */
+export function savePendingCloudHandoffIfCurrent(
+  expected: PendingCloudHandoff | null,
+  next: PendingCloudHandoff,
+): boolean {
+  const store = storage();
+  if (!store || !pendingCloudHandoffEquals(loadPendingCloudHandoff(), expected))
+    return false;
+  runAsPrivilegedShell(() => store.setItem(STORAGE_KEY, JSON.stringify(next)));
+  return true;
+}
+
 /** Load the marker; malformed or expired entries are cleared and reported null. */
 export function loadPendingCloudHandoff(
   now: number = Date.now(),

@@ -22,11 +22,11 @@
  * only a genuinely absent/expired cloud session falls through to the notice.
  *
  * SECURITY (auth-adjacent): this NEVER fabricates or bypasses a session. It
- * only exchanges an EXISTING, server-validated HttpOnly refresh cookie for a
- * fresh access token via the canonical Steward refresh endpoint. No cookie →
- * no token → the notice/wall stands exactly as before. It writes only the
- * canonical Steward token key, touching no unrelated agent credential (i.e.
- * it does NOT introduce the over-broad purge that #16673's default did).
+ * only exchanges an EXISTING, server-validated HttpOnly refresh cookie (web),
+ * or rotates an existing Steward bearer against the configured Cloud API
+ * (native/Electrobun). Without either authority, the notice/wall stands. It
+ * writes only the canonical Steward token key, touching no unrelated agent
+ * credential (i.e. it does NOT introduce #16673's over-broad purge).
  */
 
 import {
@@ -36,6 +36,12 @@ import {
   writeStoredStewardToken,
 } from "@elizaos/shared/steward-session-client";
 import { refreshCloudStewardSession } from "../api/client-cloud";
+import {
+  DEFAULT_DIRECT_CLOUD_API_BASE_URL,
+  resolveDirectCloudAuthApiBase,
+} from "../api/direct-cloud-endpoints";
+import { isElectrobunRuntime } from "../bridge/electrobun-runtime";
+import { getBootConfig } from "../config/boot-config";
 
 /** Bounded so the recovery gate can never hang on a slow refresh. */
 export const CLOUD_REPAIR_REFRESH_TIMEOUT_MS = 6_000;
@@ -56,6 +62,10 @@ export interface EnsureCloudSessionForRepairDeps {
   timeoutMs?: number;
   /** Injected (tests). Defaults to real setTimeout-based race. */
   raceTimeout?: <T>(p: Promise<T>, ms: number) => Promise<T | null>;
+  /** Ignore a present but expired/near-expiry JWT and rotate its session. */
+  forceRefresh?: boolean;
+  /** Exact recovery generation + runtime target authority owned by the caller. */
+  validate?: () => boolean;
 }
 
 function defaultRaceTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
@@ -68,7 +78,39 @@ function defaultRaceTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
   });
 }
 
-function resolveRepairRefreshEndpoint(): string | undefined {
+function isBearerRefreshRuntime(): boolean {
+  let isNative = false;
+  try {
+    isNative = Boolean(
+      (
+        globalThis as typeof globalThis & {
+          Capacitor?: { isNativePlatform?: () => boolean };
+        }
+      ).Capacitor?.isNativePlatform?.(),
+    );
+  } catch {
+    isNative = false;
+  }
+  return isNative || isElectrobunRuntime();
+}
+
+function resolveRepairRefreshEndpoint(
+  bearerRefreshRuntime: boolean,
+): string | undefined {
+  if (bearerRefreshRuntime) {
+    const configuredCloudBase =
+      getBootConfig().cloudApiBase?.trim() || DEFAULT_DIRECT_CLOUD_API_BASE_URL;
+    const resolvedApiBase = resolveDirectCloudAuthApiBase(configuredCloudBase);
+    try {
+      const parsed = new URL(resolvedApiBase);
+      if (parsed.protocol === "https:" || parsed.protocol === "http:") {
+        return `${resolvedApiBase.replace(/\/+$/, "")}${STEWARD_REFRESH_ENDPOINT}`;
+      }
+    } catch {
+      // Fall through to the fixed direct Cloud API authority below.
+    }
+    return `${DEFAULT_DIRECT_CLOUD_API_BASE_URL}${STEWARD_REFRESH_ENDPOINT}`;
+  }
   if (typeof window === "undefined") return undefined;
   // Refresh cookies are host-only. Pages proxies this same-origin endpoint to
   // the matching API Worker, preserving the browser cookie boundary.
@@ -78,11 +120,11 @@ function resolveRepairRefreshEndpoint(): string | undefined {
 /**
  * Ensure an app-origin cloud session token exists for the re-pair exchange,
  * recovering it from the same-origin HttpOnly Eliza Cloud cookie when the
- * localStorage mirror is empty.
+ * web mirror is empty, or rotating an existing native/desktop bearer.
  *
  * Returns the usable cloud token, or `null` when none can be recovered (no
- * cookie, refresh failed/timed out, or refresh returned no token). Callers
- * MUST treat `null` as "no cloud session — keep the wall/notice."
+ * cookie/native bearer, refresh failed/timed out, or refresh returned no
+ * token). Callers MUST treat `null` as "no cloud session — keep the wall."
  *
  * At most one refresh network call per invocation; the caller gates invocation
  * to once per unauthenticated cycle so there is no refresh loop.
@@ -97,17 +139,28 @@ export async function ensureCloudSessionForRepair(
     writeToken = writeStoredStewardToken,
     timeoutMs = CLOUD_REPAIR_REFRESH_TIMEOUT_MS,
     raceTimeout = defaultRaceTimeout,
+    forceRefresh = false,
+    validate = () => true,
   } = deps;
+
+  if (!validate()) return null;
 
   // Fast path: the app-origin mirror already has a token — nothing to recover.
   const existing = readToken()?.trim();
-  if (existing) return existing;
+  if (existing && !forceRefresh) return existing;
 
-  // No app-origin token. Only this host's HttpOnly session cookie can recover
-  // one; without it there is genuinely no cloud session and the notice/wall is
-  // the honest surface.
-  if (typeof window === "undefined") return null;
-  if (!hasCookie()) return null;
+  const bearerRefreshRuntime = isBearerRefreshRuntime();
+  const canRefreshWithExistingBearer = Boolean(
+    forceRefresh && existing && bearerRefreshRuntime,
+  );
+
+  // Web repair requires this host's HttpOnly session cookie. Native/Electrobun
+  // instead rotate an expired existing bearer against the configured Cloud API
+  // authority; those shells intentionally have no browser cookie to probe.
+  if (typeof window === "undefined" || !validate()) return null;
+  if (!canRefreshWithExistingBearer && (!hasCookie() || !validate())) {
+    return null;
+  }
 
   let recovered: Awaited<ReturnType<typeof refreshCloudStewardSession>> = null;
   let publicationOpen = true;
@@ -117,13 +170,15 @@ export async function ensureCloudSessionForRepair(
     authority: null as { validate: () => boolean } | null,
   };
   const validatePublication = () =>
-    publicationOpen && refreshCommit.authority?.validate() === true;
+    publicationOpen &&
+    validate() &&
+    refreshCommit.authority?.validate() === true;
   try {
     // error-policy:J4 a failed/absent cookie refresh yields null → the caller
     // keeps the wall; it NEVER fabricates a session.
     recovered = await raceTimeout(
       refreshFn({
-        endpoint: resolveRepairRefreshEndpoint(),
+        endpoint: resolveRepairRefreshEndpoint(bearerRefreshRuntime),
         commitRefreshedSession: async (session, authority) => {
           refreshCommit.finalizerInvoked = true;
           refreshCommit.authority = authority;
@@ -151,13 +206,16 @@ export async function ensureCloudSessionForRepair(
   publicationOpen = false;
   const token = recovered?.token?.trim();
   if (!token) return null;
-  if (refreshWasSuperseded) return null;
+  if (refreshWasSuperseded || !validate()) return null;
   if (refreshCommit.finalizerInvoked && !refreshCommit.committed) return null;
 
   // Injected test/alternate refresh functions may predate the transactional
   // finalizer contract. Preserve compatibility, while the production helper
   // always commits under its origin-wide mutation lease above.
-  if (!refreshCommit.committed) await writeToken(token);
+  if (!refreshCommit.committed) {
+    await writeToken(token, { validate });
+    if (!validate()) return null;
+  }
   // error-policy:J6 best-effort nudge — token consumers re-read next tick.
   // dispatchEvent reports listener errors instead of rethrowing, so no
   // try/catch is needed; the guard only skips environments without

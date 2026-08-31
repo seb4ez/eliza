@@ -12,12 +12,17 @@
 
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  beginStewardSessionRecovery,
+  rejectStewardSessionRecovery,
+} from "./steward-session-recovery-marker";
 
 const capacitorState = { isNative: false };
 
 vi.mock("@capacitor/core", () => ({
   Capacitor: {
     isNativePlatform: () => capacitorState.isNative,
+    registerPlugin: () => ({}),
   },
 }));
 
@@ -164,6 +169,30 @@ describe("useSessionAuth", () => {
       );
 
       expect(result.current.user?.id).toBe("provider_user");
+    });
+
+    it("fails closed when a same-document login receipt supersedes the provider session", () => {
+      const { result } = renderSessionAuth(
+        makeProviderAuth({
+          isAuthenticated: true,
+          isLoading: false,
+          user: { id: "account-a" },
+        }),
+      );
+      expect(result.current.authenticated).toBe(true);
+
+      let loginB!: ReturnType<typeof beginStewardSessionRecovery>;
+      act(() => {
+        loginB = beginStewardSessionRecovery("elizacloud", "provider");
+      });
+      try {
+        expect(result.current.authenticated).toBe(false);
+        expect(result.current.user).toBeNull();
+      } finally {
+        act(() => rejectStewardSessionRecovery(loginB));
+      }
+      expect(result.current.authenticated).toBe(true);
+      expect(result.current.user?.id).toBe("account-a");
     });
 
     it("is not ready while the provider is still loading", () => {

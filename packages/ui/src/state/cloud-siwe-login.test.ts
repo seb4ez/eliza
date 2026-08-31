@@ -45,25 +45,29 @@ vi.mock("@elizaos/logger", () => ({
 }));
 
 vi.mock("@elizaos/shared/steward-session-client", () => ({
+  readStoredStewardToken: () =>
+    window.localStorage.getItem("steward_session_token"),
   writeStoredStewardToken: async (
     token: string,
     options?: {
       validate?: () => boolean;
-      commitBeforePublish?: () => boolean;
+      finalizeBeforePublish?: () => (durableRestored: boolean) => void;
     },
   ) => {
     if (options?.validate?.() === false) return null;
     const predecessor = window.localStorage.getItem("steward_session_token");
     window.localStorage.setItem("steward_session_token", token);
-    if (options?.commitBeforePublish?.() === false) {
+    const rollback = options?.finalizeBeforePublish?.();
+    if (options?.validate?.() === false) {
       if (predecessor === null) {
         window.localStorage.removeItem("steward_session_token");
       } else {
         window.localStorage.setItem("steward_session_token", predecessor);
       }
+      rollback?.(true);
       return null;
     }
-    return { rollback: async () => true };
+    return { restorePredecessor: async () => true };
   },
 }));
 
@@ -309,6 +313,34 @@ describe("e2e wallet + SIWE login", () => {
     ).toBe(true);
   });
 
+  it("returns null when token-sync queues login B before SIWE await resumes", async () => {
+    window.localStorage.setItem(E2E_WALLET_KEY_STORAGE_KEY, PRIVATE_KEY);
+    await installE2eWalletIfRequested();
+    mockFetch();
+    const tenantId = configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID);
+    let recoveryB: ReturnType<typeof beginStewardSessionRecovery> | undefined;
+    const onSync = () => {
+      queueMicrotask(() => {
+        recoveryB = beginStewardSessionRecovery(tenantId, "provider");
+      });
+    };
+    window.addEventListener("steward-token-sync", onSync, { once: true });
+
+    try {
+      await expect(
+        siweLoginWithInjectedWallet("https://api.test/"),
+      ).resolves.toBeNull();
+    } finally {
+      window.removeEventListener("steward-token-sync", onSync);
+    }
+
+    expect(recoveryB?.preexistingReceipts).toEqual([]);
+    expect(recoverySnapshot().receipts).toEqual([recoveryB?.receipt]);
+    expect(window.localStorage.getItem("steward_session_token")).toBe(
+      "eliza_test_api_key",
+    );
+  });
+
   it("auto-login at install time stores the session without any caller", async () => {
     window.localStorage.setItem(E2E_WALLET_KEY_STORAGE_KEY, PRIVATE_KEY);
     window.localStorage.setItem(E2E_WALLET_AUTOLOGIN_STORAGE_KEY, "1");
@@ -386,32 +418,63 @@ describe("e2e wallet + SIWE login", () => {
     expect(recoverySnapshot().receipts).toEqual([]);
   });
 
-  it("retains its durable receipt when SIWE verification loses the response", async () => {
-    window.localStorage.setItem(E2E_WALLET_KEY_STORAGE_KEY, PRIVATE_KEY);
-    await installE2eWalletIfRequested();
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: RequestInfo | URL) => {
-        const url = String(input);
-        if (url.includes("/api/auth/siwe/nonce")) {
-          return new Response(JSON.stringify(NONCE_RESPONSE), {
-            status: 200,
-            headers: { "content-type": "application/json" },
-          });
-        }
+  it.each([
+    {
+      label: "loses the verification response",
+      verify: () => {
         throw new TypeError("verify response lost");
-      }),
-    );
+      },
+      expectedError: /verify response lost/,
+    },
+    {
+      label: "receives an explicit verification 503",
+      verify: () => new Response("temporarily unavailable", { status: 503 }),
+      expectedError: /verify failed: 503/,
+    },
+  ])(
+    "retires its recovery receipt and never republishes stale account A when SIWE $label",
+    async ({ verify, expectedError }) => {
+      window.localStorage.setItem(E2E_WALLET_KEY_STORAGE_KEY, PRIVATE_KEY);
+      await installE2eWalletIfRequested();
+      // biome-ignore lint/suspicious/noDocumentCookie: jsdom models account A's stale server-session marker.
+      document.cookie = "steward-authed=1; Path=/";
+      let tokenSyncEvents = 0;
+      const onTokenSync = () => {
+        tokenSyncEvents += 1;
+      };
+      window.addEventListener("steward-token-sync", onTokenSync);
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: RequestInfo | URL) => {
+          const url = String(input);
+          if (url.includes("/api/auth/siwe/nonce")) {
+            return new Response(JSON.stringify(NONCE_RESPONSE), {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            });
+          }
+          return verify();
+        }),
+      );
 
-    await expect(
-      siweLoginWithInjectedWallet("https://api.test"),
-    ).rejects.toThrow(/verify response lost/);
-    expect(window.localStorage.getItem("steward_session_token")).toBeNull();
-    expect(recoverySnapshot()).toMatchObject({
-      storageAvailable: true,
-      receipts: [expect.any(String)],
-    });
-  });
+      try {
+        await expect(
+          siweLoginWithInjectedWallet("https://api.test"),
+        ).rejects.toThrow(expectedError);
+      } finally {
+        window.removeEventListener("steward-token-sync", onTokenSync);
+        // biome-ignore lint/suspicious/noDocumentCookie: jsdom has no Cookie Store API.
+        document.cookie = "steward-authed=; Max-Age=0; Path=/";
+      }
+
+      expect(window.localStorage.getItem("steward_session_token")).toBeNull();
+      expect(recoverySnapshot()).toMatchObject({
+        storageAvailable: true,
+        receipts: [],
+      });
+      expect(tokenSyncEvents).toBe(0);
+    },
+  );
 
   it("retries a transient 503 nonce store outage, then completes the handshake", async () => {
     window.localStorage.setItem(E2E_WALLET_KEY_STORAGE_KEY, PRIVATE_KEY);

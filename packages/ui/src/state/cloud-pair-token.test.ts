@@ -18,6 +18,7 @@ import {
   clearCloudPairApiToken,
   clearCloudPairApiTokenIfCurrent,
   clearStalePairCredentialsForAgent,
+  clearStalePairCredentialsForAgentDurably,
 } from "./cloud-pair-token";
 
 const LEGACY_KEY = "eliza:cloud-pair:api-token";
@@ -80,6 +81,54 @@ function profileTokens(): Record<string, string | undefined> {
   };
   return Object.fromEntries(
     registry.profiles.map((p) => [p.id, p.accessToken]),
+  );
+}
+
+function seedRejectedCredentialMirrors(
+  agentId: string,
+  rejectedToken: string,
+): void {
+  const pairKey = cloudPairTokenKeyForAgent(agentId);
+  localStorage.setItem(pairKey, rejectedToken);
+  sessionStorage.setItem(pairKey, rejectedToken);
+  localStorage.setItem(LEGACY_KEY, rejectedToken);
+  sessionStorage.setItem(LEGACY_KEY, rejectedToken);
+  localStorage.setItem(
+    ACTIVE_SERVER_KEY,
+    JSON.stringify({
+      id: `cloud:${agentId}`,
+      kind: "cloud",
+      label: "Rejected agent",
+      apiBase: `https://${agentId}.elizacloud.ai`,
+      accessToken: rejectedToken,
+    }),
+  );
+  localStorage.setItem(
+    PROFILES_KEY,
+    JSON.stringify({
+      version: 1,
+      activeProfileId: "profile-a",
+      profiles: [
+        {
+          id: "profile-a",
+          createdAt: "2026-08-31T00:00:00.000Z",
+          kind: "cloud",
+          label: "Rejected agent",
+          cloudAgentId: agentId,
+          apiBase: `https://${agentId}.elizacloud.ai`,
+          accessToken: rejectedToken,
+        },
+        {
+          id: "profile-other",
+          createdAt: "2026-08-31T00:00:00.000Z",
+          kind: "cloud",
+          label: "Other agent",
+          cloudAgentId: "agent-other",
+          apiBase: "https://agent-other.elizacloud.ai",
+          accessToken: "keep-other-bearer",
+        },
+      ],
+    }),
   );
 }
 
@@ -334,5 +383,163 @@ describe("clearStalePairCredentialsForAgent", () => {
 
     localStorage.clear();
     expect(() => clearStalePairCredentialsForAgent("agent-a")).not.toThrow();
+  });
+});
+
+describe("clearStalePairCredentialsForAgentDurably", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    sessionStorage.clear();
+  });
+
+  it("terminally clears the exact rejected bearer from pair, active, and profile mirrors", async () => {
+    const rejectedToken = "rejected-account-a-bearer";
+    seedRejectedCredentialMirrors("agent-a", rejectedToken);
+
+    await expect(
+      clearStalePairCredentialsForAgentDurably({
+        agentId: "agent-a",
+        rejectedToken,
+        validate: () => true,
+      }),
+    ).resolves.toBe(true);
+
+    const pairKey = cloudPairTokenKeyForAgent("agent-a");
+    expect(localStorage.getItem(pairKey)).toBeNull();
+    expect(sessionStorage.getItem(pairKey)).toBeNull();
+    expect(localStorage.getItem(LEGACY_KEY)).toBeNull();
+    expect(sessionStorage.getItem(LEGACY_KEY)).toBeNull();
+    expect(localStorage.getItem(ACTIVE_SERVER_KEY)).not.toContain(
+      rejectedToken,
+    );
+    expect(localStorage.getItem(PROFILES_KEY)).not.toContain(rejectedToken);
+    expect(localStorage.getItem(PROFILES_KEY)).toContain("keep-other-bearer");
+  });
+
+  it("keeps every B byte when B wins generation while purge is suspended on the runtime lock", async () => {
+    seedRejectedCredentialMirrors("agent-a", "rejected-account-a-bearer");
+    const originalLocks = Object.getOwnPropertyDescriptor(navigator, "locks");
+    let releaseLock!: () => void;
+    let reportLockRequested!: () => void;
+    const lockRequested = new Promise<void>((resolve) => {
+      reportLockRequested = resolve;
+    });
+    const lockBarrier = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    const request = vi.fn(
+      async (
+        _name: string,
+        _options: LockOptions,
+        callback: () => Promise<boolean>,
+      ) => {
+        reportLockRequested();
+        await lockBarrier;
+        return callback();
+      },
+    );
+    Object.defineProperty(navigator, "locks", {
+      configurable: true,
+      value: { request },
+    });
+    let accountAGenerationIsCurrent = true;
+
+    try {
+      const purge = clearStalePairCredentialsForAgentDurably({
+        agentId: "agent-a",
+        rejectedToken: "rejected-account-a-bearer",
+        validate: () => accountAGenerationIsCurrent,
+      });
+      await lockRequested;
+
+      // Login B publishes its generation/token/runtime mirrors before A ever
+      // acquires the lock. A must fail closed instead of targeting these bytes.
+      accountAGenerationIsCurrent = false;
+      const pairKey = cloudPairTokenKeyForAgent("agent-a");
+      localStorage.setItem(pairKey, "account-b-bearer");
+      sessionStorage.setItem(pairKey, "account-b-bearer");
+      localStorage.setItem(LEGACY_KEY, "account-b-bearer");
+      sessionStorage.setItem(LEGACY_KEY, "account-b-bearer");
+      localStorage.setItem(
+        ACTIVE_SERVER_KEY,
+        JSON.stringify({
+          id: "cloud:agent-a",
+          kind: "cloud",
+          label: "Account B agent",
+          apiBase: "https://agent-a.elizacloud.ai",
+          accessToken: "account-b-bearer",
+        }),
+      );
+      localStorage.setItem(
+        PROFILES_KEY,
+        JSON.stringify({
+          version: 1,
+          activeProfileId: "profile-b",
+          profiles: [
+            {
+              id: "profile-b",
+              createdAt: "2026-08-31T00:00:00.000Z",
+              kind: "cloud",
+              label: "Account B agent",
+              cloudAgentId: "agent-a",
+              apiBase: "https://agent-a.elizacloud.ai",
+              accessToken: "account-b-bearer",
+            },
+          ],
+        }),
+      );
+      releaseLock();
+
+      await expect(purge).resolves.toBe(false);
+      expect(localStorage.getItem(pairKey)).toBe("account-b-bearer");
+      expect(sessionStorage.getItem(pairKey)).toBe("account-b-bearer");
+      expect(localStorage.getItem(LEGACY_KEY)).toBe("account-b-bearer");
+      expect(sessionStorage.getItem(LEGACY_KEY)).toBe("account-b-bearer");
+      expect(localStorage.getItem(ACTIVE_SERVER_KEY)).toContain(
+        "account-b-bearer",
+      );
+      expect(localStorage.getItem(PROFILES_KEY)).toContain("account-b-bearer");
+    } finally {
+      if (originalLocks) {
+        Object.defineProperty(navigator, "locks", originalLocks);
+      } else {
+        Reflect.deleteProperty(navigator, "locks");
+      }
+    }
+  });
+
+  it("returns false and preserves A when the runtime lock host rejects", async () => {
+    const rejectedToken = "rejected-account-a-bearer";
+    seedRejectedCredentialMirrors("agent-a", rejectedToken);
+    const originalLocks = Object.getOwnPropertyDescriptor(navigator, "locks");
+    Object.defineProperty(navigator, "locks", {
+      configurable: true,
+      value: {
+        request: vi.fn(async () => {
+          throw new Error("runtime lock host unavailable");
+        }),
+      },
+    });
+
+    try {
+      await expect(
+        clearStalePairCredentialsForAgentDurably({
+          agentId: "agent-a",
+          rejectedToken,
+          validate: () => true,
+        }),
+      ).resolves.toBe(false);
+      expect(localStorage.getItem(cloudPairTokenKeyForAgent("agent-a"))).toBe(
+        rejectedToken,
+      );
+      expect(localStorage.getItem(ACTIVE_SERVER_KEY)).toContain(rejectedToken);
+      expect(localStorage.getItem(PROFILES_KEY)).toContain(rejectedToken);
+    } finally {
+      if (originalLocks) {
+        Object.defineProperty(navigator, "locks", originalLocks);
+      } else {
+        Reflect.deleteProperty(navigator, "locks");
+      }
+    }
   });
 });

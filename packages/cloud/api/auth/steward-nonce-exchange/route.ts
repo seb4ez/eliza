@@ -18,62 +18,46 @@
  * returned only to the hardware checkout origin that still has to authenticate
  * a cross-site Stripe checkout request with Bearer auth.
  *
- * Origin/Referer CSRF check mirrors `/api/auth/steward-session` exactly: exact
- * first-party Eliza UI origins plus localhost in non-production.
+ * Cookie mode uses the strict Origin plus Fetch Metadata boundary from
+ * `/api/auth/steward-session`; the exact hardware-checkout origins are a
+ * separate cross-site bearer-only lane that emits no cookies.
  */
 
 import {
   STEWARD_CSRF_HEADER,
+  STEWARD_CSRF_HEADER_VALUE,
   STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
   type StewardSessionErrorCode,
 } from "@elizaos/shared/steward-session-client";
-import { Hono } from "hono";
+import { type Context, Hono } from "hono";
 import { setCookie } from "hono/cookie";
 import {
-  browserOriginHost,
-  checkElizaMutatingRequestOrigin,
+  checkStewardNonceExchangeRequest,
   hasElizaNonSimpleRequestMarker,
-  isPermittedElizaBrowserOrigin,
 } from "@/lib/auth/browser-origin-policy";
 import { cookieDomainForHost } from "@/lib/auth/cookie-domain";
 import {
   STEWARD_AUTH_UPSTREAM_TIMEOUT_MS,
+  type StewardTokenClaims,
   type StewardVerifyEnv,
   verifyStewardTokenCached,
 } from "@/lib/auth/steward-client";
-import { stewardCookieNames } from "@/lib/auth/steward-cookies";
+import {
+  legacyStewardCookieNames,
+  readStewardSessionMigrationCookieStateFromHeader,
+  STEWARD_REFRESH_AUTHORITY_TTL_SECONDS,
+  STEWARD_V2_AUTHORITY_MAX_AGE_SECONDS,
+  stewardCookieNames,
+  stewardV2CookiesAreHostBound,
+} from "@/lib/auth/steward-cookies";
+import {
+  classifySsoBridgeLogout,
+  type SsoBridgeLogoutClassification,
+} from "@/lib/services/sso-bridge-codes";
 import { signStewardMutatingRequest } from "@/lib/steward/sign";
 import { describeSyncError, syncUserFromSteward } from "@/lib/steward-sync";
 import { logger } from "@/lib/utils/logger";
 import type { AppEnv } from "@/types/cloud-worker-env";
-
-const STEWARD_REFRESH_COOKIE_MAX_AGE = 30 * 24 * 60 * 60;
-
-function checkOrigin(
-  c: { req: { header: (name: string) => string | undefined } },
-  isProduction: boolean,
-): { ok: true } | { ok: false; reason: string } {
-  return checkElizaMutatingRequestOrigin(c.req, isProduction);
-}
-
-function shouldReturnClientToken(
-  c: { req: { header: (name: string) => string | undefined } },
-  isProduction: boolean,
-): boolean {
-  const origin =
-    browserOriginHost(c.req.header("origin")) ??
-    browserOriginHost(c.req.header("referer"));
-  const host = (c.req.header("host") ?? "").split(":")[0]?.toLowerCase() ?? "";
-  if (!origin) return false;
-  // The SPA reads localStorage to decide `isAuthenticated` on /cloud
-  // mount. Without returning the JWT here, OAuth users bounce back to /login.
-  // Mirror the token for every origin the CSRF check already accepted — incl.
-  // same-origin custom hosts via `origin === host`. Diverging from the CSRF
-  // gate (as the static-set-only check did) silently dropped the token on hosts
-  // that are accepted by Origin-match, so a valid login bounced to /login.
-  // Matches steward-refresh's shouldReturnClientToken.
-  return isPermittedElizaBrowserOrigin(origin, host, isProduction);
-}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -86,6 +70,78 @@ function errorBody(
   code: StewardSessionErrorCode,
 ): { error: string; code: StewardSessionErrorCode } {
   return { error: message, code };
+}
+
+type SsoLogoutBarrierResult =
+  | SsoBridgeLogoutClassification
+  | { status: "unavailable" };
+
+async function checkSsoLogoutBarrier(
+  claims: StewardTokenClaims,
+): Promise<SsoLogoutBarrierResult> {
+  try {
+    return await classifySsoBridgeLogout(claims.userId, claims.issuedAt);
+  } catch (error) {
+    logger.error(
+      "[steward-nonce-exchange] SSO logout-marker store unavailable",
+      { error: error instanceof Error ? error.message : String(error) },
+    );
+    return { status: "unavailable" };
+  }
+}
+
+function logoutCooldownMessage(retryAfterSeconds: number): string {
+  if (retryAfterSeconds <= 0) {
+    return "You signed out moments ago. Sign in again to create a new session.";
+  }
+  const unit = retryAfterSeconds === 1 ? "second" : "seconds";
+  return `You signed out moments ago. Wait ${retryAfterSeconds} ${unit}, then sign in again to create a new session.`;
+}
+
+function rejectLogoutClassification(
+  c: Context<AppEnv>,
+  classification: Exclude<SsoBridgeLogoutClassification, { status: "allowed" }>,
+  metricSuffix: "admission" | "final",
+): Response {
+  if (classification.status === "definitely_revoked") {
+    logExchange(
+      metricSuffix === "final" ? "session-ended-final" : "session-ended",
+    );
+    return c.json(errorBody("Session was signed out", "session_ended"), 401);
+  }
+
+  logExchange(
+    metricSuffix === "final" ? "logout-cooldown-final" : "logout-cooldown",
+  );
+  c.header("Retry-After", String(classification.retryAfterSeconds));
+  return c.json(
+    {
+      error: logoutCooldownMessage(classification.retryAfterSeconds),
+      code: "logout_cooldown" as const,
+      retryAfterSeconds: classification.retryAfterSeconds,
+      retryAtEpochSeconds: classification.retryAtEpochSeconds,
+    },
+    409,
+  );
+}
+
+function sessionMutationNamespace(
+  c: Context<AppEnv>,
+  cookieState: ReturnType<
+    typeof readStewardSessionMigrationCookieStateFromHeader
+  >,
+): "v2" | "v1" | null {
+  if (cookieState.ambiguous) return null;
+  const marker = c.req.header(STEWARD_CSRF_HEADER);
+  if (marker === STEWARD_SESSION_MUTATION_PROTOCOL_VALUE) return "v2";
+  if (
+    marker === STEWARD_CSRF_HEADER_VALUE &&
+    cookieState.v2Authority === "absent" &&
+    cookieState.source !== "v2"
+  ) {
+    return "v1";
+  }
+  return null;
 }
 
 let stewardNonceMetricCounter = 0;
@@ -238,7 +294,11 @@ const app = new Hono<AppEnv>();
 
 app.post("/", async (c) => {
   const isProduction = c.env.NODE_ENV === "production";
-  const originCheck = checkOrigin(c, isProduction);
+  const originCheck = checkStewardNonceExchangeRequest(
+    c.req,
+    c.env.ENVIRONMENT,
+    isProduction,
+  );
   if (!originCheck.ok) {
     logExchange("forbidden-origin");
     logger.warn("[steward-nonce-exchange] rejected cross-origin POST", {
@@ -252,18 +312,23 @@ app.post("/", async (c) => {
     logExchange("csrf-marker-missing");
     return c.json(errorBody("Forbidden", "csrf_marker_required"), 403);
   }
-  if (
-    c.req.header(STEWARD_CSRF_HEADER) !==
-    STEWARD_SESSION_MUTATION_PROTOCOL_VALUE
-  ) {
-    logExchange("session-mutation-protocol-required");
-    return c.json(
-      errorBody(
-        "Session client update required",
-        "session_mutation_protocol_required",
-      ),
-      409,
+  let mutationNamespace: "v2" | "v1" | null = null;
+  if (originCheck.responseMode === "cookie") {
+    const requestCookieState = readStewardSessionMigrationCookieStateFromHeader(
+      c.req.header("cookie") ?? null,
+      c.env.ENVIRONMENT,
     );
+    mutationNamespace = sessionMutationNamespace(c, requestCookieState);
+    if (!mutationNamespace) {
+      logExchange("session-mutation-protocol-required");
+      return c.json(
+        errorBody(
+          "Session client update required",
+          "session_mutation_protocol_required",
+        ),
+        409,
+      );
+    }
   }
 
   const body = (await c.req.json().catch(() => ({}))) as {
@@ -409,6 +474,15 @@ app.post("/", async (c) => {
     return c.json(errorBody("Invalid token", "invalid_token"), 401);
   }
 
+  const admissionBarrier = await checkSsoLogoutBarrier(claims);
+  if (admissionBarrier.status === "unavailable") {
+    logExchange("sso-marker-unavailable");
+    return c.json(errorBody("SSO bridge unavailable", "sso_unavailable"), 503);
+  }
+  if (admissionBarrier.status !== "allowed") {
+    return rejectLogoutClassification(c, admissionBarrier, "admission");
+  }
+
   let cloudUser: Awaited<ReturnType<typeof syncUserFromSteward>>;
   try {
     cloudUser = await syncUserFromSteward({
@@ -431,42 +505,62 @@ app.post("/", async (c) => {
     );
   }
 
-  const ttl = claims.expiration
-    ? Math.max(0, claims.expiration - Math.floor(Date.now() / 1000))
-    : null;
-  const secure = c.env.NODE_ENV === "production";
-  const domain = cookieDomainForHost(c.req.header("host"));
+  // User convergence can outlive a concurrent logout. Re-read the strongly
+  // consistent marker immediately before either cookies or the JSON bearer
+  // are published; both response modes represent new session authority.
+  const finalBarrier = await checkSsoLogoutBarrier(claims);
+  if (finalBarrier.status === "unavailable") {
+    logExchange("sso-marker-unavailable-final");
+    return c.json(errorBody("SSO bridge unavailable", "sso_unavailable"), 503);
+  }
+  if (finalBarrier.status !== "allowed") {
+    return rejectLogoutClassification(c, finalBarrier, "final");
+  }
 
-  const cookieNames = stewardCookieNames(c.env.ENVIRONMENT);
+  if (originCheck.responseMode === "cookie") {
+    const isV2Mutation = mutationNamespace === "v2";
+    const secure = isV2Mutation
+      ? stewardV2CookiesAreHostBound(c.env.ENVIRONMENT)
+      : c.env.NODE_ENV === "production";
+    const domain = isV2Mutation
+      ? undefined
+      : cookieDomainForHost(c.req.header("host"));
+    const cookieNames = isV2Mutation
+      ? stewardCookieNames(c.env.ENVIRONMENT)
+      : legacyStewardCookieNames(c.env.ENVIRONMENT);
 
-  setCookie(c, cookieNames.token, token, {
-    httpOnly: true,
-    secure,
-    sameSite: "Lax",
-    path: "/",
-    ...(domain ? { domain } : {}),
-    ...(typeof ttl === "number" ? { maxAge: ttl } : {}),
-  });
-
-  if (typeof refreshToken === "string" && refreshToken.length > 0) {
-    setCookie(c, cookieNames.refreshToken, refreshToken, {
+    setCookie(c, cookieNames.token, token, {
       httpOnly: true,
       secure,
       sameSite: "Lax",
       path: "/",
       ...(domain ? { domain } : {}),
-      maxAge: STEWARD_REFRESH_COOKIE_MAX_AGE,
+      maxAge: STEWARD_REFRESH_AUTHORITY_TTL_SECONDS,
+    });
+
+    if (typeof refreshToken === "string" && refreshToken.length > 0) {
+      setCookie(c, cookieNames.refreshToken, refreshToken, {
+        httpOnly: true,
+        secure,
+        sameSite: "Lax",
+        path: "/",
+        ...(domain ? { domain } : {}),
+        maxAge: STEWARD_REFRESH_AUTHORITY_TTL_SECONDS,
+      });
+    }
+
+    setCookie(c, cookieNames.authed, "1", {
+      httpOnly: false,
+      secure,
+      sameSite: "Lax",
+      path: "/",
+      ...(domain ? { domain } : {}),
+      maxAge:
+        mutationNamespace === "v2"
+          ? STEWARD_V2_AUTHORITY_MAX_AGE_SECONDS
+          : STEWARD_REFRESH_AUTHORITY_TTL_SECONDS,
     });
   }
-
-  setCookie(c, cookieNames.authed, "1", {
-    httpOnly: false,
-    secure,
-    sameSite: "Lax",
-    path: "/",
-    ...(domain ? { domain } : {}),
-    maxAge: STEWARD_REFRESH_COOKIE_MAX_AGE,
-  });
 
   logExchange("ok");
   // Returning `token` here so the SPA can mirror it into localStorage. The
@@ -492,7 +586,7 @@ app.post("/", async (c) => {
     welcomeBonusWithheld: cloudUser.welcomeBonusWithheld === true,
     welcomeBonusWithheldReason: cloudUser.welcomeBonusWithheldReason,
     welcomeBonusWithheldMessage: cloudUser.welcomeBonusWithheldMessage,
-    ...(shouldReturnClientToken(c, isProduction) ? { token } : {}),
+    token,
   });
 });
 

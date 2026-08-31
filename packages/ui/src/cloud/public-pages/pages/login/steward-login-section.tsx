@@ -45,12 +45,7 @@ import {
   useRef,
   useState,
 } from "react";
-import {
-  Navigate,
-  useLocation,
-  useNavigate,
-  useSearchParams,
-} from "react-router-dom";
+import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import {
   DiscordIcon,
@@ -69,13 +64,18 @@ import { openExternalUrl } from "../../../../utils/openExternalUrl";
 import { enqueueStewardSessionMutation } from "../../../lib/steward-session-mutation-queue";
 import {
   beginStewardSessionRecovery,
-  completeStewardSessionRecovery,
-  completeStewardSessionRecoverySnapshot,
+  createStewardSessionRecoveryCommittedAuthority,
+  createStewardSessionRecoveryPublicationFence,
+  createStewardSessionRecoverySnapshotPublicationFence,
+  doesStewardSessionRecoverySnapshotMatchToken,
   hasStewardSessionRecovery,
   isStewardSessionRecoveryReceiptLive,
   isStewardSessionRecoverySnapshotLive,
+  markStewardSessionRecoveryCookiePending,
   readStewardSessionRecovery,
   rejectStewardSessionRecovery,
+  type StewardSessionRecoveryCommittedAuthority,
+  type StewardSessionRecoveryPublicationRollback,
 } from "../../../lib/steward-session-recovery-marker";
 import { useCloudT } from "../../../shell/CloudI18nProvider";
 import {
@@ -192,15 +192,24 @@ type EmailCheckState =
   | "locked"
   | "invalid";
 
+interface LoginRedirectPublication {
+  destination: string;
+  authority: StewardSessionRecoveryCommittedAuthority;
+}
+
 async function persistStewardToken(
   token: string,
   signal?: AbortSignal,
   validate?: () => boolean,
+  finalizeBeforePublish?: () => StewardSessionRecoveryPublicationRollback,
 ): Promise<boolean> {
   if (validate?.() === false) return false;
-  await writeStoredStewardToken(token, { signal, validate });
-  signal?.throwIfAborted();
-  if (validate?.() === false) return false;
+  const writeAuthority = await writeStoredStewardToken(token, {
+    signal,
+    validate,
+    finalizeBeforePublish,
+  });
+  if (!writeAuthority) return false;
   if (readStoredStewardToken() !== token) {
     throw new Error(
       "Eliza Cloud sign-in needs browser storage. Enable storage for this site and try again.",
@@ -208,6 +217,26 @@ async function persistStewardToken(
   }
   clearSsoLoggedOut();
   return true;
+}
+
+function isRecoveryPublicationCurrent(generation: string | null): boolean {
+  const current = readStewardSessionRecovery(STEWARD_TENANT_ID);
+  return (
+    current.storageAvailable &&
+    current.generation === generation &&
+    current.receipts.length === 0
+  );
+}
+
+function createRecoverySnapshotCommittedAuthority(
+  generation: string | null,
+  token: string,
+): StewardSessionRecoveryCommittedAuthority {
+  return {
+    isCurrent: () =>
+      isRecoveryPublicationCurrent(generation) &&
+      readStoredStewardToken() === token,
+  };
 }
 
 /**
@@ -278,6 +307,12 @@ type Provider =
 
 type WalletKind = "ethereum" | "solana";
 
+type ProviderRecoveryIntent = {
+  recovery: ReturnType<typeof beginStewardSessionRecovery>;
+  generation: number;
+  sessionMutationDispatched: boolean;
+};
+
 // Wallet libs (wagmi / rainbowkit / @solana) are heavy; both pieces load only
 // when the user expresses wallet intent (see `walletButtonsMounted`).
 const StewardWalletProviders = lazy(() =>
@@ -337,6 +372,24 @@ function requireCompletedAuth(
   return result;
 }
 
+function describeSessionEstablishmentError(
+  error: unknown,
+  fallback: string,
+): string {
+  if (
+    error instanceof StewardSessionError &&
+    error.code === "logout_cooldown"
+  ) {
+    const wait = error.retryAfterSeconds;
+    if (typeof wait === "number" && wait > 0) {
+      const unit = wait === 1 ? "second" : "seconds";
+      return `You just signed out. Wait ${wait} ${unit}, then start sign-in again to create a new session.`;
+    }
+    return "You just signed out. Start sign-in again to create a new session.";
+  }
+  return getErrorMessage(error, fallback);
+}
+
 /**
  * Message for a failed one-time-code exchange. A 401/403/410 from
  * `steward-nonce-exchange` means the code was rejected — expired, already
@@ -349,6 +402,15 @@ function requireCompletedAuth(
 function describeCodeExchangeError(error: unknown, t: LoginTranslator): string {
   if (
     error instanceof StewardSessionError &&
+    error.code === "logout_cooldown"
+  ) {
+    return describeSessionEstablishmentError(
+      error,
+      "Could not complete Eliza Cloud sign-in.",
+    );
+  }
+  if (
+    error instanceof StewardSessionError &&
     (error.status === 401 || error.status === 403 || error.status === 410)
   ) {
     return t("cloud.login.callback.codeRejected", {
@@ -356,16 +418,20 @@ function describeCodeExchangeError(error: unknown, t: LoginTranslator): string {
         "That sign-in link expired or was already used. Please sign in again below.",
     });
   }
-  return getErrorMessage(error, "Could not complete Eliza Cloud sign-in.");
+  return describeSessionEstablishmentError(
+    error,
+    "Could not complete Eliza Cloud sign-in.",
+  );
 }
 
 function isDefiniteSessionMutationRejection(error: unknown): boolean {
-  return (
-    error instanceof StewardSessionError &&
-    error.status >= 400 &&
-    error.status < 500 &&
-    error.status !== 408
-  );
+  const status =
+    error instanceof StewardSessionError
+      ? error.status
+      : error !== null && typeof error === "object" && "status" in error
+        ? Reflect.get(error, "status")
+        : undefined;
+  return typeof status === "number";
 }
 
 function getCallbackReasonMessage(
@@ -473,7 +539,7 @@ function describeEmailLoginError(error: unknown, fallback: string): string {
       return "That sign-in email expired or was already used. Request a new email.";
     }
   }
-  return getErrorMessage(error, fallback);
+  return describeSessionEstablishmentError(error, fallback);
 }
 
 let cachedStewardProviders: StewardProviders | null = null;
@@ -712,6 +778,8 @@ export default function StewardLoginSection() {
   const [walletIntentGeneration, setWalletIntentGeneration] = useState<
     number | null
   >(null);
+  const providerRecoveryIntentRef = useRef<ProviderRecoveryIntent | null>(null);
+  const walletRecoveryIntentRef = useRef<ProviderRecoveryIntent | null>(null);
   // Wallet methods are collapsed behind a single toggle by default so email /
   // Magic Link is the clear above-the-fold primary action (#19217). Expanding
   // reveals the EVM / Solana peer buttons; clicking one mounts the lazy wallet
@@ -723,7 +791,8 @@ export default function StewardLoginSection() {
   // an unmounted peer button.
   const walletOptionsRegionRef = useRef<HTMLDivElement>(null);
   const [callbackError, setCallbackError] = useState<string | null>(null);
-  const [redirectTo, setRedirectTo] = useState<string | null>(null);
+  const [redirectPublication, setRedirectPublication] =
+    useState<LoginRedirectPublication | null>(null);
   // Do not expose fresh-login controls while an older session is still being
   // restored. Otherwise a delayed restore can overtake an OTP request and make
   // requesting a code look like successful authentication.
@@ -733,9 +802,8 @@ export default function StewardLoginSection() {
   const [sessionRecoveryAttempt, setSessionRecoveryAttempt] = useState(0);
   const [sessionRecoveryRetryAvailable, setSessionRecoveryRetryAvailable] =
     useState(false);
-  const [externalSuccessDestination, setExternalSuccessDestination] = useState<
-    string | null
-  >(null);
+  const [externalSuccessPublication, setExternalSuccessPublication] =
+    useState<LoginRedirectPublication | null>(null);
   // The one in-flight shared-session recovery, keyed by the challenged email
   // and owning its own AbortController. Keying prevents an abandoned email-A
   // challenge's recovery from being handed to a later email-B challenge; the
@@ -872,21 +940,47 @@ export default function StewardLoginSection() {
 
   const revokeProviderIntent = useCallback(() => {
     abortSharedEmailSessionRecovery();
+    const recoveryIntent = providerRecoveryIntentRef.current;
+    if (recoveryIntent && !recoveryIntent.sessionMutationDispatched) {
+      rejectStewardSessionRecovery(recoveryIntent.recovery);
+    }
+    providerRecoveryIntentRef.current = null;
+    walletRecoveryIntentRef.current = null;
     providerIntentAbortRef.current.abort();
     providerIntentGenerationRef.current += 1;
   }, [abortSharedEmailSessionRecovery]);
 
-  const rotateProviderIntent = useCallback(() => {
-    sessionCommitGenerationRef.current = null;
-    setSessionCommitGeneration(null);
-    revokeProviderIntent();
-    providerIntentAbortRef.current = new AbortController();
-    setProviderIntentRevision(providerIntentGenerationRef.current);
-    return {
-      generation: providerIntentGenerationRef.current,
-      signal: providerIntentAbortRef.current.signal,
-    };
-  }, [revokeProviderIntent]);
+  const suspendProviderIntentForLifecycle = useCallback(() => {
+    abortSharedEmailSessionRecovery();
+    // A document teardown cannot prove that the provider did not finish after
+    // the last observable callback, nor can it atomically coordinate with the
+    // next document. Keep the durable reservation as a block-only barrier so
+    // a reload cannot adopt stale cookie A. Explicit provider errors/cancels
+    // still call the rejection helpers and retire their own reservation.
+    providerRecoveryIntentRef.current = null;
+    walletRecoveryIntentRef.current = null;
+    providerIntentAbortRef.current.abort();
+    providerIntentGenerationRef.current += 1;
+  }, [abortSharedEmailSessionRecovery]);
+
+  const rotateProviderIntent = useCallback(
+    (options?: { preserveRecoveryReservation?: boolean }) => {
+      sessionCommitGenerationRef.current = null;
+      setSessionCommitGeneration(null);
+      if (options?.preserveRecoveryReservation) {
+        suspendProviderIntentForLifecycle();
+      } else {
+        revokeProviderIntent();
+      }
+      providerIntentAbortRef.current = new AbortController();
+      setProviderIntentRevision(providerIntentGenerationRef.current);
+      return {
+        generation: providerIntentGenerationRef.current,
+        signal: providerIntentAbortRef.current.signal,
+      };
+    },
+    [revokeProviderIntent, suspendProviderIntentForLifecycle],
+  );
 
   const isProviderGenerationCurrent = useCallback((generation: number) => {
     return (
@@ -901,6 +995,89 @@ export default function StewardLoginSection() {
       isProviderGenerationCurrent(generation) &&
       providersLiveConfirmedRef.current,
     [isProviderGenerationCurrent],
+  );
+
+  const beginProviderRecoveryIntent = useCallback(
+    (generation: number): ProviderRecoveryIntent | null => {
+      if (!isProviderIntentCurrent(generation)) return null;
+      const recovery = beginStewardSessionRecovery(
+        STEWARD_TENANT_ID,
+        "provider",
+      );
+      if (
+        !isProviderIntentCurrent(generation) ||
+        !isStewardSessionRecoveryReceiptLive(recovery)
+      ) {
+        rejectStewardSessionRecovery(recovery);
+        return null;
+      }
+      const intent = {
+        recovery,
+        generation,
+        sessionMutationDispatched: false,
+      };
+      providerRecoveryIntentRef.current = intent;
+      return intent;
+    },
+    [isProviderIntentCurrent],
+  );
+
+  const markProviderSessionMutationDispatched = useCallback(
+    (
+      intent: ProviderRecoveryIntent,
+      generation: number,
+      expectedToken: string,
+    ): boolean => {
+      if (
+        !isProviderIntentCurrent(generation) ||
+        !isStewardSessionRecoveryReceiptLive(intent.recovery)
+      ) {
+        if (!intent.sessionMutationDispatched) {
+          rejectStewardSessionRecovery(intent.recovery);
+        }
+        return false;
+      }
+      markStewardSessionRecoveryCookiePending(intent.recovery, expectedToken);
+      intent.sessionMutationDispatched = true;
+      return true;
+    },
+    [isProviderIntentCurrent],
+  );
+
+  const rejectProviderRecoveryBeforeSessionMutation = useCallback(
+    (intent: ProviderRecoveryIntent) => {
+      if (
+        !intent.sessionMutationDispatched &&
+        readStewardSessionRecovery(intent.recovery.tenantId).receipts.includes(
+          intent.recovery.receipt,
+        )
+      ) {
+        rejectStewardSessionRecovery(intent.recovery);
+      }
+      if (providerRecoveryIntentRef.current === intent) {
+        providerRecoveryIntentRef.current = null;
+      }
+    },
+    [],
+  );
+
+  const rejectProviderRecoveryAfterFailure = useCallback(
+    (intent: ProviderRecoveryIntent, error: unknown) => {
+      if (!intent.sessionMutationDispatched) {
+        rejectProviderRecoveryBeforeSessionMutation(intent);
+      } else if (
+        isDefiniteSessionMutationRejection(error) &&
+        readStewardSessionRecovery(intent.recovery.tenantId).receipts.includes(
+          intent.recovery.receipt,
+        )
+      ) {
+        rejectStewardSessionRecovery(intent.recovery);
+      }
+      if (providerRecoveryIntentRef.current === intent) {
+        providerRecoveryIntentRef.current = null;
+      }
+    },
+    [rejectProviderRecoveryBeforeSessionMutation],
   );
 
   const setLiveProviderAuthority = useCallback((confirmed: boolean) => {
@@ -922,11 +1099,11 @@ export default function StewardLoginSection() {
           providerIntentLifecycleRef.current === lifecycle &&
           providerIntentCleanupPendingRef.current === lifecycle
         ) {
-          revokeProviderIntent();
+          suspendProviderIntentForLifecycle();
         }
       });
     };
-  }, [revokeProviderIntent]);
+  }, [suspendProviderIntentForLifecycle]);
 
   const recoverSharedEmailSession = useCallback(() => {
     const expected = email.trim().toLowerCase();
@@ -984,7 +1161,7 @@ export default function StewardLoginSection() {
         durableRecovery.hasOAuth;
       callbackExchangeStartedRef.current = false;
       callbackRecoveryBlockedRef.current = false;
-      rotateProviderIntent();
+      rotateProviderIntent({ preserveRecoveryReservation: true });
       discardStewardProvidersRequest();
       consumeStewardPkceVerifier();
       setLiveProviderAuthority(false);
@@ -1007,8 +1184,8 @@ export default function StewardLoginSection() {
       setError(null);
       setCallbackError(null);
       setCompletingCallback(false);
-      setExternalSuccessDestination(null);
-      setRedirectTo(null);
+      setExternalSuccessPublication(null);
+      setRedirectPublication(null);
       setWalletButtonsMounted(false);
       setMountedWalletKind(null);
       setAutoStartWallet(null);
@@ -1202,13 +1379,19 @@ export default function StewardLoginSection() {
       }
       recoverPendingOAuthReturnToRef.current = true;
       callbackExchangeStartedRef.current = true;
+      const publication =
+        createStewardSessionRecoveryPublicationFence(recoveryReceipt);
+      let callbackPublishedToken: string | null = null;
+      let sessionMutationDispatched = false;
+      const callbackOwnsPublication = () =>
+        isProviderGenerationCurrent(callbackGeneration) &&
+        publication.validate();
       enqueueStewardSessionMutation(async (mutationLease) => {
-        if (
-          !isProviderGenerationCurrent(callbackGeneration) ||
-          !isStewardSessionRecoveryReceiptLive(recoveryReceipt)
-        ) {
+        if (!callbackOwnsPublication()) {
           return false;
         }
+        markStewardSessionRecoveryCookiePending(recoveryReceipt);
+        sessionMutationDispatched = true;
         const res = await exchangeStewardCodeViaApi(code, {
           redirectUri: buildStewardOAuthRedirectUri(window.location.origin),
           tenantId: STEWARD_TENANT_ID,
@@ -1231,32 +1414,44 @@ export default function StewardLoginSection() {
             "Sign-in completed, but the browser session could not be hydrated. Refresh and try again.",
           );
         }
-        if (
-          !isProviderGenerationCurrent(callbackGeneration) ||
-          !isStewardSessionRecoveryReceiptLive(recoveryReceipt)
-        ) {
+        // The nonce POST had to be armed before B was known. Once its response
+        // yields B, persist the stable binding before any local publication so
+        // a later crash may recover B but can never adopt stale cookie A.
+        markStewardSessionRecoveryCookiePending(recoveryReceipt, token);
+        if (!callbackOwnsPublication()) {
           return false;
         }
         const tokenPublished = await persistStewardToken(
           token,
           callbackSignal,
-          () =>
-            isProviderGenerationCurrent(callbackGeneration) &&
-            isStewardSessionRecoveryReceiptLive(recoveryReceipt),
+          callbackOwnsPublication,
+          publication.finalizeBeforePublish,
         );
-        if (!tokenPublished) return false;
         if (
-          !isProviderGenerationCurrent(callbackGeneration) ||
-          !isStewardSessionRecoveryReceiptLive(recoveryReceipt)
+          !tokenPublished ||
+          !publication.isFinalized() ||
+          readStoredStewardToken() !== token
         ) {
           return false;
         }
+        clearSsoLoggedOut();
+        if (!publication.publishChange() || !publication.validate()) {
+          return false;
+        }
         window.dispatchEvent(new CustomEvent("steward-token-sync"));
-        completeStewardSessionRecovery(recoveryReceipt);
-        return true;
+        const committed =
+          publication.validate() && readStoredStewardToken() === token;
+        if (committed) callbackPublishedToken = token;
+        return committed;
       })
         .then((committed) => {
-          if (!committed) {
+          const committedAuthority = callbackPublishedToken
+            ? createStewardSessionRecoveryCommittedAuthority(
+                recoveryReceipt,
+                callbackPublishedToken,
+              )
+            : null;
+          if (!committed || !committedAuthority?.isCurrent()) {
             if (isProviderGenerationCurrent(callbackGeneration)) {
               callbackExchangeStartedRef.current = false;
               callbackRecoveryBlockedRef.current = false;
@@ -1265,16 +1460,23 @@ export default function StewardLoginSection() {
             }
             return;
           }
-          setRedirectTo(
-            resolveLoginReturnTo(searchParams, consumePendingOAuthReturnTo()),
-          );
+          setRedirectPublication({
+            destination: resolveLoginReturnTo(
+              searchParams,
+              consumePendingOAuthReturnTo(),
+            ),
+            authority: committedAuthority,
+          });
         })
         .catch((sessionError) => {
-          if (!isProviderGenerationCurrent(callbackGeneration)) return;
-          callbackExchangeStartedRef.current = false;
-          if (isDefiniteSessionMutationRejection(sessionError)) {
+          if (
+            !sessionMutationDispatched ||
+            isDefiniteSessionMutationRejection(sessionError)
+          ) {
             rejectStewardSessionRecovery(recoveryReceipt);
           }
+          if (!isProviderGenerationCurrent(callbackGeneration)) return;
+          callbackExchangeStartedRef.current = false;
           setCompletingCallback(false);
           setCallbackError(describeCodeExchangeError(sessionError, t));
         });
@@ -1338,7 +1540,7 @@ export default function StewardLoginSection() {
     // a pre-freeze request to overtake the restored document.
     void sessionRecoveryAttempt;
     if (PLAYWRIGHT_TEST_AUTH_ENABLED) return;
-    if (redirectTo !== null) return;
+    if (redirectPublication !== null) return;
     if (searchParams.get("switchAccount") === "1") return;
     if (callbackRecoveryBlockedRef.current || searchParams.get("error")) {
       setSessionRecoveryComplete(true);
@@ -1351,7 +1553,10 @@ export default function StewardLoginSection() {
     const recoveryGeneration = providerIntentGenerationRef.current;
     const recoverySignal = providerIntentAbortRef.current.signal;
     const recoverySnapshot = readStewardSessionRecovery(STEWARD_TENANT_ID);
-    const recoveringServerSession = recoverySnapshot.receipts.length > 0;
+    const recoveringServerSession =
+      recoverySnapshot.currentReceiptPhase === "cookie_pending" &&
+      recoverySnapshot.currentReceiptKind !== "telegram" &&
+      recoverySnapshot.expectedIdentity != null;
     recoverPendingOAuthReturnToRef.current =
       recoverPendingOAuthReturnToRef.current || recoverySnapshot.hasOAuth;
     const recoveryIsCurrent = () =>
@@ -1381,6 +1586,12 @@ export default function StewardLoginSection() {
         if (recoveringServerSession) {
           const recoveryResult = await enqueueStewardSessionMutation(
             async (mutationLease) => {
+              const publication =
+                createStewardSessionRecoverySnapshotPublicationFence(
+                  recoverySnapshot,
+                );
+              const snapshotOwnsPublication = () =>
+                recoveryIsCurrent() && publication.validate();
               const tokenAtAdmission = readStoredStewardToken();
               if (!isStewardSessionRecoverySnapshotLive(recoverySnapshot)) {
                 return { kind: "superseded" as const };
@@ -1406,44 +1617,79 @@ export default function StewardLoginSection() {
                   "The previous sign-in may have completed, but its browser session could not be recovered. Retry session recovery.",
                 );
               }
+              if (
+                !doesStewardSessionRecoverySnapshotMatchToken(
+                  recoverySnapshot,
+                  refreshed.token,
+                )
+              ) {
+                // Keep the receipt as a durable barrier. The cookie predates
+                // this attempt (or the receipt is an unbound legacy/OAuth
+                // mutation), so neither this render nor a later reload may
+                // silently publish it as the account the user just chose.
+                throw new Error(
+                  "The server recovered a different account than this sign-in expected. Continue with a new sign-in instead.",
+                );
+              }
               if (!isStewardSessionRecoverySnapshotLive(recoverySnapshot)) {
                 return { kind: "superseded" as const };
               }
-              await writeStoredStewardToken(refreshed.token, {
-                signal: recoverySignal,
-                validate: () => {
-                  const currentToken = readStoredStewardToken();
-                  return (
-                    recoveryIsCurrent() &&
-                    isStewardSessionRecoverySnapshotLive(recoverySnapshot) &&
-                    (currentToken === tokenAtAdmission ||
-                      currentToken === refreshed.token)
-                  );
+              const writeAuthority = await writeStoredStewardToken(
+                refreshed.token,
+                {
+                  signal: recoverySignal,
+                  validate: () => {
+                    const currentToken = readStoredStewardToken();
+                    return (
+                      snapshotOwnsPublication() &&
+                      (currentToken === tokenAtAdmission ||
+                        currentToken === refreshed.token)
+                    );
+                  },
+                  finalizeBeforePublish: publication.finalizeBeforePublish,
                 },
-              });
+              );
               if (
-                !recoveryIsCurrent() ||
-                !isStewardSessionRecoverySnapshotLive(recoverySnapshot) ||
+                !writeAuthority ||
+                !publication.isFinalized() ||
                 readStoredStewardToken() !== refreshed.token
               ) {
                 return { kind: "cancelled" as const };
               }
-              completeStewardSessionRecoverySnapshot(recoverySnapshot);
-              return { kind: "recovered" as const };
+              if (!publication.publishChange() || !publication.validate()) {
+                return { kind: "cancelled" as const };
+              }
+              return { kind: "recovered" as const, token: refreshed.token };
             },
           );
-          if (!recoveryIsCurrent()) return;
           if (recoveryResult.kind === "cancelled") return;
           if (recoveryResult.kind === "recovered") {
-            if (hasStewardSessionRecovery(STEWARD_TENANT_ID)) {
+            const recoveredAuthority = createRecoverySnapshotCommittedAuthority(
+              recoverySnapshot.generation,
+              recoveryResult.token,
+            );
+            if (!recoveredAuthority.isCurrent()) {
               throw new Error(
                 "Another sign-in is still being finalized. Retry session recovery in a moment.",
               );
             }
             window.dispatchEvent(new CustomEvent("steward-token-sync"));
-            setRedirectTo(resolveRecoveredReturnTo());
+            if (!recoveredAuthority.isCurrent()) {
+              throw new Error(
+                "Another sign-in started while the restored session was being published. Retry session recovery in a moment.",
+              );
+            }
+            // Durable publication and its shell notification must complete
+            // even if the authority event unmounted this provider. Lifecycle
+            // cancellation suppresses only this document's navigation.
+            if (!recoveryIsCurrent()) return;
+            setRedirectPublication({
+              destination: resolveRecoveredReturnTo(),
+              authority: recoveredAuthority,
+            });
             return;
           }
+          if (!recoveryIsCurrent()) return;
           if (hasStewardSessionRecovery(STEWARD_TENANT_ID)) {
             throw new Error(
               "Another sign-in is still being finalized. Retry session recovery in a moment.",
@@ -1455,9 +1701,19 @@ export default function StewardLoginSection() {
         }
 
         let storedToken = readStoredStewardToken();
-        if (!storedToken && hasStewardAuthedCookie()) {
+        if (
+          !storedToken &&
+          recoverySnapshot.receipts.length === 0 &&
+          hasStewardAuthedCookie()
+        ) {
           const cookieRecovery = await enqueueStewardSessionMutation(
             async (mutationLease) => {
+              const publication =
+                createStewardSessionRecoverySnapshotPublicationFence(
+                  recoverySnapshot,
+                );
+              const snapshotOwnsPublication = () =>
+                recoveryIsCurrent() && publication.validate();
               // The readable marker is only an admission hint. A durable login
               // or logout intent can appear while this returning-user refresh
               // waits for another tab, so revalidate the exact empty snapshot
@@ -1485,36 +1741,58 @@ export default function StewardLoginSection() {
               ) {
                 return { kind: "superseded" as const };
               }
-              await writeStoredStewardToken(refreshed.token, {
-                signal: recoverySignal,
-                validate: () => {
-                  const currentToken = readStoredStewardToken();
-                  return (
-                    recoveryIsCurrent() &&
-                    isStewardSessionRecoverySnapshotLive(recoverySnapshot) &&
-                    (currentToken === null || currentToken === refreshed.token)
-                  );
+              const writeAuthority = await writeStoredStewardToken(
+                refreshed.token,
+                {
+                  signal: recoverySignal,
+                  validate: () => {
+                    const currentToken = readStoredStewardToken();
+                    return (
+                      snapshotOwnsPublication() &&
+                      (currentToken === null ||
+                        currentToken === refreshed.token)
+                    );
+                  },
+                  finalizeBeforePublish: publication.finalizeBeforePublish,
                 },
-              });
-              if (!recoveryIsCurrent()) {
+              );
+              if (!writeAuthority || !publication.isFinalized()) {
                 return { kind: "cancelled" as const };
               }
-              if (
-                !isStewardSessionRecoverySnapshotLive(recoverySnapshot) ||
-                readStoredStewardToken() !== refreshed.token
-              ) {
+              if (readStoredStewardToken() !== refreshed.token) {
                 return { kind: "superseded" as const };
               }
-              return { kind: "recovered" as const };
+              if (!publication.publishChange() || !publication.validate()) {
+                return { kind: "cancelled" as const };
+              }
+              return { kind: "recovered" as const, token: refreshed.token };
             },
           );
-          if (!recoveryIsCurrent()) return;
           if (cookieRecovery.kind === "cancelled") return;
           if (cookieRecovery.kind === "recovered") {
+            const recoveredAuthority = createRecoverySnapshotCommittedAuthority(
+              recoverySnapshot.generation,
+              cookieRecovery.token,
+            );
+            if (!recoveredAuthority.isCurrent()) {
+              throw new Error(
+                "Another sign-in started while the browser session was being published. Retry session recovery in a moment.",
+              );
+            }
             window.dispatchEvent(new CustomEvent("steward-token-sync"));
-            setRedirectTo(resolveRecoveredReturnTo());
+            if (!recoveredAuthority.isCurrent()) {
+              throw new Error(
+                "Another sign-in started while the browser session was being published. Retry session recovery in a moment.",
+              );
+            }
+            if (!recoveryIsCurrent()) return;
+            setRedirectPublication({
+              destination: resolveRecoveredReturnTo(),
+              authority: recoveredAuthority,
+            });
             return;
           }
+          if (!recoveryIsCurrent()) return;
           if (cookieRecovery.kind === "superseded") {
             if (hasStewardSessionRecovery(STEWARD_TENANT_ID)) {
               throw new Error(
@@ -1524,11 +1802,13 @@ export default function StewardLoginSection() {
             storedToken = readStoredStewardToken();
           }
         }
-        if (storedToken) {
+        if (storedToken && recoverySnapshot.receipts.length === 0) {
           // Session recovery establishes auth only. A pending Telegram claim
           // remains inert until /get-started previews it and the user confirms
-          // it explicitly. Any readable cookie was already reconciled above,
-          // so a rejection must not trigger a second refresh rotation.
+          // it explicitly. A durable reserved/unbound receipt is a block-only
+          // barrier: it may represent a newer account choice that has not yet
+          // dispatched its cookie POST, so the older local token must not be
+          // mirrored or redirected while that receipt exists.
           const storedSessionStillOwnsAuthority = () =>
             recoveryIsCurrent() &&
             isStewardSessionRecoverySnapshotLive(recoverySnapshot) &&
@@ -1546,7 +1826,14 @@ export default function StewardLoginSection() {
             return;
           }
           if (recoveryIsCurrent()) {
-            setRedirectTo(resolveRecoveredReturnTo());
+            setRedirectPublication({
+              destination: resolveRecoveredReturnTo(),
+              authority: {
+                isCurrent: () =>
+                  isStewardSessionRecoverySnapshotLive(recoverySnapshot) &&
+                  readStoredStewardToken() === storedToken,
+              },
+            });
           }
           return;
         }
@@ -1574,7 +1861,7 @@ export default function StewardLoginSection() {
     };
   }, [
     isProviderGenerationCurrent,
-    redirectTo,
+    redirectPublication,
     searchParams,
     sessionRecoveryAttempt,
   ]);
@@ -1634,9 +1921,13 @@ export default function StewardLoginSection() {
               return;
             }
             if (recovered) {
+              if (!recovered.isCurrent()) return;
               // The recovery helper returns only after refresh response
               // parsing and canonical publication complete under one lease.
-              setExternalSuccessDestination(resolveLoginReturnTo(searchParams));
+              setExternalSuccessPublication({
+                destination: resolveLoginReturnTo(searchParams),
+                authority: recovered,
+              });
               setEmailCheckState("approved");
               setError(null);
               setStep("external-success");
@@ -1711,8 +2002,12 @@ export default function StewardLoginSection() {
             );
             return;
           }
+          if (!recovered.isCurrent()) return;
           // The recovery helper has already published the token atomically.
-          setExternalSuccessDestination(message.destination);
+          setExternalSuccessPublication({
+            destination: message.destination,
+            authority: recovered,
+          });
           setEmailCheckState("approved");
           setError(null);
           setStep("external-success");
@@ -1774,31 +2069,34 @@ export default function StewardLoginSection() {
     token: string,
     refreshToken?: string | null,
     intentGeneration = providerIntentGenerationRef.current,
+    recoveryIntent?: ProviderRecoveryIntent,
     options?: { verifiedPhone: string },
   ) {
-    if (!isProviderIntentCurrent(intentGeneration)) return;
+    if (!recoveryIntent || !isProviderIntentCurrent(intentGeneration)) {
+      return;
+    }
     const intentSignal = providerIntentAbortRef.current.signal;
     sessionCommitGenerationRef.current = intentGeneration;
     setSessionCommitGeneration(intentGeneration);
-    let recoveryReceipt: ReturnType<typeof beginStewardSessionRecovery>;
-    try {
-      recoveryReceipt = beginStewardSessionRecovery(
-        STEWARD_TENANT_ID,
-        "provider",
-      );
-    } catch (storageError) {
-      sessionCommitGenerationRef.current = null;
-      setSessionCommitGeneration(null);
-      throw storageError;
-    }
+    const recoveryReceipt = recoveryIntent.recovery;
     setPasskeyEmailGrant(null);
     setShowPasskeyEnrollmentRecovery(false);
+    const publication =
+      createStewardSessionRecoveryPublicationFence(recoveryReceipt);
+    const providerOwnsPublication = () =>
+      isProviderIntentCurrent(intentGeneration) && publication.validate();
     try {
       const committed = await enqueueStewardSessionMutation(
         async (mutationLease) => {
+          if (!providerOwnsPublication()) {
+            return false;
+          }
           if (
-            !isProviderIntentCurrent(intentGeneration) ||
-            !isStewardSessionRecoveryReceiptLive(recoveryReceipt)
+            !markProviderSessionMutationDispatched(
+              recoveryIntent,
+              intentGeneration,
+              token,
+            )
           ) {
             return false;
           }
@@ -1806,56 +2104,64 @@ export default function StewardLoginSection() {
             ...options,
             signal: intentSignal,
             mutationLease,
-            validate: () =>
-              isProviderIntentCurrent(intentGeneration) &&
-              isStewardSessionRecoveryReceiptLive(recoveryReceipt),
+            validate: providerOwnsPublication,
+            finalizeBeforePublish: publication.finalizeBeforePublish,
           });
           if (
-            !isProviderIntentCurrent(intentGeneration) ||
-            !isStewardSessionRecoveryReceiptLive(recoveryReceipt)
+            !publication.isFinalized() ||
+            readStoredStewardToken() !== token
           ) {
             return false;
           }
-          // Keep server commit, protected-storage publication, and exact
-          // receipt completion under one origin-wide lock. A newer provider
-          // transaction cannot interleave and then be overwritten locally.
-          const tokenPublished = await persistStewardToken(
-            token,
-            intentSignal,
-            () =>
-              isProviderIntentCurrent(intentGeneration) &&
-              isStewardSessionRecoveryReceiptLive(recoveryReceipt),
+          clearSsoLoggedOut();
+          if (!publication.publishChange() || !publication.validate()) {
+            return false;
+          }
+          window.dispatchEvent(
+            new CustomEvent("steward-token-sync", { detail: { token } }),
           );
-          if (!tokenPublished) return false;
-          if (
-            !isProviderIntentCurrent(intentGeneration) ||
-            !isStewardSessionRecoveryReceiptLive(recoveryReceipt)
-          ) {
-            return false;
-          }
-          completeStewardSessionRecovery(recoveryReceipt);
-          return true;
+          return publication.validate() && readStoredStewardToken() === token;
         },
       );
       if (!committed) {
+        if (!recoveryIntent.sessionMutationDispatched) {
+          rejectStewardSessionRecovery(recoveryReceipt);
+        }
         if (isProviderGenerationCurrent(intentGeneration)) {
           sessionCommitGenerationRef.current = null;
           setSessionCommitGeneration(null);
         }
         return;
       }
-      toast.success("Signed in!");
-      setRedirectTo(
-        resolveLoginReturnTo(searchParams, consumePendingOAuthReturnTo()),
+      const committedAuthority = createStewardSessionRecoveryCommittedAuthority(
+        recoveryReceipt,
+        token,
       );
+      if (!committedAuthority.isCurrent()) {
+        if (isProviderGenerationCurrent(intentGeneration)) {
+          sessionCommitGenerationRef.current = null;
+          setSessionCommitGeneration(null);
+        }
+        return;
+      }
+      if (providerRecoveryIntentRef.current === recoveryIntent) {
+        providerRecoveryIntentRef.current = null;
+      }
+      toast.success("Signed in!");
+      if (!committedAuthority.isCurrent()) return;
+      setRedirectPublication({
+        destination: resolveLoginReturnTo(
+          searchParams,
+          consumePendingOAuthReturnTo(),
+        ),
+        authority: committedAuthority,
+      });
       setStep("success");
     } catch (commitError) {
+      rejectProviderRecoveryAfterFailure(recoveryIntent, commitError);
       if (isProviderGenerationCurrent(intentGeneration)) {
         sessionCommitGenerationRef.current = null;
         setSessionCommitGeneration(null);
-        if (isDefiniteSessionMutationRejection(commitError)) {
-          rejectStewardSessionRecovery(recoveryReceipt);
-        }
       }
       throw commitError;
     }
@@ -1897,7 +2203,16 @@ export default function StewardLoginSection() {
       await persistStewardToken(LOCAL_DEDICATED_TEST_API_KEY, signal);
       if (!isProviderIntentCurrent(generation)) return;
       window.dispatchEvent(new CustomEvent("steward-token-sync"));
-      setRedirectTo(resolveLoginReturnTo(searchParams));
+      const localAuthority = {
+        isCurrent: () =>
+          isProviderIntentCurrent(generation) &&
+          readStoredStewardToken() === LOCAL_DEDICATED_TEST_API_KEY,
+      };
+      if (!localAuthority.isCurrent()) return;
+      setRedirectPublication({
+        destination: resolveLoginReturnTo(searchParams),
+        authority: localAuthority,
+      });
       setStep("success");
     } catch (localSignInError) {
       if (!isProviderIntentCurrent(generation)) return;
@@ -2000,7 +2315,10 @@ export default function StewardLoginSection() {
     setError(null);
     setShowPasskeyRecovery(false);
     setShowPasskeyEnrollmentRecovery(false);
+    let recoveryIntent: ProviderRecoveryIntent | null = null;
     try {
+      recoveryIntent = beginProviderRecoveryIntent(intentGeneration);
+      if (!recoveryIntent) return;
       const result = requireCompletedAuth(
         await auth.signInWithPasskey(email.trim(), {
           fallbackToRegistration: false,
@@ -2009,8 +2327,16 @@ export default function StewardLoginSection() {
       if (!isProviderIntentCurrent(intentGeneration)) return;
       await rememberPasskeyDeviceHint(email);
       if (!isProviderIntentCurrent(intentGeneration)) return;
-      await handleSuccess(result.token, result.refreshToken, intentGeneration);
+      await handleSuccess(
+        result.token,
+        result.refreshToken,
+        intentGeneration,
+        recoveryIntent,
+      );
     } catch (e: unknown) {
+      if (recoveryIntent) {
+        rejectProviderRecoveryAfterFailure(recoveryIntent, e);
+      }
       if (!isProviderIntentCurrent(intentGeneration)) return;
       // error-policy:J4 authentication failures remain visibly distinct and
       // only the ambiguous browser-owned credential outcome offers recovery.
@@ -2025,8 +2351,17 @@ export default function StewardLoginSection() {
         setShowPasskeyRecovery(true);
         setLoading(null);
       } else {
-        setError(getErrorMessage(e, "Passkey sign-in failed. Try again."));
+        setError(
+          describeSessionEstablishmentError(
+            e,
+            "Passkey sign-in failed. Try again.",
+          ),
+        );
         setLoading(null);
+      }
+    } finally {
+      if (recoveryIntent) {
+        rejectProviderRecoveryBeforeSessionMutation(recoveryIntent);
       }
     }
   }
@@ -2119,6 +2454,7 @@ export default function StewardLoginSection() {
     setLoading("passkey");
     setError(null);
     setShowPasskeyEnrollmentRecovery(false);
+    let recoveryIntent: ProviderRecoveryIntent | null = null;
     try {
       let emailGrant = passkeyEmailGrant;
       if (!emailGrant) {
@@ -2126,14 +2462,24 @@ export default function StewardLoginSection() {
         if (!isProviderIntentCurrent(generation)) return;
         setPasskeyEmailGrant(emailGrant);
       }
+      recoveryIntent = beginProviderRecoveryIntent(generation);
+      if (!recoveryIntent) return;
       const result = requireCompletedAuth(
         await auth.addPasskey(email.trim(), { emailGrant }),
       );
       if (!isProviderIntentCurrent(generation)) return;
       await rememberPasskeyDeviceHint(email);
       if (!isProviderIntentCurrent(generation)) return;
-      await handleSuccess(result.token, result.refreshToken, generation);
+      await handleSuccess(
+        result.token,
+        result.refreshToken,
+        generation,
+        recoveryIntent,
+      );
     } catch (e: unknown) {
+      if (recoveryIntent) {
+        rejectProviderRecoveryAfterFailure(recoveryIntent, e);
+      }
       if (!isProviderIntentCurrent(generation)) return;
       // error-policy:J4 an OTP-proven account with a persisted credential
       // recovers through authentication; ambiguous browser cancellation keeps
@@ -2152,9 +2498,18 @@ export default function StewardLoginSection() {
         setError("Passkey setup was cancelled. Tap Create passkey to retry.");
         setShowPasskeyEnrollmentRecovery(true);
       } else {
-        setError(getErrorMessage(e, "That code didn't work. Try again."));
+        setError(
+          describeSessionEstablishmentError(
+            e,
+            "That code didn't work. Try again.",
+          ),
+        );
       }
       setLoading(null);
+    } finally {
+      if (recoveryIntent) {
+        rejectProviderRecoveryBeforeSessionMutation(recoveryIntent);
+      }
     }
   }
 
@@ -2273,17 +2628,35 @@ export default function StewardLoginSection() {
     const { generation } = rotateProviderIntent();
     setLoading("sms");
     setError(null);
+    let recoveryIntent: ProviderRecoveryIntent | null = null;
     try {
+      recoveryIntent = beginProviderRecoveryIntent(generation);
+      if (!recoveryIntent) return;
       const result = requireCompletedAuth(await auth.verifySmsOtp(phone, code));
       if (!isProviderIntentCurrent(generation)) return;
-      await handleSuccess(result.token, result.refreshToken, generation, {
-        verifiedPhone: phone,
-      });
+      await handleSuccess(
+        result.token,
+        result.refreshToken,
+        generation,
+        recoveryIntent,
+        { verifiedPhone: phone },
+      );
     } catch (smsError) {
+      if (recoveryIntent) {
+        rejectProviderRecoveryAfterFailure(recoveryIntent, smsError);
+      }
       if (!isProviderIntentCurrent(generation)) return;
       // error-policy:J4 Rejected or failed SMS verification stays recoverable.
-      setError(getErrorMessage(smsError, "That code didn't work. Try again."));
+      setError(
+        describeSessionEstablishmentError(
+          smsError,
+          "That code didn't work. Try again.",
+        ),
+      );
     } finally {
+      if (recoveryIntent) {
+        rejectProviderRecoveryBeforeSessionMutation(recoveryIntent);
+      }
       if (isProviderIntentCurrent(generation)) setLoading(null);
     }
   }
@@ -2314,7 +2687,10 @@ export default function StewardLoginSection() {
     const { generation } = rotateProviderIntent();
     setLoading("email");
     setError(null);
+    let recoveryIntent: ProviderRecoveryIntent | null = null;
     try {
+      recoveryIntent = beginProviderRecoveryIntent(generation);
+      if (!recoveryIntent) return;
       const result = await verifyStewardEmailSignInCode(
         { baseUrl: stewardApiUrl, tenantId: STEWARD_TENANT_ID },
         email.trim(),
@@ -2326,13 +2702,25 @@ export default function StewardLoginSection() {
         );
       }
       if (!isProviderIntentCurrent(generation)) return;
-      await handleSuccess(result.token, result.refreshToken, generation);
+      await handleSuccess(
+        result.token,
+        result.refreshToken,
+        generation,
+        recoveryIntent,
+      );
     } catch (e: unknown) {
+      if (recoveryIntent) {
+        rejectProviderRecoveryAfterFailure(recoveryIntent, e);
+      }
       if (!isProviderIntentCurrent(generation)) return;
       setError(
         describeEmailLoginError(e, "That code did not work. Try again."),
       );
       setLoading(null);
+    } finally {
+      if (recoveryIntent) {
+        rejectProviderRecoveryBeforeSessionMutation(recoveryIntent);
+      }
     }
   }
 
@@ -2512,20 +2900,34 @@ export default function StewardLoginSection() {
     }
     setLoading("telegram");
     setError(null);
+    let recoveryIntent: ProviderRecoveryIntent | null = null;
     try {
+      recoveryIntent = beginProviderRecoveryIntent(intentGeneration);
+      if (!recoveryIntent) return;
       const result = requireCompletedAuth(
         await auth.signInWithTelegram(payload, {
           tenantId: STEWARD_TENANT_ID,
         }),
       );
       if (!isProviderIntentCurrent(intentGeneration)) return;
-      await handleSuccess(result.token, result.refreshToken, intentGeneration);
+      await handleSuccess(
+        result.token,
+        result.refreshToken,
+        intentGeneration,
+        recoveryIntent,
+      );
     } catch (telegramError: unknown) {
+      if (recoveryIntent) {
+        rejectProviderRecoveryAfterFailure(recoveryIntent, telegramError);
+      }
       if (!isProviderIntentCurrent(intentGeneration)) return;
       // error-policy:J4 Steward or Cloud session failures remain visibly
       // distinct and leave the user on the login surface for a safe retry.
       setError(
-        getErrorMessage(telegramError, "Telegram sign-in failed. Try again."),
+        describeSessionEstablishmentError(
+          telegramError,
+          "Telegram sign-in failed. Try again.",
+        ),
       );
       setLoading(null);
       window.setTimeout(() => {
@@ -2533,6 +2935,10 @@ export default function StewardLoginSection() {
           telegramRegionRef.current?.focus({ preventScroll: true });
         }
       }, 0);
+    } finally {
+      if (recoveryIntent) {
+        rejectProviderRecoveryBeforeSessionMutation(recoveryIntent);
+      }
     }
   }
 
@@ -2550,6 +2956,20 @@ export default function StewardLoginSection() {
       return;
     }
     const { generation } = rotateProviderIntent();
+    let recoveryIntent: ProviderRecoveryIntent | null = null;
+    try {
+      recoveryIntent = beginProviderRecoveryIntent(generation);
+    } catch (walletIntentError) {
+      setError(
+        getErrorMessage(
+          walletIntentError,
+          "Secure sign-in recovery storage is unavailable.",
+        ),
+      );
+      return;
+    }
+    if (!recoveryIntent) return;
+    walletRecoveryIntentRef.current = recoveryIntent;
     setError(null);
     setWalletIntentGeneration(generation);
     setMountedWalletKind(kind);
@@ -2559,6 +2979,11 @@ export default function StewardLoginSection() {
 
   function cancelWalletIntent() {
     if (sessionCommitGenerationRef.current !== null) return;
+    const recoveryIntent = walletRecoveryIntentRef.current;
+    if (recoveryIntent && !recoveryIntent.sessionMutationDispatched) {
+      rejectStewardSessionRecovery(recoveryIntent.recovery);
+    }
+    walletRecoveryIntentRef.current = null;
     rotateProviderIntent();
     setWalletButtonsMounted(false);
     setMountedWalletKind(null);
@@ -2588,8 +3013,33 @@ export default function StewardLoginSection() {
     telegramRegionRef.current?.focus({ preventScroll: true });
   }, [telegramIntent]);
 
-  if (redirectTo) {
-    return <Navigate to={redirectTo} replace />;
+  useEffect(() => {
+    if (!redirectPublication) return;
+    if (!redirectPublication.authority.isCurrent()) {
+      setRedirectPublication(null);
+      setCompletingCallback(false);
+      setStep("idle");
+      setError(
+        "A newer sign-in superseded this session. Continue with the latest sign-in.",
+      );
+      return;
+    }
+    navigate(redirectPublication.destination, { replace: true });
+  }, [navigate, redirectPublication]);
+
+  if (redirectPublication) {
+    return (
+      <ReservedLoginFrame>
+        <div className="flex flex-col items-center gap-4" role="status">
+          <div className="size-8 animate-spin rounded-full border-2 border-border-strong border-t-accent motion-reduce:animate-none" />
+          <p className="text-sm text-muted">
+            {t("cloud.login.completingSignIn", {
+              defaultValue: "Completing sign-in…",
+            })}
+          </p>
+        </div>
+      </ReservedLoginFrame>
+    );
   }
 
   // A completed OAuth/token callback is being exchanged. Hold a terminal
@@ -2736,6 +3186,8 @@ export default function StewardLoginSection() {
   }
 
   if (step === "external-success") {
+    const externalAuthorityCurrent =
+      externalSuccessPublication?.authority.isCurrent() === true;
     return (
       <ReservedLoginFrame>
         <div
@@ -2746,9 +3198,11 @@ export default function StewardLoginSection() {
             <EmailIcon />
           </div>
           <p className="text-base font-semibold text-txt-strong">
-            {t("cloud.login.emailStatus.signedIn", {
-              defaultValue: "Signed in",
-            })}
+            {externalAuthorityCurrent
+              ? t("cloud.login.emailStatus.signedIn", {
+                  defaultValue: "Signed in",
+                })
+              : "A newer sign-in is in progress"}
           </p>
           <p className="text-sm text-muted">
             {t("cloud.login.emailStatus.signedInElsewhere", {
@@ -2759,12 +3213,18 @@ export default function StewardLoginSection() {
           <Button
             type="button"
             className="hosted-signin-focus-emphasis w-full"
-            onClick={() =>
-              setRedirectTo(
-                externalSuccessDestination ??
-                  resolveLoginReturnTo(searchParams),
-              )
-            }
+            disabled={!externalAuthorityCurrent}
+            onClick={() => {
+              const publication = externalSuccessPublication;
+              if (!publication?.authority.isCurrent()) {
+                setStep("idle");
+                setError(
+                  "A newer sign-in superseded this session. Continue with the latest sign-in.",
+                );
+                return;
+              }
+              setRedirectPublication(publication);
+            }}
           >
             {t("cloud.emailCallback.continue", { defaultValue: "Continue" })}
           </Button>
@@ -3721,10 +4181,18 @@ export default function StewardLoginSection() {
                       }}
                       onSuccess={(result) => {
                         if (walletIntentGeneration === null) return;
+                        const recoveryIntent = walletRecoveryIntentRef.current;
+                        if (
+                          !recoveryIntent ||
+                          recoveryIntent.generation !== walletIntentGeneration
+                        ) {
+                          return;
+                        }
                         return handleSuccess(
                           result.token,
                           result.refreshToken,
                           walletIntentGeneration,
+                          recoveryIntent,
                         );
                       }}
                       onError={(walletError) => {
@@ -3733,6 +4201,16 @@ export default function StewardLoginSection() {
                           !isProviderIntentCurrent(walletIntentGeneration)
                         ) {
                           return;
+                        }
+                        const recoveryIntent = walletRecoveryIntentRef.current;
+                        if (
+                          recoveryIntent?.generation === walletIntentGeneration
+                        ) {
+                          rejectProviderRecoveryAfterFailure(
+                            recoveryIntent,
+                            walletError,
+                          );
+                          walletRecoveryIntentRef.current = null;
                         }
                         setError(
                           walletError.message ||

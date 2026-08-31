@@ -12,10 +12,15 @@
  * `persistFirstRun` helper, so a completed onboarding posts exactly once.
  */
 
+import {
+  clearStoredStewardToken,
+  readStoredStewardToken,
+} from "@elizaos/shared/steward-session-client";
 import { client } from "../api";
 import { supportsFullAppShellRoutes } from "../api/app-shell-capabilities";
 import type { DedicatedAdoptionConfirmationRequester } from "../api/client-cloud";
 import {
+  compensateFreshCloudCompatAgentCreate,
   getCloudAuthToken,
   isDirectCloudSharedAgentBase,
 } from "../api/client-cloud";
@@ -50,6 +55,11 @@ import {
   savePersistedFirstRunComplete,
 } from "../state";
 import { runAgentSessionRecovery } from "../state/agent-session-recovery-runner";
+import { bindDirectCloudLoginToPersonalAgent } from "../state/bind-direct-cloud-login";
+import {
+  captureStoredStewardLoginAuthority,
+  isStoredStewardTokenUsable,
+} from "../state/cloud-steward-login";
 import type { CloudLoginOptions } from "../state/types";
 import { isCloudStatusAuthenticated } from "../utils";
 import { isPersonalSharedElizaId } from "../utils/cloud-agent-base";
@@ -77,6 +87,8 @@ import {
 import { resolveFirstRunLocalAgentApiBase } from "./runtime-target";
 
 const FIRST_RUN_AGENT_WAIT_MS = 180_000;
+const CLOUD_AGENT_SELECTION_SUPERSEDED_MESSAGE =
+  "Cloud agent setup was superseded by a newer login.";
 
 // ── Injected ports — the store seams the finish logic needs ──────────────────
 
@@ -543,12 +555,46 @@ export async function bindCloudAgent(
     ...(opts.knownAgents ? { knownAgents: opts.knownAgents } : {}),
     onProgress: (status, detail) => ports.onStatus?.(detail ?? status, status),
   });
+  const selectionIsCurrent = () => selectedAgent.authority?.isCurrent() ?? true;
+  const supersededOutcome = (): FirstRunFinishOutcome => ({
+    kind: "error",
+    message: CLOUD_AGENT_SELECTION_SUPERSEDED_MESSAGE,
+  });
+  const ensureSelectionIsCurrent = async (
+    compensateLocal?: () => Promise<void>,
+  ): Promise<boolean> => {
+    // `ready` and caller callbacks may enqueue login B without changing the
+    // receipt synchronously. Flush that microtask before accepting A across
+    // any await/event boundary.
+    await Promise.resolve();
+    if (selectionIsCurrent()) return true;
+    const failures: unknown[] = [];
+    try {
+      await compensateLocal?.();
+    } catch (error) {
+      failures.push(error);
+    }
+    try {
+      await selectedAgent.authority?.compensateIfSuperseded();
+    } catch (error) {
+      failures.push(error);
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        "The stale Cloud agent selection could not be fully compensated.",
+      );
+    }
+    return false;
+  };
+  if (!(await ensureSelectionIsCurrent())) return supersededOutcome();
   // The remote agent now exists/was selected; every step after this point
   // mutates local durable state, so an abandoned attempt stops HERE (#19255).
   ports.signal?.throwIfAborted();
   const cloudAgentApiBase = selectedAgent.apiBase;
   if (selectedAgent.requiresAgentPairing) {
     ports.onStatus?.("Signing in to your cloud agent", "pairing");
+    if (!(await ensureSelectionIsCurrent())) return supersededOutcome();
     try {
       const pairMode = await pairDedicatedCloudAgentInCurrentWindow({
         cloudApiBase,
@@ -556,15 +602,17 @@ export async function bindCloudAgent(
         cloudToken: authToken,
         containerBase: cloudAgentApiBase,
       });
+      if (!(await ensureSelectionIsCurrent())) return supersededOutcome();
       ports.signal?.throwIfAborted();
       if (pairMode === "in-process") {
+        ports.onStatus?.(null);
+        if (!(await ensureSelectionIsCurrent())) return supersededOutcome();
         persistMobileRuntimeModeForServerTarget("elizacloud");
         clearForceFreshFirstRun();
         clearPersistedFirstRunState();
         // Durable completion is persisted HERE, at the landing itself, for the
         // same reason as the main bind path below (#15903).
         savePersistedFirstRunComplete(true);
-        ports.onStatus?.(null);
         ports.completeFirstRun("chat");
         return { kind: "done" };
       }
@@ -575,6 +623,7 @@ export async function bindCloudAgent(
       savePersistedFirstRunComplete(true);
       return { kind: "handoff-started" };
     } catch (err) {
+      if (!(await ensureSelectionIsCurrent())) return supersededOutcome();
       return {
         kind: "error",
         message: `Couldn't sign in to your cloud agent: ${
@@ -591,9 +640,18 @@ export async function bindCloudAgent(
     accessToken: authToken,
   });
   ports.onStatus?.("Saving first-run profile", "persist");
+  if (!(await ensureSelectionIsCurrent())) return supersededOutcome();
   let liveTargetAuthority: ReturnType<typeof client.stageSessionTarget> = null;
   let compensateConnection: (() => Promise<void>) | null = null;
-  const attemptIsLive = () => !ports.signal?.aborted;
+  let connectionCompensation: Promise<void> | null = null;
+  const compensateSavedConnection = (): Promise<void> => {
+    if (!connectionCompensation) {
+      const compensate = compensateConnection;
+      connectionCompensation = compensate?.() ?? Promise.resolve();
+    }
+    return connectionCompensation;
+  };
+  const attemptIsLive = () => !ports.signal?.aborted && selectionIsCurrent();
   const sharedAgentProfile = await persistAgentProfileConnectionDurably(
     {
       kind: "cloud",
@@ -609,12 +667,17 @@ export async function bindCloudAgent(
       validate: attemptIsLive,
       finalize: async () => {
         ports.signal?.throwIfAborted();
+        if (!selectionIsCurrent()) return false;
         liveTargetAuthority = client.stageSessionTarget({
           baseUrl: cloudAgentApiBase,
           token: authToken,
         });
         if (!liveTargetAuthority) return false;
-        if (liveTargetAuthority.publish()) return true;
+        if (!attemptIsLive()) {
+          liveTargetAuthority.restoreIfCurrent();
+          return false;
+        }
+        if (liveTargetAuthority.publish() && attemptIsLive()) return true;
         liveTargetAuthority.restoreIfCurrent();
         return false;
       },
@@ -626,6 +689,9 @@ export async function bindCloudAgent(
       },
     },
   );
+  if (!(await ensureSelectionIsCurrent(compensateSavedConnection))) {
+    return supersededOutcome();
+  }
   if (!sharedAgentProfile || !liveTargetAuthority) {
     return {
       kind: "error",
@@ -633,8 +699,7 @@ export async function bindCloudAgent(
     };
   }
   if (!attemptIsLive()) {
-    const compensate = compensateConnection as (() => Promise<void>) | null;
-    if (compensate) await compensate();
+    await compensateSavedConnection();
     ports.signal?.throwIfAborted();
     return {
       kind: "error",
@@ -655,7 +720,9 @@ export async function bindCloudAgent(
   // non-conforming shim without an empty catch block.
   // error-policy:J6 best-effort warm-up — failure is fully degradable.
   void Promise.resolve()
-    .then(() => client.listConversations?.())
+    .then(() =>
+      selectionIsCurrent() ? client.listConversations?.() : undefined,
+    )
     .catch(() => undefined);
   persistMobileRuntimeModeForServerTarget("elizacloud");
   // Direct Cloud agent bases are chat runtimes, not full app-shell setup
@@ -663,6 +730,12 @@ export async function bindCloudAgent(
   // owns the app-shell routes.
   if (supportsFullAppShellRoutes(cloudAgentApiBase)) {
     await persistFirstRun(plan, ports);
+    if (!(await ensureSelectionIsCurrent(compensateSavedConnection))) {
+      return supersededOutcome();
+    }
+  }
+  if (!(await ensureSelectionIsCurrent(compensateSavedConnection))) {
+    return supersededOutcome();
   }
   // A shared/dedicated cloud agent SKIPS persistFirstRun above, so it never
   // reaches the `client.submitFirstRun` call that clears the durable
@@ -676,8 +749,6 @@ export async function bindCloudAgent(
   // agent is healthy and running. Clear it on the cloud completion path too so
   // "completion clears force-fresh" holds for EVERY runtime (idempotent — the
   // app-shell path's submitFirstRun already cleared it above).
-  clearForceFreshFirstRun();
-  clearPersistedFirstRunState();
   // Persist the durable completion contract at the landing ITSELF, not only
   // through the conductor's completion callback: every successful cloud
   // landing — fresh provision AND the returning-account "Finding your
@@ -685,9 +756,19 @@ export async function bindCloudAgent(
   // launch re-enters first-run for a user whose agent is healthy (#15903).
   // Idempotent with the callback's own setFirstRunComplete(true) persist.
   ports.signal?.throwIfAborted();
-  savePersistedFirstRunComplete(true);
   ports.onStatus?.(null);
+  if (!(await ensureSelectionIsCurrent(compensateSavedConnection))) {
+    return supersededOutcome();
+  }
+  clearForceFreshFirstRun();
+  clearPersistedFirstRunState();
+  savePersistedFirstRunComplete(true);
   ports.completeFirstRun("chat");
+
+  // Completion is now committed. A later login may supersede this authority,
+  // in which case only suppress A's optional background handoff work; do not
+  // delete an agent that was already durably presented to the user.
+  if (!selectionIsCurrent()) return { kind: "done" };
 
   // Marker hygiene (#15902): a pending-handoff marker is only meaningful for
   // the shared agent it was minted for. A leftover marker from a different
@@ -700,6 +781,7 @@ export async function bindCloudAgent(
       ? pendingHandoff
       : null;
   if (pendingHandoff && !pendingHandoffForThisAgent) {
+    if (!selectionIsCurrent()) return { kind: "done" };
     clearPendingCloudHandoff();
   }
 
@@ -731,13 +813,18 @@ export async function bindCloudAgent(
     (selectedAgent.created || pendingHandoffForThisAgent === null) &&
     isDirectCloudSharedAgentBase(cloudAgentApiBase)
   ) {
+    if (!selectionIsCurrent()) return { kind: "done" };
     const sharedAgentId = selectedAgent.agentId;
     const cloudApiBase = getBootConfig().cloudApiBase || "https://eliza.app";
-    const createDedicatedHandoffTarget = async (): Promise<string> => {
+    const createDedicatedHandoffTarget = async (): Promise<{
+      agentId: string;
+      compensateIfSuperseded(): Promise<void>;
+    }> => {
       const dedicated = await client.createCloudCompatAgent({
         agentName: name,
         ...(bio.length ? { agentConfig: { bio } } : {}),
         forceCreate: true,
+        validateAuthority: selectionIsCurrent,
       });
       if (!dedicated.success || !dedicated.data.agentId) {
         throw new Error(
@@ -747,6 +834,44 @@ export async function bindCloudAgent(
         );
       }
       const dedicatedAgentId = dedicated.data.agentId;
+      let compensation: Promise<void> | null = null;
+      const compensateIfSuperseded = async () => {
+        compensation ??= (async () => {
+          try {
+            await compensateFreshCloudCompatAgentCreate({
+              client,
+              cloudApiBase,
+              authToken,
+              created: dedicated.created,
+              agentId: dedicatedAgentId,
+              agentName: dedicated.data.agentName || name,
+              createdAt: dedicated.data.createdAt,
+              executionTier: dedicated.data.executionTier,
+            });
+          } finally {
+            const pending = loadPendingCloudHandoff();
+            if (
+              pending?.sharedAgentId === sharedAgentId &&
+              pending.dedicatedAgentId === dedicatedAgentId
+            ) {
+              clearPendingCloudHandoff();
+            }
+          }
+        })();
+        await compensation;
+      };
+      if (!selectionIsCurrent()) {
+        const superseded = new Error(CLOUD_AGENT_SELECTION_SUPERSEDED_MESSAGE);
+        try {
+          await compensateIfSuperseded();
+        } catch (cleanupError) {
+          throw new AggregateError(
+            [superseded, cleanupError],
+            "The superseded dedicated handoff target could not be conditionally removed.",
+          );
+        }
+        throw superseded;
+      }
       // Reload insurance, persisted the INSTANT the dedicated target id is known
       // — before the 30-120s container boot in startCloudAgentHandoff, with no
       // await between learning the id and persisting it. The supervisor is
@@ -761,33 +886,106 @@ export async function bindCloudAgent(
         cloudApiBase,
         startedAt: Date.now(),
       });
-      return dedicatedAgentId;
+      return { agentId: dedicatedAgentId, compensateIfSuperseded };
     };
     runCloudAgentHandoff(
       sharedAgentId,
       async () => {
-        const dedicatedAgentId = await createDedicatedHandoffTarget();
-        return await client.startCloudAgentHandoff({
-          agentId: sharedAgentId,
-          sharedApiBase: cloudAgentApiBase,
-          conversationId: sharedAgentId,
-          dedicatedAgentId,
-          cloudApiBase,
-          authToken,
-          onSwitch: async (containerBase) => {
-            silentlyRepointToDedicated({
-              containerBase,
-              dedicatedAgentId,
-              authToken,
-              ...(isPersonalSharedElizaId(sharedAgentId)
-                ? { personalElizaId: sharedAgentId }
-                : {}),
-            });
-          },
-        });
+        if (!selectionIsCurrent()) {
+          throw new Error(CLOUD_AGENT_SELECTION_SUPERSEDED_MESSAGE);
+        }
+        const dedicatedTarget = await createDedicatedHandoffTarget();
+        if (!selectionIsCurrent()) {
+          await dedicatedTarget.compensateIfSuperseded();
+          throw new Error(CLOUD_AGENT_SELECTION_SUPERSEDED_MESSAGE);
+        }
+        let cutoverPublished = false;
+        let compensationHandled = false;
+        try {
+          const result = await client.startCloudAgentHandoff({
+            agentId: sharedAgentId,
+            sharedApiBase: cloudAgentApiBase,
+            conversationId: sharedAgentId,
+            dedicatedAgentId: dedicatedTarget.agentId,
+            cloudApiBase,
+            authToken,
+            validateAuthority: selectionIsCurrent,
+            onSwitch: async (containerBase) => {
+              if (!selectionIsCurrent()) {
+                throw new Error(CLOUD_AGENT_SELECTION_SUPERSEDED_MESSAGE);
+              }
+              silentlyRepointToDedicated({
+                containerBase,
+                dedicatedAgentId: dedicatedTarget.agentId,
+                authToken,
+                ...(isPersonalSharedElizaId(sharedAgentId)
+                  ? { personalElizaId: sharedAgentId }
+                  : {}),
+              });
+              cutoverPublished = true;
+            },
+          });
+          if (!selectionIsCurrent() && !cutoverPublished) {
+            const superseded = new Error(
+              CLOUD_AGENT_SELECTION_SUPERSEDED_MESSAGE,
+            );
+            compensationHandled = true;
+            try {
+              await dedicatedTarget.compensateIfSuperseded();
+            } catch (cleanupError) {
+              const aggregate = new AggregateError(
+                [superseded, cleanupError],
+                "The superseded handoff and its exact target cleanup both failed.",
+              );
+              reportRendererDiagnostic({
+                scope: "first-run.superseded-handoff-cleanup",
+                error: aggregate,
+                severity: "error",
+                context: {
+                  sharedAgentId,
+                  dedicatedAgentId: dedicatedTarget.agentId,
+                },
+              });
+              throw aggregate;
+            }
+            throw superseded;
+          }
+          return result;
+        } catch (error) {
+          if (
+            !selectionIsCurrent() &&
+            !cutoverPublished &&
+            !compensationHandled
+          ) {
+            try {
+              await dedicatedTarget.compensateIfSuperseded();
+            } catch (cleanupError) {
+              const aggregate = new AggregateError(
+                [error, cleanupError],
+                "The superseded handoff and its exact target cleanup both failed.",
+              );
+              reportRendererDiagnostic({
+                scope: "first-run.superseded-handoff-cleanup",
+                error: aggregate,
+                severity: "error",
+                context: {
+                  sharedAgentId,
+                  dedicatedAgentId: dedicatedTarget.agentId,
+                },
+              });
+              throw aggregate;
+            }
+          }
+          throw error;
+        }
       },
       () => {
-        removeAgentProfile(sharedAgentProfile.id);
+        // Once cutover succeeded, deleting A's transient shared bridge is safe
+        // even if login B won immediately afterwards. Only the local profile
+        // mutation remains gated to the currently presented account.
+        if (selectionIsCurrent()) {
+          removeAgentProfile(sharedAgentProfile.id);
+        }
         void client
           .deleteSharedBridgeAgent(sharedAgentId, {
             cloudApiBase,
@@ -804,6 +1002,7 @@ export async function bindCloudAgent(
             }
           });
       },
+      selectionIsCurrent,
     );
   } else if (
     pendingHandoffForThisAgent &&
@@ -815,7 +1014,7 @@ export async function bindCloudAgent(
     // when it is provably dead, and re-runs the same migration otherwise, so
     // the provisioning tile tracks a live handoff rather than pinning
     // "Setting up…" forever (#15902).
-    resumePendingCloudHandoff();
+    if (selectionIsCurrent()) resumePendingCloudHandoff();
   }
   return { kind: "done" };
 }
@@ -836,52 +1035,93 @@ export async function listOrAutoProvisionCloudAgent(
     firstRunRuntimeTarget("cloud"),
   );
   ports.setRuntimeState("firstRunProvider", "elizacloud");
-  if (!getCloudAuthToken(client)) {
+  const readCanonicalStewardToken = (): string | null => {
+    try {
+      return readStoredStewardToken()?.trim() || null;
+    } catch {
+      // error-policy:J3 inaccessible protected storage is not Cloud authority.
+      return null;
+    }
+  };
+  const storedTokenAtAdmission = readCanonicalStewardToken();
+  if (
+    storedTokenAtAdmission &&
+    !isStoredStewardTokenUsable(storedTokenAtAdmission)
+  ) {
+    // The access JWT outlives its cryptographic authorization as a refresh
+    // lineage artifact. Retire only this exact expired value before deciding
+    // whether an interactive login is required; a concurrent B token wins.
+    await clearStoredStewardToken({ expectedToken: storedTokenAtAdmission });
+    ports.signal?.throwIfAborted();
+  }
+  const tokenBeforeInteractiveLogin = readCanonicalStewardToken();
+  if (
+    !tokenBeforeInteractiveLogin ||
+    !isStoredStewardTokenUsable(tokenBeforeInteractiveLogin)
+  ) {
     // Interactive OAuth is the unbounded wait (#19255): tell the conductor so
     // it can seed the waiting turn and arm the bounded recovery deadline.
     ports.onInteractiveLogin?.();
     await ports.handleInteractiveCloudLogin({ requireClientAuth: true });
-    ports.onInteractiveLoginComplete?.();
     ports.signal?.throwIfAborted();
+    ports.onInteractiveLoginComplete?.();
   }
-  const authToken = getCloudAuthToken(client) ?? "";
-  if (!authToken) {
+  const storedAuthority = captureStoredStewardLoginAuthority();
+  const canonicalToken = readCanonicalStewardToken();
+  if (canonicalToken && !isStoredStewardTokenUsable(canonicalToken)) {
     return { kind: "needs-cloud-login" };
   }
-  // The join flow persists durable local state; a deadline-abandoned attempt
-  // stops HERE (#19255) so it cannot race a newer attempt's join.
-  ports.signal?.throwIfAborted();
+  if (!storedAuthority && !canonicalToken) {
+    return { kind: "needs-cloud-login" };
+  }
+  if (!storedAuthority) {
+    throw new DOMException(
+      "Personal Eliza resolution was superseded by a newer login.",
+      "AbortError",
+    );
+  }
+  const authToken = storedAuthority.token;
+  // The join flow persists durable local state; bind it to the exact bearer and
+  // receipt-free recovery generation so even a login which leaves token A in
+  // place cannot inherit A's binding or completion.
+  const personalEntryIsCurrent = () =>
+    !ports.signal?.aborted && storedAuthority.isCurrent();
+  const assertPersonalEntryIsCurrent = () => {
+    ports.signal?.throwIfAborted();
+    if (!personalEntryIsCurrent()) {
+      throw new DOMException(
+        "Personal Eliza resolution was superseded by a newer login.",
+        "AbortError",
+      );
+    }
+  };
+  assertPersonalEntryIsCurrent();
   const cloudApiBase = getBootConfig().cloudApiBase || "https://eliza.app";
-  const selected = await runJoinFlow({
+  await runJoinFlow({
     client,
     effects: {
-      savePersistedActiveServer,
+      bindPersonalAgent: bindDirectCloudLoginToPersonalAgent,
       savePersistedFirstRunComplete,
     },
     cloudApiBase,
     authToken,
     signal: ports.signal,
-    onProgress: (status, detail) => ports.onStatus?.(detail ?? status, status),
-    ...(ports.requestDedicatedAdoptionConfirmation
-      ? {
-          requestDedicatedAdoptionConfirmation:
-            ports.requestDedicatedAdoptionConfirmation,
-        }
-      : {}),
+    validateAuthority: personalEntryIsCurrent,
+    onProgress: (status, detail) => {
+      assertPersonalEntryIsCurrent();
+      ports.onStatus?.(detail ?? status, status);
+      assertPersonalEntryIsCurrent();
+    },
   });
-  addAgentProfile({
-    kind: "cloud",
-    label: selected.agentName,
-    cloudAgentId: selected.agentId,
-    cloudRuntimeAgentId: selected.activeAgentId,
-    cloudRuntime: selected.runtime,
-    apiBase: selected.apiBase,
-    accessToken: authToken,
-  });
+  assertPersonalEntryIsCurrent();
   persistMobileRuntimeModeForServerTarget("elizacloud");
+  assertPersonalEntryIsCurrent();
   clearForceFreshFirstRun();
+  assertPersonalEntryIsCurrent();
   clearPersistedFirstRunState();
+  assertPersonalEntryIsCurrent();
   ports.onStatus?.(null);
+  assertPersonalEntryIsCurrent();
   ports.completeFirstRun("chat");
   return { kind: "done" };
 }

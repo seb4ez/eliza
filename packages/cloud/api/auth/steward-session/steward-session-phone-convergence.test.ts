@@ -17,7 +17,9 @@ type VerifiedClaims = {
   expiration: number;
   issuedAt: number;
 };
-const verifyStewardTokenCached = mock(
+const verifyStewardTokenCached = mock<
+  (_env: unknown, _token: string) => Promise<VerifiedClaims | null>
+>(
   async (): Promise<VerifiedClaims | null> => ({
     userId: "steward-user-1",
     tenantId: "personal-steward-user-1",
@@ -55,6 +57,7 @@ mock.module("@/api-app/services/audit-dispatcher-singleton", () => ({
 }));
 
 mock.module("@/lib/auth/steward-client", () => ({
+  STEWARD_VERIFY_CLOCK_SKEW_SECONDS: 300,
   verifyStewardTokenCached,
 }));
 
@@ -64,6 +67,7 @@ mock.module("@/lib/services/steward-client", () => ({
 }));
 
 mock.module("@/lib/services/sso-bridge-codes", () => ({
+  classifySsoBridgeLogout: mock(async () => ({ status: "allowed" as const })),
   isBlockedBySsoBridgeLogout: mock(async () => false),
 }));
 
@@ -103,19 +107,31 @@ const ENV = {
 async function post(
   body: unknown,
   mutationProtocol = STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+  cookie?: string,
+  metadata: {
+    origin?: string;
+    fetchSite?: string;
+    requestUrl?: string;
+  } = {},
 ): Promise<Response> {
   const app = new Hono();
   app.route("/api/auth/steward-session", route);
   return await app.fetch(
-    new Request("https://api-staging.elizacloud.ai/api/auth/steward-session", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        origin: "https://staging.elizacloud.ai",
-        [STEWARD_CSRF_HEADER]: mutationProtocol,
+    new Request(
+      metadata.requestUrl ??
+        "https://api-staging.elizacloud.ai/api/auth/steward-session",
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          origin: metadata.origin ?? "https://staging.eliza.app",
+          "sec-fetch-site": metadata.fetchSite ?? "same-origin",
+          [STEWARD_CSRF_HEADER]: mutationProtocol,
+          ...(cookie ? { cookie } : {}),
+        },
+        body: JSON.stringify(body),
       },
-      body: JSON.stringify(body),
-    }),
+    ),
     ENV,
   );
 }
@@ -138,10 +154,26 @@ beforeEach(() => {
 });
 
 describe("POST /api/auth/steward-session phone convergence", () => {
-  test("rejects a legacy account-A login before verification or cookie mutation", async () => {
+  test("legacy account login writes only v1 before activation", async () => {
     const response = await post(
       { token: "account-a-token" },
       STEWARD_CSRF_HEADER_VALUE,
+    );
+
+    expect(response.status).toBe(200);
+    expect(verifyStewardTokenCached).toHaveBeenCalled();
+    expect(syncUserFromSteward).toHaveBeenCalled();
+    const cookies = response.headers.getSetCookie().join("\n");
+    expect(cookies).toContain("steward-token-staging=account-a-token");
+    expect(cookies).toContain("steward-authed-staging=1");
+    expect(cookies).not.toContain("-v2-staging");
+  });
+
+  test("rejects a legacy account login after v2 activation", async () => {
+    const response = await post(
+      { token: "late-account-a-token" },
+      STEWARD_CSRF_HEADER_VALUE,
+      "__Host-steward-authed-v2-staging=1; __Host-steward-token-v2-staging=account-b",
     );
 
     expect(response.status).toBe(409);
@@ -153,6 +185,105 @@ describe("POST /api/auth/steward-session phone convergence", () => {
     expect(response.headers.getSetCookie()).toEqual([]);
   });
 
+  test("allows the canonical marketing-to-API OIDC continuation with same-site metadata", async () => {
+    const response = await post(
+      { token: "oidc-session-token" },
+      STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+      undefined,
+      {
+        origin: "https://staging.eliza.app",
+        fetchSite: "same-site",
+        requestUrl: "https://api-staging.eliza.app/api/auth/steward-session",
+      },
+    );
+
+    expect(response.status).toBe(200);
+    const cookies = response.headers.getSetCookie().join("\n");
+    expect(cookies).toContain(
+      "__Host-steward-token-v2-staging=oidc-session-token",
+    );
+    expect(cookies).toContain("Path=/");
+    expect(cookies).toContain("Secure");
+    expect(cookies).not.toContain("Domain=");
+  });
+
+  test("uses an explicit non-prefixed cookie namespace only for local HTTP", async () => {
+    const app = new Hono();
+    app.route("/api/auth/steward-session", route);
+    const response = await app.fetch(
+      new Request("http://127.0.0.1:8787/api/auth/steward-session", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          origin: "http://127.0.0.1:8787",
+          "sec-fetch-site": "same-origin",
+          [STEWARD_CSRF_HEADER]: STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+        },
+        body: JSON.stringify({ token: "local-session-token" }),
+      }),
+      { ...ENV, ENVIRONMENT: "local", NODE_ENV: "development" },
+    );
+
+    expect(response.status).toBe(200);
+    const cookies = response.headers.getSetCookie().join("\n");
+    expect(cookies).toContain("steward-token-v2-local=local-session-token");
+    expect(cookies).toContain("steward-authed-v2-local=1");
+    expect(cookies).not.toContain("__Host-");
+    expect(cookies).toContain("Path=/");
+    expect(cookies).not.toContain("Secure");
+    expect(cookies).not.toContain("Domain=");
+  });
+
+  test("migrates a same-identity v1 refresh credential when activating v2", async () => {
+    const response = await post(
+      { token: "same-account-token" },
+      STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+      "steward-token-staging=older-same-account-token; steward-refresh-token-staging=opaque-v1-refresh; steward-authed-staging=1",
+    );
+
+    expect(response.status).toBe(200);
+    const cookies = response.headers.getSetCookie().join("\n");
+    expect(cookies).toContain(
+      "__Host-steward-refresh-token-v2-staging=opaque-v1-refresh",
+    );
+    expect(cookies).toContain("__Host-steward-authed-v2-staging=1");
+    expect(cookies).toContain("Secure");
+    expect(cookies).toContain("Path=/");
+    expect(cookies).not.toContain("Domain=");
+    expect(verifyStewardTokenCached).toHaveBeenCalledTimes(2);
+  });
+
+  test("does not carry a v1 refresh across an identity change", async () => {
+    verifyStewardTokenCached.mockImplementation(async (_env, token) => ({
+      userId: token === "new-account-token" ? "account-b" : "account-a",
+      tenantId: "elizacloud",
+      expiration: Math.floor(Date.now() / 1000) + 900,
+      issuedAt: Math.floor(Date.now() / 1000) - 10,
+    }));
+
+    const response = await post(
+      { token: "new-account-token" },
+      STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+      "steward-token-staging=old-account-token; steward-refresh-token-staging=account-a-refresh; steward-authed-staging=1",
+    );
+
+    expect(response.status).toBe(200);
+    const cookies = response.headers.getSetCookie().join("\n");
+    expect(cookies).toContain(
+      "__Host-steward-token-v2-staging=new-account-token",
+    );
+    expect(cookies).toContain("__Host-steward-authed-v2-staging=1");
+    expect(cookies).not.toContain("account-a-refresh");
+    expect(
+      response.headers
+        .getSetCookie()
+        .find((cookie) =>
+          cookie.startsWith("__Host-steward-refresh-token-v2-staging="),
+        ),
+    ).toMatch(/Max-Age=0; Path=\/; Secure/);
+    expect(cookies).not.toContain("Domain=");
+  });
+
   test("passes only the server-verified phone into the existing sync authority", async () => {
     const response = await post({
       token: "sms-session-token",
@@ -161,6 +292,12 @@ describe("POST /api/auth/steward-session phone convergence", () => {
     });
 
     expect(response.status).toBe(200);
+    const cookies = response.headers.getSetCookie().join("\n");
+    expect(cookies).toContain(
+      "__Host-steward-token-v2-staging=sms-session-token",
+    );
+    expect(cookies).toContain("__Host-steward-authed-v2-staging=1");
+    expect(cookies).not.toContain("steward-token-staging=sms-session-token");
     expect(verifyStewardBearerPhone).toHaveBeenCalledWith({
       env: ENV,
       bearerToken: "sms-session-token",

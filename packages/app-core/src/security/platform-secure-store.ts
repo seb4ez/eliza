@@ -16,6 +16,8 @@ export type SecureStoreSecretKind =
   | "session.steward_token"
   | "runtime.active_server"
   | "runtime.agent_profiles"
+  /** Host-only encrypted WAL for the cross-slot runtime connection commit. */
+  | "runtime.connection_txn"
   | "runtime.access_token"
   | "connector.telegram_personal_session"
   | "connector.telegram_personal_auth_state"

@@ -43,6 +43,20 @@ const emailCompleteSpies = vi.hoisted(() => ({
   unsubscribe: vi.fn(),
 }));
 
+function recoveredSession(token = "recovered-session-token") {
+  return { ok: true as const, token, isCurrent: () => true };
+}
+
+function jwtFor(userId: string, rotation = 1): string {
+  const payload = btoa(
+    JSON.stringify({ sub: userId, tenantId: "elizacloud", rotation }),
+  )
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+  return `header.${payload}.signature`;
+}
+
 vi.mock("./passkey-capability", () => ({
   resolveWebPasskeyCapability: () =>
     Promise.resolve({ usable: false, reason: "native-without-bridge" }),
@@ -173,9 +187,20 @@ describe("StewardLoginSection email magic-link companion code", () => {
       refreshToken: "refresh-token",
     });
     emailLoginSpies.poll.mockResolvedValue("pending");
-    sessionSpies.sync.mockResolvedValue(undefined);
+    sessionSpies.sync.mockImplementation(
+      async (
+        token: string,
+        _refreshToken?: string | null,
+        options?: {
+          finalizeBeforePublish?: () => (durableRestored: boolean) => void;
+        },
+      ) => {
+        window.localStorage.setItem("steward_session_token", token);
+        options?.finalizeBeforePublish?.();
+      },
+    );
     sessionSpies.recover.mockResolvedValue({ ok: true });
-    sessionSpies.recoverEmail.mockResolvedValue({ ok: true });
+    sessionSpies.recoverEmail.mockResolvedValue(recoveredSession());
     sessionSpies.hasAuthedCookie.mockReturnValue(false);
     emailCompleteSpies.listener = null;
     emailCompleteSpies.unsubscribe.mockReset();
@@ -211,7 +236,10 @@ describe("StewardLoginSection email magic-link companion code", () => {
       expect(sessionSpies.sync).toHaveBeenCalledWith(
         "session-token",
         "refresh-token",
-        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+        expect.objectContaining({
+          finalizeBeforePublish: expect.any(Function),
+          signal: expect.any(AbortSignal),
+        }),
       ),
     );
     expect(window.localStorage.getItem("eliza_sso_logged_out")).toBeNull();
@@ -347,6 +375,12 @@ describe("StewardLoginSection email magic-link companion code", () => {
   });
 
   it("keeps the server-selected account authoritative when BFCache aborts a dispatched session commit", async () => {
+    const attemptedToken = jwtFor("server-selected-account", 1);
+    const recoveredToken = jwtFor("server-selected-account", 2);
+    emailLoginSpies.verify.mockResolvedValue({
+      token: attemptedToken,
+      refreshToken: "refresh-token",
+    });
     let finishSessionSync: (() => void) | undefined;
     sessionSpies.sync.mockImplementation(
       () =>
@@ -356,7 +390,7 @@ describe("StewardLoginSection email magic-link companion code", () => {
     );
     sessionSpies.recover.mockResolvedValue({
       ok: true,
-      token: "server-selected-account-token",
+      token: recoveredToken,
     });
     renderSection();
     await startEmailLogin();
@@ -398,7 +432,7 @@ describe("StewardLoginSection email magic-link companion code", () => {
     ).toBe(false);
     await waitFor(() =>
       expect(window.localStorage.getItem("steward_session_token")).toBe(
-        "server-selected-account-token",
+        recoveredToken,
       ),
     );
 
@@ -443,11 +477,11 @@ describe("StewardLoginSection email magic-link companion code", () => {
   it("binds consumed-link recovery to the challenged email", async () => {
     emailLoginSpies.poll.mockResolvedValue("consumed");
     let finishRecovery:
-      | ((value: { ok: true; token?: string }) => void)
+      | ((value: ReturnType<typeof recoveredSession>) => void)
       | undefined;
     sessionSpies.recoverEmail.mockImplementation(
       () =>
-        new Promise<{ ok: true; token?: string }>((resolve) => {
+        new Promise<ReturnType<typeof recoveredSession>>((resolve) => {
           finishRecovery = resolve;
         }),
     );
@@ -465,7 +499,7 @@ describe("StewardLoginSection email magic-link companion code", () => {
     expect(screen.getByLabelText("Six-digit code")).toBeTruthy();
 
     await act(async () => {
-      finishRecovery?.({ ok: true, token: "must-not-publish-after-poll" });
+      finishRecovery?.(recoveredSession("must-not-publish-after-poll"));
     });
 
     expect(await screen.findByText("Signed in")).toBeTruthy();
@@ -484,10 +518,12 @@ describe("StewardLoginSection email magic-link companion code", () => {
 
   it("aborts an abandoned challenge's recovery and never hands it to a later email", async () => {
     emailLoginSpies.poll.mockResolvedValue("consumed");
-    const pendingRecoveries: Array<(value: { ok: true } | null) => void> = [];
+    const pendingRecoveries: Array<
+      (value: ReturnType<typeof recoveredSession> | null) => void
+    > = [];
     sessionSpies.recoverEmail.mockImplementation(
       () =>
-        new Promise<{ ok: true } | null>((resolve) => {
+        new Promise<ReturnType<typeof recoveredSession> | null>((resolve) => {
           pendingRecoveries.push(resolve);
         }),
     );
@@ -534,14 +570,14 @@ describe("StewardLoginSection email magic-link companion code", () => {
 
     // The abandoned email-A recovery resolving late must not sign email B in.
     await act(async () => {
-      pendingRecoveries[0]?.({ ok: true });
+      pendingRecoveries[0]?.(recoveredSession("account-a-token"));
     });
     expect(screen.queryByText("Signed in")).toBeNull();
     expect(screen.getByLabelText("Six-digit code")).toBeTruthy();
 
     // Only email B's own keyed recovery completes the waiting tab.
     await act(async () => {
-      pendingRecoveries[1]?.({ ok: true });
+      pendingRecoveries[1]?.(recoveredSession("account-b-token"));
     });
     expect(await screen.findByText("Signed in")).toBeTruthy();
   });
@@ -568,7 +604,7 @@ describe("StewardLoginSection email magic-link companion code", () => {
 
   it("falls back to /join for a hostile waiting-tab returnTo", async () => {
     emailLoginSpies.poll.mockResolvedValue("consumed");
-    sessionSpies.recoverEmail.mockResolvedValue({ ok: true });
+    sessionSpies.recoverEmail.mockResolvedValue(recoveredSession());
     renderSection("/login?returnTo=%2F%5C%5Cevil.example");
     await startEmailLogin();
 
@@ -578,6 +614,29 @@ describe("StewardLoginSection email magic-link companion code", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Continue" }));
 
     expect(screen.getByTestId("location-path").textContent).toBe("/join");
+  });
+
+  it("does not continue a waiting tab after its recovered authority expires", async () => {
+    emailLoginSpies.poll.mockResolvedValue("consumed");
+    let current = true;
+    sessionSpies.recoverEmail.mockResolvedValue({
+      ok: true,
+      token: "waiting-account-a",
+      isCurrent: () => current,
+    });
+    renderSection("/login?returnTo=%2Fget-started");
+    await startEmailLogin();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_000);
+    });
+    expect(await screen.findByText("Signed in")).toBeTruthy();
+
+    current = false;
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+
+    expect(screen.getByTestId("location-path").textContent).toBe("/login");
+    expect(screen.queryByText("Signed in")).toBeNull();
   });
 
   it("dismisses the live waiting form when the callback succeeds in another tab", async () => {
@@ -606,11 +665,11 @@ describe("StewardLoginSection email magic-link companion code", () => {
 
   it("keeps the waiting form live until advisory recovery is account-bound", async () => {
     let finishRecovery:
-      | ((value: { ok: true; token?: string }) => void)
+      | ((value: ReturnType<typeof recoveredSession>) => void)
       | undefined;
     sessionSpies.recoverEmail.mockImplementation(
       () =>
-        new Promise<{ ok: true; token?: string }>((resolve) => {
+        new Promise<ReturnType<typeof recoveredSession>>((resolve) => {
           finishRecovery = resolve;
         }),
     );
@@ -631,10 +690,7 @@ describe("StewardLoginSection email magic-link companion code", () => {
     expect(screen.getByLabelText("Six-digit code")).toBeTruthy();
 
     await act(async () => {
-      finishRecovery?.({
-        ok: true,
-        token: "must-not-publish-after-broadcast",
-      });
+      finishRecovery?.(recoveredSession("must-not-publish-after-broadcast"));
     });
 
     expect(await screen.findByText("Signed in")).toBeTruthy();

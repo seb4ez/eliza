@@ -32,6 +32,7 @@ import { scrubRejectedActiveServerCredentialDurably } from "../state/active-serv
 import { scrubPersistedAgentProfileTokens } from "../state/agent-profiles";
 import { loadPersistedActiveServer } from "../state/persistence";
 import { clearSharedCloudAccountBinding } from "../state/shared-cloud-account-binding";
+import type { RestoredConnectionAuthority } from "../state/startup-phase-restore";
 import { isManagedCloudSharedAgentBase } from "../utils/cloud-agent-base";
 
 export type AuthStatusState =
@@ -87,6 +88,7 @@ const authStatusSubscribers = new Set<(state: AuthStatusState) => void>();
 let authStatusSnapshot: AuthStatusState = { phase: "loading" };
 let authStatusFetch: Promise<void> | null = null;
 let authStatusPrime: Promise<void> | null = null;
+let authStatusPrimeAuthorityCurrent: (() => boolean) | null = null;
 let authStatusPrimeSettledAt = 0;
 let authStatusPrimeRetryAt = 0;
 let authStatusEpoch = 0;
@@ -107,8 +109,11 @@ function publishAuthStatus(state: AuthStatusState): void {
   }
 }
 
-async function authMeWithRejectedBearerRecovery() {
+async function authMeWithRejectedBearerRecovery(
+  validate: () => boolean = () => true,
+) {
   const result = await authMe();
+  if (!validate()) return result;
   if (result.ok || result.status !== 401 || result.access?.mode !== "remote") {
     return result;
   }
@@ -121,10 +126,12 @@ async function authMeWithRejectedBearerRecovery() {
   // target. Remove it before the one retry so a valid cookie can win, or the
   // server can return the unauthenticated pairing/password contract instead of
   // seeing the same rejected Authorization header twice.
+  if (!validate()) return result;
   setBootConfig({ ...getBootConfig(), apiToken: undefined });
   if (!(await scrubRejectedActiveServerCredentialDurably(apiToken))) {
     return result;
   }
+  if (!validate()) return result;
   return authMe();
 }
 
@@ -211,20 +218,39 @@ async function fetchAuthStatus(): Promise<void> {
  * up moments later. The hook's activation fetch re-probes with the full
  * 10×1s retry budget in that case, exactly as before priming existed.
  *
- * Fire-and-forget and single-shot: repeat calls, an in-flight real fetch, or
- * an already-resolved snapshot make it a no-op.
+ * Fire-and-forget and single-shot per exact runtime authority: repeat calls
+ * under the same live target, an in-flight real fetch, or an already-resolved
+ * snapshot are no-ops. A successor may detach a superseded prime immediately.
  */
-export function primeAuthStatusProbe(): void {
-  if (authStatusPrime || authStatusFetch) return;
+export function primeAuthStatusProbe(
+  authority?: Pick<RestoredConnectionAuthority, "isCurrent">,
+): void {
+  if (authStatusPrime) {
+    if (authStatusPrimeAuthorityCurrent?.() !== false) return;
+    // Target B may begin while A's native RPC is still unresolved. Detach the
+    // retired promise so B can prime immediately; A retains its own closure
+    // fence and cannot publish when it eventually settles.
+    authStatusPrime = null;
+    authStatusPrimeAuthorityCurrent = null;
+    authStatusPrimeSettledAt = 0;
+    authStatusPrimeRetryAt = 0;
+  }
+  if (authStatusFetch) return;
   if (authStatusSnapshot.phase !== "loading") return;
   const probeEpoch = authStatusEpoch;
-  authStatusPrime = (async () => {
-    const result = await authMeWithRejectedBearerRecovery();
-    if (probeEpoch !== authStatusEpoch) return;
+  const isPrimeCurrent = () =>
+    probeEpoch === authStatusEpoch && (authority?.isCurrent() ?? true);
+  if (!isPrimeCurrent()) return;
+  let ownedPrime: Promise<void>;
+  ownedPrime = (async () => {
+    if (!isPrimeCurrent()) return;
+    const result = await authMeWithRejectedBearerRecovery(isPrimeCurrent);
+    if (!isPrimeCurrent()) return;
     // A real fetch started (or a state was published) while the prime was in
     // flight — that path owns the snapshot; drop the primed result.
     if (authStatusFetch || authStatusSnapshot.phase !== "loading") return;
     if (result.ok === true) {
+      if (!isPrimeCurrent()) return;
       publishAuthStatus({
         phase: "authenticated",
         identity: result.identity,
@@ -235,10 +261,12 @@ export function primeAuthStatusProbe(): void {
     }
     if (result.status === 503) return;
     if (result.status === 429) {
+      if (!isPrimeCurrent()) return;
       authStatusPrimeRetryAt =
         Date.now() + rateLimitRetryMs(result.retryAfterMs);
       return;
     }
+    if (!isPrimeCurrent()) return;
     publishAuthStatus({
       phase: "unauthenticated",
       reason:
@@ -249,8 +277,21 @@ export function primeAuthStatusProbe(): void {
       access: result.access,
     });
   })().finally(() => {
+    if (authStatusPrime !== ownedPrime) return;
+    if (!isPrimeCurrent()) {
+      // A superseded prime owns no reusable cache metadata. Releasing its
+      // promise lets target B prime immediately without relying on a separate
+      // authStatusEpoch bump to invalidate A.
+      authStatusPrime = null;
+      authStatusPrimeAuthorityCurrent = null;
+      authStatusPrimeSettledAt = 0;
+      authStatusPrimeRetryAt = 0;
+      return;
+    }
     authStatusPrimeSettledAt = Date.now();
   });
+  authStatusPrimeAuthorityCurrent = isPrimeCurrent;
+  authStatusPrime = ownedPrime;
 }
 
 /**
@@ -366,6 +407,7 @@ export function __setAuthStatusForTests(state: AuthStatusState): () => void {
 export function __resetAuthStatusForTests(): void {
   authStatusFetch = null;
   authStatusPrime = null;
+  authStatusPrimeAuthorityCurrent = null;
   authStatusPrimeSettledAt = 0;
   authStatusPrimeRetryAt = 0;
   authStatusEpoch += 1;

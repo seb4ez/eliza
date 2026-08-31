@@ -41,6 +41,39 @@ describe("persistActiveServerCredential", () => {
     expect(getActiveProfile()?.accessToken).toBe("session-token");
   });
 
+  it("retains a composite active-server/profile compensator for recovery transactions", async () => {
+    savePersistedActiveServer(
+      createPersistedActiveServer({
+        kind: "cloud",
+        id: "cloud:test",
+        label: "Cloud Test",
+        apiBase: "https://runtime.example.test",
+        accessToken: "previous-token",
+      }),
+    );
+    // Materialize the migrated profile before the transactional update.
+    expect(getActiveProfile()?.accessToken).toBe("previous-token");
+    let compensate: (() => Promise<void>) | null = null;
+    const finalize = vi.fn(async () => true);
+
+    await persistActiveServerCredential("fresh-token", undefined, {
+      validate: () => true,
+      finalize,
+      captureCompensation: (rollback) => {
+        compensate = rollback;
+      },
+    });
+
+    expect(finalize).toHaveBeenCalledOnce();
+    expect(loadPersistedActiveServer()?.accessToken).toBe("fresh-token");
+    expect(getActiveProfile()?.accessToken).toBe("fresh-token");
+    const rollback = compensate as (() => Promise<void>) | null;
+    expect(rollback).toEqual(expect.any(Function));
+    await rollback?.();
+    expect(loadPersistedActiveServer()?.accessToken).toBe("previous-token");
+    expect(getActiveProfile()?.accessToken).toBe("previous-token");
+  });
+
   it("persists a directly booted remote target before pairing reloads", async () => {
     await persistActiveServerCredential(
       "paired-token",

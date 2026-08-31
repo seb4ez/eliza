@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import {
   canMutateLegacyStewardCookies,
   LEGACY_STEWARD_COOKIES,
+  STEWARD_V2_AUTHORITY_TOMBSTONE,
   stewardCookieNames,
 } from "@elizaos/cloud-shared/lib/auth/steward-cookies";
 import { PLAYWRIGHT_TEST_AUTH_SECRET } from "../src/fixtures/env";
@@ -12,13 +13,10 @@ import { expect, test } from "../src/helpers/test-fixtures";
  * Steward session + session-identity contract.
  *
  * Grounded on real source (auth/steward-session/route.ts):
- *   • POST runs the CSRF Origin/Referer check FIRST (checkOrigin), before token
- *     parsing — a request with no Origin and no Referer returns 403
- *     "forbidden_origin" (route.ts:143-156, 100-121). NOTE: the task brief said
- *     400 here, but the shipped route returns 403; this asserts the real code.
- *   • A permitted local origin (127.0.0.1 in non-production) passes the CSRF
- *     gate; with no token -> 400 "missing_token" (route.ts:166-169,
- *     isPermittedOrigin LOCAL_DEV_ORIGIN_HOSTS:54-58,87).
+ *   • POST checks exact Origin + Sec-Fetch-Site before token parsing; missing
+ *     browser metadata returns 403 `forbidden_origin`.
+ *   • A direct loopback origin in non-production passes only with matching
+ *     same-origin Fetch Metadata; with no token it returns 400 `missing_token`.
  *   • With a token but no STEWARD_JWT_SECRET / STEWARD_SESSION_SECRET configured
  *     (the e2e harness configures neither) the worker cannot verify and returns
  *     503 "server_secret_missing" (route.ts:171-183, steward-client.ts
@@ -87,6 +85,7 @@ test.describe("steward session", () => {
       headers: {
         "Content-Type": "application/json",
         Origin: stack.urls.api,
+        "Sec-Fetch-Site": "same-origin",
         "X-Eliza-CSRF": STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
       },
       body: JSON.stringify({}),
@@ -104,6 +103,7 @@ test.describe("steward session", () => {
       headers: {
         "Content-Type": "application/json",
         Origin: stack.urls.api,
+        "Sec-Fetch-Site": "same-origin",
         "X-Eliza-CSRF": STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
       },
       body: JSON.stringify({ token: "header.payload.signature" }),
@@ -125,6 +125,7 @@ test.describe("steward session", () => {
       // no JSON content type, so the custom header must be sent explicitly.
       headers: {
         Origin: stack.urls.api,
+        "Sec-Fetch-Site": "same-origin",
         "X-Eliza-CSRF": STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
       },
     });
@@ -142,7 +143,14 @@ test.describe("steward session", () => {
     const scoped = stewardCookieNames(WORKER_ENVIRONMENT);
     expect(cleared).toContain(scoped.token);
     expect(cleared).toContain(scoped.refreshToken);
-    expect(cleared).toContain(scoped.authed);
+    expect(cleared).not.toContain(scoped.authed);
+    expect(res.headers.getSetCookie()).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining(
+          `${scoped.authed}=${STEWARD_V2_AUTHORITY_TOMBSTONE}`,
+        ),
+      ]),
+    );
 
     // #13728: every elizacloud.ai environment shares the parent cookie domain,
     // so a non-production worker clearing the historical UNSUFFIXED names would

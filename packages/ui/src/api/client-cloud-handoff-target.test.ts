@@ -5,7 +5,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@capacitor/core", () => ({
-  Capacitor: { isNativePlatform: () => false },
+  Capacitor: {
+    isNativePlatform: () => false,
+    registerPlugin: vi.fn(() => ({})),
+  },
   CapacitorHttp: { get: vi.fn(), post: vi.fn(), request: vi.fn() },
 }));
 
@@ -55,6 +58,17 @@ function fakeClient(detailById: Record<string, CloudCompatAgent>) {
   const client = Object.create(ElizaClient.prototype) as ElizaClient;
   Object.assign(client, { getCloudCompatAgent });
   return { client, getCloudCompatAgent };
+}
+
+function exactDedicatedAgentDetail(url: string) {
+  if (!url.endsWith("/api/v1/eliza/agents/dedicated-1")) return null;
+  return {
+    status: 200,
+    json: async () => ({
+      success: true,
+      data: { ...runningDedicated(), id: "dedicated-1" },
+    }),
+  };
 }
 
 const SHARED_BASE = "https://elizacloud.ai/api/v1/eliza/agents/shared-1/api";
@@ -147,6 +161,44 @@ describe("startCloudAgentHandoff — dedicated migration target", () => {
 
     expect(getCloudCompatAgent).not.toHaveBeenCalled();
   });
+
+  it("does not borrow account B for a compatibility read after account A is superseded", async () => {
+    const { client, getCloudCompatAgent } = fakeClient({});
+    let authorityCurrent = true;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => ({
+      status: 503,
+      json: async () => {
+        if (String(input).includes("/api/v1/eliza/agents/dedicated-1")) {
+          authorityCurrent = false;
+        }
+        return { success: false };
+      },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      client.startCloudAgentHandoff({
+        agentId: "shared-1",
+        sharedApiBase: SHARED_BASE,
+        conversationId: "shared-1",
+        dedicatedAgentId: "dedicated-1",
+        cloudApiBase: "https://www.elizacloud.ai",
+        authToken: "account-a-token",
+        onSwitch: vi.fn(),
+        validateAuthority: () => authorityCurrent,
+        intervalMs: 1,
+        timeoutMs: 200,
+        log: () => {},
+      }),
+    ).rejects.toMatchObject({ code: "CLOUD_HANDOFF_AUTHORITY_SUPERSEDED" });
+
+    expect(getCloudCompatAgent).not.toHaveBeenCalled();
+    expect(
+      fetchMock.mock.calls.some(([input]) =>
+        String(input).includes("/api/cloud/compat/agents/"),
+      ),
+    ).toBe(false);
+  });
 });
 
 describe("startCloudAgentHandoff — proxy-readiness gate (#15901)", () => {
@@ -163,6 +215,8 @@ describe("startCloudAgentHandoff — proxy-readiness gate (#15901)", () => {
     let healthProbes = 0;
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
+      const detail = exactDedicatedAgentDetail(url);
+      if (detail) return detail;
       if (url.endsWith("/api/health")) {
         healthProbes += 1;
         return {
@@ -207,6 +261,8 @@ describe("startCloudAgentHandoff — proxy-readiness gate (#15901)", () => {
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
         const url = String(input);
+        const detail = exactDedicatedAgentDetail(url);
+        if (detail) return detail;
         if (url.endsWith("/api/health")) {
           return { status: 401, json: async () => ({}) };
         }
@@ -240,6 +296,8 @@ describe("startCloudAgentHandoff — proxy-readiness gate (#15901)", () => {
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
         const url = String(input);
+        const detail = exactDedicatedAgentDetail(url);
+        if (detail) return detail;
         if (url.endsWith("/api/health")) {
           healthProbes += 1;
           if (healthProbes < 2) throw new TypeError("Failed to fetch");
@@ -275,6 +333,8 @@ describe("startCloudAgentHandoff — proxy-readiness gate (#15901)", () => {
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
         const url = String(input);
+        const detail = exactDedicatedAgentDetail(url);
+        if (detail) return detail;
         if (url.endsWith("/api/health")) {
           return { status: 404, json: async () => ({}) };
         }

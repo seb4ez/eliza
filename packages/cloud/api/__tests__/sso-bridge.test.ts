@@ -92,8 +92,9 @@ async function mintToken(
   // verifier caps exp-iat, so the clock shift may not inflate the TTL.
   const ttl = opts.expOffsetSec ?? 3600;
   const realNow = Date.now();
+  const ownsShiftedClock = iatOffset !== 0;
   try {
-    if (iatOffset !== 0) setSystemTime(new Date(realNow + iatOffset * 1000));
+    if (ownsShiftedClock) setSystemTime(new Date(realNow + iatOffset * 1000));
     const minted = await mintStewardTokenFromClaims(
       ENV,
       { userId, expiration: 0, issuedAt: 0 },
@@ -102,7 +103,10 @@ async function mintToken(
     if (!minted) throw new Error("test token mint failed");
     return minted.token;
   } finally {
-    setSystemTime();
+    // Preserve a caller-owned fake clock when no local iat shift was asked
+    // for. This lets logout-ordering tests advance both issuance and
+    // verification together, as a real post-logout login would.
+    if (ownsShiftedClock) setSystemTime();
   }
 }
 
@@ -467,14 +471,23 @@ describe("cache independence — the guarantees may not depend on atomic cache o
         "session_ended",
       );
 
-      const postLogout = await mintToken(userId, { iatOffsetSec: 5 });
-      const pair2 = await makeVerifierPair();
-      const code2 = await mintCode(postLogout, pair2.challenge);
-      const ok = await exchange(code2, pair2.verifier);
-      await expectUsableToken(ok, userId);
+      // Advance the verifier with the issuer: a token exactly five seconds
+      // ahead remains indistinguishable from a pre-logout token minted by a
+      // fast clock, so the first unambiguous fresh login is at +6s.
+      const postLogoutNow = Date.now();
+      try {
+        setSystemTime(new Date(postLogoutNow + 6_000));
+        const postLogout = await mintToken(userId);
+        const pair2 = await makeVerifierPair();
+        const code2 = await mintCode(postLogout, pair2.challenge);
+        const ok = await exchange(code2, pair2.verifier);
+        await expectUsableToken(ok, userId);
 
-      const replay = await exchange(code2, pair2.verifier);
-      expect(replay.status).toBe(401);
+        const replay = await exchange(code2, pair2.verifier);
+        expect(replay.status).toBe(401);
+      } finally {
+        setSystemTime();
+      }
     } finally {
       for (const [name, fn] of saved) {
         cacheRecord[name] = fn;
@@ -484,6 +497,46 @@ describe("cache independence — the guarantees may not depend on atomic cache o
 });
 
 describe("logout stays logged out (cross-host)", () => {
+  test("keeps both fast pre-logout and genuinely fresh +1s tokens blocked with a cooldown", async () => {
+    const userId = "user-logout-cooldown";
+    const fastPreLogoutToken = await mintToken(userId, { iatOffsetSec: 5 });
+    await markSsoBridgeLogout(userId);
+
+    const firstPair = await makeVerifierPair();
+    const fastResponse = await call("/mint", {
+      origin: "https://eliza.app",
+      bearer: fastPreLogoutToken,
+      body: { codeChallenge: firstPair.challenge },
+    });
+    expect(fastResponse.status).toBe(409);
+    const fastBody = (await fastResponse.json()) as {
+      code: string;
+      retryAfterSeconds: number;
+    };
+    expect(fastBody.code).toBe("logout_cooldown");
+    expect(fastResponse.headers.get("retry-after")).toBe(
+      String(fastBody.retryAfterSeconds),
+    );
+
+    const postLogoutNow = Date.now();
+    try {
+      setSystemTime(new Date(postLogoutNow + 1_000));
+      const freshInsideWindow = await mintToken(userId);
+      const secondPair = await makeVerifierPair();
+      const freshResponse = await call("/mint", {
+        origin: "https://eliza.app",
+        bearer: freshInsideWindow,
+        body: { codeChallenge: secondPair.challenge },
+      });
+      expect(freshResponse.status).toBe(409);
+      await expect(freshResponse.json()).resolves.toMatchObject({
+        code: "logout_cooldown",
+      });
+    } finally {
+      setSystemTime();
+    }
+  });
+
   test("after an explicit logout, pre-logout tokens can neither mint nor exchange; a fresh login bridges again", async () => {
     const userId = "user-logout";
     const preLogoutToken = await mintToken(userId, { iatOffsetSec: -10 });
@@ -514,11 +567,49 @@ describe("logout stays logged out (cross-host)", () => {
 
     // A NEW login (token issued after the marker) is a fresh consent: the
     // bridge works again without waiting for the marker to age out.
-    const postLogoutToken = await mintToken(userId, { iatOffsetSec: 5 });
-    const pair2 = await makeVerifierPair();
-    const newCode = await mintCode(postLogoutToken, pair2.challenge);
-    const fresh = await exchange(newCode, pair2.verifier);
-    await expectUsableToken(fresh, userId);
+    const postLogoutNow = Date.now();
+    try {
+      setSystemTime(new Date(postLogoutNow + 6_000));
+      const postLogoutToken = await mintToken(userId);
+      const pair2 = await makeVerifierPair();
+      const newCode = await mintCode(postLogoutToken, pair2.challenge);
+      const fresh = await exchange(newCode, pair2.verifier);
+      await expectUsableToken(fresh, userId);
+    } finally {
+      setSystemTime();
+    }
+  });
+
+  test("a logout committed after exchange admission but before re-mint response wins", async () => {
+    const userId = "user-exchange-final-gate";
+    const preLogoutToken = await mintToken(userId, { iatOffsetSec: -10 });
+    const { verifier, challenge } = await makeVerifierPair();
+    const code = await mintCode(preLogoutToken, challenge);
+    const { ssoBridgeRepository } = await import(
+      "@/db/repositories/sso-bridge"
+    );
+    const originalRead =
+      ssoBridgeRepository.getLogoutMarkerForWrite.bind(ssoBridgeRepository);
+    let exchangeMarkerReads = 0;
+    ssoBridgeRepository.getLogoutMarkerForWrite = async (stewardUserId) => {
+      const marker = await originalRead(stewardUserId);
+      exchangeMarkerReads += 1;
+      if (exchangeMarkerReads === 1) {
+        await markSsoBridgeLogout(stewardUserId);
+      }
+      return marker;
+    };
+
+    try {
+      const response = await exchange(code, verifier);
+      expect(response.status).toBe(401);
+      expect(((await response.json()) as { code: string }).code).toBe(
+        "session_ended",
+      );
+      expect(exchangeMarkerReads).toBe(2);
+    } finally {
+      ssoBridgeRepository.getLogoutMarkerForWrite = originalRead;
+    }
   });
 });
 

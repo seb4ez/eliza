@@ -7,6 +7,9 @@
  * without one tab erasing the other's newer ambiguity proof.
  */
 
+import { readStoredStewardToken } from "@elizaos/shared/steward-session-client";
+import { decodeJwtPayload } from "./jwt";
+
 export const STEWARD_SESSION_RECOVERY_CHANGE_EVENT =
   "eliza-steward-session-recovery-change";
 
@@ -15,7 +18,13 @@ const LOGOUT_KEY_PREFIX = "eliza.steward.server-session-logout.v1";
 const GENERATION_KEY_PREFIX = "eliza.steward.server-session-generation.v1";
 
 export type StewardSessionRecoveryKind = "oauth" | "provider" | "telegram";
+export type StewardSessionRecoveryPhase = "reserved" | "cookie_pending";
 export type StewardSessionLogoutKind = "logout" | "account-switch";
+
+export interface StewardSessionRecoveryIdentity {
+  userId: string;
+  tenantId: string;
+}
 
 export interface StewardSessionRecoverySnapshot {
   tenantId: string;
@@ -26,6 +35,12 @@ export interface StewardSessionRecoverySnapshot {
    */
   generation: string | null;
   hasOAuth: boolean;
+  /** Durable phase of the generation receipt, or null after it retired. */
+  currentReceiptPhase?: StewardSessionRecoveryPhase | null;
+  /** Kind of the generation receipt; Telegram uses distinct reconciliation. */
+  currentReceiptKind?: StewardSessionRecoveryKind | null;
+  /** Stable account binding required before cookie recovery may publish. */
+  expectedIdentity?: StewardSessionRecoveryIdentity | null;
   /** False means absence cannot be proven and every passive writer must stop. */
   storageAvailable: boolean;
 }
@@ -53,6 +68,32 @@ export interface StewardSessionLogoutSnapshot {
   tenantId: string;
   intents: readonly StewardSessionLogoutIntent[];
   storageAvailable: boolean;
+}
+
+export type StewardSessionRecoveryPublicationRollback = ((
+  durableRestored: boolean,
+) => void) & {
+  beforeDurableRestore?: () => void;
+};
+
+export interface StewardSessionRecoveryPublicationFence {
+  /** Revalidate the exact receipt/snapshot on both sides of durable awaits. */
+  validate(): boolean;
+  /** True only after the owned markers were transactionally retired. */
+  isFinalized(): boolean;
+  /**
+   * Retire owned markers without emitting a same-document recovery event.
+   * The returned rollback restores their exact raw values if token publication
+   * is compensated.
+   */
+  finalizeBeforePublish(): StewardSessionRecoveryPublicationRollback;
+  /** Wake same-document recovery consumers only after token authority exists. */
+  publishChange(): boolean;
+}
+
+export interface StewardSessionRecoveryCommittedAuthority {
+  /** Revalidate immediately before each external success side effect. */
+  isCurrent(): boolean;
 }
 
 export class StewardSessionRecoveryStorageError extends Error {
@@ -124,9 +165,41 @@ function persistGeneration(
   }
 }
 
-function parseMarkerKind(value: string | null): StewardSessionRecoveryKind {
+interface StewardSessionRecoveryMarker {
+  kind: StewardSessionRecoveryKind;
+  phase: StewardSessionRecoveryPhase;
+  expectedIdentity: StewardSessionRecoveryIdentity | null;
+}
+
+function isRecoveryKind(value: unknown): value is StewardSessionRecoveryKind {
+  return value === "oauth" || value === "provider" || value === "telegram";
+}
+
+function parseExpectedIdentity(
+  value: unknown,
+): StewardSessionRecoveryIdentity | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const userId = (value as { userId?: unknown }).userId;
+  const tenantId = (value as { tenantId?: unknown }).tenantId;
+  if (
+    typeof userId !== "string" ||
+    userId.trim().length === 0 ||
+    typeof tenantId !== "string" ||
+    tenantId.trim().length === 0
+  ) {
+    return null;
+  }
+  return { userId: userId.trim(), tenantId: tenantId.trim() };
+}
+
+function parseMarker(value: string | null): StewardSessionRecoveryMarker {
   if (value === "oauth" || value === "provider" || value === "telegram") {
-    return value;
+    // A legacy marker cannot prove either dispatch or account binding. Keep it
+    // as a durable block-only reservation; it may never authorize recovered
+    // token publication after upgrade.
+    return { kind: value, phase: "reserved", expectedIdentity: null };
   }
   try {
     const parsed: unknown = value === null ? null : JSON.parse(value);
@@ -135,13 +208,16 @@ function parseMarkerKind(value: string | null): StewardSessionRecoveryKind {
       typeof parsed === "object" &&
       !Array.isArray(parsed)
     ) {
-      const parsedKind = (parsed as { kind?: unknown }).kind;
-      if (
-        parsedKind === "oauth" ||
-        parsedKind === "provider" ||
-        parsedKind === "telegram"
-      ) {
-        return parsedKind;
+      const record = parsed as Record<string, unknown>;
+      if (isRecoveryKind(record.kind)) {
+        return {
+          kind: record.kind,
+          // A pre-phase/partial JSON marker cannot prove dispatch. Keep it as a
+          // durable block-only reservation rather than probing a stale cookie.
+          phase:
+            record.phase === "cookie_pending" ? "cookie_pending" : "reserved",
+          expectedIdentity: parseExpectedIdentity(record.expectedIdentity),
+        };
       }
     }
   } catch (error) {
@@ -149,15 +225,19 @@ function parseMarkerKind(value: string | null): StewardSessionRecoveryKind {
     // mutation. Conservatively recover it as a non-OAuth provider intent.
     void error;
   }
-  return "provider";
+  return {
+    kind: "provider",
+    phase: "reserved",
+    expectedIdentity: null,
+  };
 }
 
 function readMarkers(tenantId: string): {
-  markers: Map<string, StewardSessionRecoveryKind>;
+  markers: Map<string, StewardSessionRecoveryMarker>;
   storageAvailable: boolean;
 } {
   const prefix = tenantKeyPrefix(tenantId);
-  const markers = new Map<string, StewardSessionRecoveryKind>();
+  const markers = new Map<string, StewardSessionRecoveryMarker>();
   if (typeof window === "undefined") {
     return { markers, storageAvailable: false };
   }
@@ -167,7 +247,7 @@ function readMarkers(tenantId: string): {
       if (!key?.startsWith(prefix)) continue;
       const receipt = key.slice(prefix.length);
       if (!receipt) continue;
-      markers.set(receipt, parseMarkerKind(window.localStorage.getItem(key)));
+      markers.set(receipt, parseMarker(window.localStorage.getItem(key)));
     }
   } catch (error) {
     // error-policy:J6 Absence cannot be established when enumeration fails.
@@ -295,7 +375,12 @@ function persistMarker(
   try {
     window.localStorage.setItem(
       key,
-      JSON.stringify({ kind, createdAt: Date.now() }),
+      JSON.stringify({
+        kind,
+        phase: "reserved",
+        expectedIdentity: null,
+        createdAt: Date.now(),
+      }),
     );
   } catch (error) {
     void error;
@@ -321,17 +406,131 @@ function removeReceipts(tenantId: string, receipts: readonly string[]): void {
   notifyRecoveryChange();
 }
 
+interface RawRecoveryMarker {
+  key: string;
+  raw: string;
+}
+
+function restoreRawRecoveryMarkers(
+  markers: readonly RawRecoveryMarker[],
+): void {
+  if (typeof window === "undefined") {
+    throw new StewardSessionRecoveryStorageError();
+  }
+  const failures: unknown[] = [];
+  for (const marker of markers) {
+    try {
+      const current = window.localStorage.getItem(marker.key);
+      if (current === null) {
+        window.localStorage.setItem(marker.key, marker.raw);
+        if (window.localStorage.getItem(marker.key) !== marker.raw) {
+          failures.push(
+            new Error(`Recovery marker ${marker.key} was not restored.`),
+          );
+        }
+      } else if (current !== marker.raw) {
+        failures.push(
+          new Error(`Recovery marker ${marker.key} changed before rollback.`),
+        );
+      }
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (failures.length > 0) {
+    throw new StewardSessionRecoveryStorageError(
+      "Secure sign-in recovery markers could not be restored after token publication failed.",
+    );
+  }
+}
+
+/**
+ * Remove marker values as a rollbackable part of token publication. Unlike
+ * ordinary completion, this deliberately does not emit the recovery event:
+ * that event would let a same-document listener reenter before the token's
+ * own authority event has linearized.
+ */
+function removeReceiptsForPublication(
+  tenantId: string,
+  receipts: readonly string[],
+  generation: string | null,
+): StewardSessionRecoveryPublicationRollback {
+  if (typeof window === "undefined") {
+    throw new StewardSessionRecoveryStorageError();
+  }
+  const markers: RawRecoveryMarker[] = [];
+  const ownedReceipts = new Set(receipts);
+  const restoreIfStillOwned = () => {
+    const currentGeneration = readGeneration(tenantId);
+    if (
+      currentGeneration.storageAvailable &&
+      currentGeneration.generation !== generation
+    ) {
+      // A successor which started while these markers were silently absent
+      // does not own them in its ancestry. Reintroducing them would poison B's
+      // otherwise-live publication fence, so superseding state wins.
+      return;
+    }
+    const currentMarkers = readMarkers(tenantId);
+    if (
+      currentMarkers.storageAvailable &&
+      [...currentMarkers.markers.keys()].some(
+        (receipt) => !ownedReceipts.has(receipt),
+      )
+    ) {
+      return;
+    }
+    // An unreadable generation/marker enumeration is not proof of a successor.
+    // Restore A fail-closed; if storage is still unavailable the write throws
+    // into shared compensation rather than silently losing ambiguity proof.
+    restoreRawRecoveryMarkers(markers);
+  };
+  try {
+    for (const receipt of new Set(receipts)) {
+      const key = markerKey(tenantId, receipt);
+      const raw = window.localStorage.getItem(key);
+      if (raw !== null) markers.push({ key, raw });
+    }
+    for (const marker of markers) {
+      window.localStorage.removeItem(marker.key);
+      if (window.localStorage.getItem(marker.key) !== null) {
+        throw new Error(`Recovery marker ${marker.key} was not removed.`);
+      }
+    }
+  } catch (error) {
+    try {
+      restoreIfStillOwned();
+    } catch {
+      throw new StewardSessionRecoveryStorageError(
+        "Secure sign-in recovery removal and rollback both failed.",
+      );
+    }
+    void error;
+    throw new StewardSessionRecoveryStorageError(
+      "Secure sign-in recovery markers could not be retired before token publication.",
+    );
+  }
+
+  return restoreIfStillOwned;
+}
+
 export function readStewardSessionRecovery(
   tenantId: string,
 ): StewardSessionRecoverySnapshot {
   const { markers, storageAvailable } = readMarkers(tenantId);
   const logout = readLogoutMarkers(tenantId);
   const generation = readGeneration(tenantId);
+  const currentMarker = generation.generation
+    ? markers.get(generation.generation)
+    : undefined;
   return {
     tenantId,
     receipts: [...markers.keys()].sort(),
     generation: generation.generation,
-    hasOAuth: [...markers.values()].includes("oauth"),
+    hasOAuth: [...markers.values()].some(({ kind }) => kind === "oauth"),
+    currentReceiptPhase: currentMarker?.phase ?? null,
+    currentReceiptKind: currentMarker?.kind ?? null,
+    expectedIdentity: currentMarker?.expectedIdentity ?? null,
     // A logout intent is intentionally not a login-recovery receipt. Reporting
     // the snapshot unavailable makes legacy cookie-first recovery stop before
     // it can replay a bearer while the logout is awaiting/replaying its lock.
@@ -381,6 +580,46 @@ export function isStewardSessionRecoveryReceiptLive(
   );
 }
 
+/**
+ * Revalidate a fully published receipt after an await/microtask boundary.
+ * Synchronous recovery listeners may queue login B after A's final in-callback
+ * check; no caller may trust a boolean success across that boundary without
+ * proving A's generation, empty receipt set, and exact canonical token again.
+ */
+export function isStewardSessionRecoveryPublicationAuthorityCurrent(
+  recovery: Pick<StewardSessionRecoveryReceipt, "tenantId" | "receipt">,
+  expectedToken: string,
+  readToken: () => string | null = readStoredStewardToken,
+): boolean {
+  const current = readStewardSessionRecovery(recovery.tenantId);
+  try {
+    return (
+      current.storageAvailable &&
+      current.generation === recovery.receipt &&
+      current.receipts.length === 0 &&
+      readToken() === expectedToken
+    );
+  } catch (error) {
+    void error;
+    return false;
+  }
+}
+
+export function createStewardSessionRecoveryCommittedAuthority(
+  recovery: Pick<StewardSessionRecoveryReceipt, "tenantId" | "receipt">,
+  expectedToken: string,
+  readToken?: () => string | null,
+): StewardSessionRecoveryCommittedAuthority {
+  return {
+    isCurrent: () =>
+      isStewardSessionRecoveryPublicationAuthorityCurrent(
+        recovery,
+        expectedToken,
+        readToken,
+      ),
+  };
+}
+
 export function isStewardSessionRecoverySnapshotLive(
   expected: StewardSessionRecoverySnapshot,
 ): boolean {
@@ -389,6 +628,14 @@ export function isStewardSessionRecoverySnapshotLive(
     expected.storageAvailable &&
     current.storageAvailable &&
     current.generation === expected.generation &&
+    (current.currentReceiptPhase ?? null) ===
+      (expected.currentReceiptPhase ?? null) &&
+    (current.currentReceiptKind ?? null) ===
+      (expected.currentReceiptKind ?? null) &&
+    recoveryIdentitiesEqual(
+      current.expectedIdentity ?? null,
+      expected.expectedIdentity ?? null,
+    ) &&
     current.receipts.length === expected.receipts.length &&
     expected.receipts.every(
       (receipt, index) => current.receipts[index] === receipt,
@@ -396,7 +643,60 @@ export function isStewardSessionRecoverySnapshotLive(
   );
 }
 
-/** Persist synchronously and call this immediately before network dispatch. */
+function recoveryIdentityFromToken(
+  token: string,
+  tenantId: string,
+): StewardSessionRecoveryIdentity | null {
+  const claims = decodeJwtPayload(token) as
+    | (ReturnType<typeof decodeJwtPayload> & {
+        tenantId?: unknown;
+        tenant_id?: unknown;
+      })
+    | null;
+  const rawUserId = claims?.userId ?? claims?.sub;
+  if (typeof rawUserId !== "string" || rawUserId.trim().length === 0) {
+    return null;
+  }
+  const rawTenantId =
+    typeof claims?.tenantId === "string"
+      ? claims.tenantId
+      : typeof claims?.tenant_id === "string"
+        ? claims.tenant_id
+        : tenantId;
+  if (rawTenantId.trim().length === 0) return null;
+  return { userId: rawUserId.trim(), tenantId: rawTenantId.trim() };
+}
+
+function recoveryIdentitiesEqual(
+  left: StewardSessionRecoveryIdentity | null,
+  right: StewardSessionRecoveryIdentity | null,
+): boolean {
+  return (
+    left === right ||
+    (left !== null &&
+      right !== null &&
+      left.userId === right.userId &&
+      left.tenantId === right.tenantId)
+  );
+}
+
+/** Whether a refresh result is the exact account armed for cookie recovery. */
+export function doesStewardSessionRecoverySnapshotMatchToken(
+  snapshot: StewardSessionRecoverySnapshot,
+  token: string,
+): boolean {
+  return (
+    snapshot.currentReceiptPhase === "cookie_pending" &&
+    snapshot.currentReceiptKind !== "telegram" &&
+    snapshot.expectedIdentity != null &&
+    recoveryIdentitiesEqual(
+      snapshot.expectedIdentity,
+      recoveryIdentityFromToken(token, snapshot.tenantId),
+    )
+  );
+}
+
+/** Reserve authority before any provider prompt or one-time credential consume. */
 export function beginStewardSessionRecovery(
   tenantId: string,
   kind: StewardSessionRecoveryKind,
@@ -429,6 +729,84 @@ export function beginStewardSessionRecovery(
     kind,
     preexistingReceipts: before.receipts,
   };
+}
+
+/**
+ * Durably arm cookie-first recovery immediately before the actual cookie POST.
+ * The stable user+tenant binding survives access-token rotation while ensuring
+ * a stale preexisting cookie can never be published as the attempted account.
+ */
+export function markStewardSessionRecoveryCookiePending(
+  recovery: StewardSessionRecoveryReceipt,
+  expectedToken?: string | null,
+): void {
+  if (!isStewardSessionRecoveryReceiptLive(recovery)) {
+    throw new StewardSessionRecoveryStorageError(
+      "Sign-in recovery was superseded before cookie mutation dispatch.",
+    );
+  }
+  if (typeof window === "undefined") {
+    throw new StewardSessionRecoveryStorageError();
+  }
+  const key = markerKey(recovery.tenantId, recovery.receipt);
+  let previousRaw: string | null = null;
+  let pendingRaw: string | null = null;
+  const restoreReservation = (): boolean => {
+    if (previousRaw === null || pendingRaw === null) return false;
+    try {
+      // Never overwrite a concurrent change to this exact marker. A later
+      // generation uses a distinct key, while an exact-marker change owns the
+      // right to remain fail-closed.
+      if (window.localStorage.getItem(key) !== pendingRaw) return false;
+      window.localStorage.setItem(key, previousRaw);
+      return window.localStorage.getItem(key) === previousRaw;
+    } catch (rollbackError) {
+      void rollbackError;
+      return false;
+    }
+  };
+  try {
+    previousRaw = window.localStorage.getItem(key);
+    if (previousRaw === null) {
+      throw new Error("Recovery reservation is missing.");
+    }
+    const current = parseMarker(previousRaw);
+    const requestedIdentity = expectedToken
+      ? recoveryIdentityFromToken(expectedToken, recovery.tenantId)
+      : null;
+    if (
+      current.expectedIdentity !== null &&
+      requestedIdentity !== null &&
+      !recoveryIdentitiesEqual(current.expectedIdentity, requestedIdentity)
+    ) {
+      throw new Error("Recovery identity binding cannot be replaced.");
+    }
+    pendingRaw = JSON.stringify({
+      kind: current.kind,
+      phase: "cookie_pending",
+      // OAuth must arm before its nonce response reveals B, then strengthens
+      // the same exact marker after the response. Never weaken an existing
+      // binding on an idempotent/unbound repeat.
+      expectedIdentity: requestedIdentity ?? current.expectedIdentity,
+      createdAt: Date.now(),
+    });
+    window.localStorage.setItem(key, pendingRaw);
+    if (window.localStorage.getItem(key) !== pendingRaw) {
+      throw new Error("Recovery dispatch phase was not persisted.");
+    }
+  } catch (error) {
+    restoreReservation();
+    void error;
+    throw new StewardSessionRecoveryStorageError(
+      "Sign-in cannot continue because cookie recovery authority could not be persisted.",
+    );
+  }
+  if (!isStewardSessionRecoveryReceiptLive(recovery)) {
+    restoreReservation();
+    throw new StewardSessionRecoveryStorageError(
+      "Sign-in recovery was superseded during cookie mutation dispatch.",
+    );
+  }
 }
 
 /**
@@ -588,25 +966,105 @@ export function completeStewardSessionRecovery(
   ]);
 }
 
+function createRecoveryPublicationFence(options: {
+  tenantId: string;
+  receipts: readonly string[];
+  generation: string | null;
+  isLive(): boolean;
+}): StewardSessionRecoveryPublicationFence {
+  let finalized = false;
+  let rollbackMarkers: StewardSessionRecoveryPublicationRollback | null = null;
+  const finalizedStateIsLive = () => {
+    const current = readStewardSessionRecovery(options.tenantId);
+    return (
+      current.storageAvailable &&
+      current.generation === options.generation &&
+      // A successor can persist its marker before its generation write becomes
+      // observable in this tab. Requiring an actually empty marker set closes
+      // that cross-document gap instead of accepting the still-old generation.
+      current.receipts.length === 0
+    );
+  };
+  const validate = () =>
+    finalized ? finalizedStateIsLive() : options.isLive();
+
+  return {
+    validate,
+    isFinalized: () => finalized && finalizedStateIsLive(),
+    finalizeBeforePublish: () => {
+      if (finalized || !options.isLive()) {
+        throw new StewardSessionRecoveryStorageError(
+          "Sign-in recovery was superseded before token publication.",
+        );
+      }
+      const rollback = removeReceiptsForPublication(
+        options.tenantId,
+        options.receipts,
+        options.generation,
+      );
+      if (!finalizedStateIsLive()) {
+        try {
+          rollback(false);
+        } catch (error) {
+          void error;
+          throw new StewardSessionRecoveryStorageError(
+            "Sign-in recovery changed and its removed markers could not be restored.",
+          );
+        }
+        throw new StewardSessionRecoveryStorageError(
+          "Sign-in recovery was superseded during token publication.",
+        );
+      }
+      finalized = true;
+      rollbackMarkers = rollback;
+      const restoreMarkers = () => {
+        const activeRollback = rollbackMarkers;
+        if (!activeRollback) return;
+        activeRollback(false);
+        rollbackMarkers = null;
+        finalized = false;
+      };
+      const rollbackPublication = ((_durableRestored: boolean) => {
+        restoreMarkers();
+      }) as StewardSessionRecoveryPublicationRollback;
+      rollbackPublication.beforeDurableRestore = restoreMarkers;
+      return rollbackPublication;
+    },
+    publishChange: () => {
+      if (!finalized || !finalizedStateIsLive()) return false;
+      notifyRecoveryChange();
+      return finalizedStateIsLive();
+    },
+  };
+}
+
 /**
- * Commit one live receipt immediately before publishing authenticated state.
- * The boolean is the publication fence: it proves every owned marker is gone
- * and no newer generation began before the post-removal read. A failed
- * localStorage removal or concurrent successor therefore keeps publication
- * fail-closed instead of being hidden behind the best-effort cleanup API.
+ * Build a rollbackable fence for one live login receipt. The finalizer removes
+ * the receipt silently inside `writeStoredStewardToken`; `publishChange` is
+ * intentionally separate so callers can first verify the returned token-write
+ * authority and exact canonical token.
  */
-export function commitStewardSessionRecoveryForPublication(
+export function createStewardSessionRecoveryPublicationFence(
   recovery: StewardSessionRecoveryReceipt,
-): boolean {
-  if (!isStewardSessionRecoveryReceiptLive(recovery)) return false;
-  const ownedReceipts = [recovery.receipt, ...recovery.preexistingReceipts];
-  removeReceipts(recovery.tenantId, ownedReceipts);
-  const current = readStewardSessionRecovery(recovery.tenantId);
-  return (
-    current.storageAvailable &&
-    current.generation === recovery.receipt &&
-    ownedReceipts.every((receipt) => !current.receipts.includes(receipt))
-  );
+): StewardSessionRecoveryPublicationFence {
+  return createRecoveryPublicationFence({
+    tenantId: recovery.tenantId,
+    receipts: [recovery.receipt, ...recovery.preexistingReceipts],
+    generation: recovery.receipt,
+    isLive: () => isStewardSessionRecoveryReceiptLive(recovery),
+  });
+}
+
+/** Build the same rollbackable publication fence for an exact cookie snapshot. */
+export function createStewardSessionRecoverySnapshotPublicationFence(
+  snapshot: StewardSessionRecoverySnapshot,
+): StewardSessionRecoveryPublicationFence {
+  return createRecoveryPublicationFence({
+    tenantId: snapshot.tenantId,
+    receipts: snapshot.receipts,
+    generation: snapshot.generation,
+    isLive: () => isStewardSessionRecoverySnapshotLive(snapshot),
+  });
 }
 
 /** Retire exactly the receipts reconciled by one cookie-first read. */

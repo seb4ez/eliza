@@ -86,6 +86,8 @@ export const DEFAULT_BOOT_CONFIG: AppBootConfig = {
 
 const BOOT_CONFIG_STORE_KEY = Symbol.for("elizaos.app.boot-config");
 const BOOT_CONFIG_WINDOW_KEY = "__ELIZAOS_APP_BOOT_CONFIG__";
+/** Same-document signal for runtime credential/base rotations. */
+export const BOOT_CONFIG_CHANGE_EVENT = "elizaos:boot-config-change";
 
 interface BootConfigStore {
   current: AppBootConfig;
@@ -126,10 +128,17 @@ function getBootConfigStore(): BootConfigStore {
   return store;
 }
 
+/** Publish a boot-config mutation across duplicated shared/UI module bundles. */
+export function dispatchBootConfigChangeEvent(): void {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new Event(BOOT_CONFIG_CHANGE_EVENT));
+}
+
 export function setBootConfig(config: AppBootConfig): void {
   const store = getBootConfigStore();
   store.current = config;
   getGlobalSlot()[BOOT_CONFIG_WINDOW_KEY] = config;
+  dispatchBootConfigChangeEvent();
 }
 
 export function getBootConfig(): AppBootConfig {

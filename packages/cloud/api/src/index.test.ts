@@ -146,7 +146,7 @@ test("gates crypto payment confirmation before cold shard loading", async () => 
       "https://api.eliza.app/api/crypto/payments/missing-id/confirm",
       {
         method: "POST",
-        headers: { cookie: "steward-token-staging=session" },
+        headers: { cookie: "__Host-steward-token-v2-staging=session" },
       },
     ),
     env,

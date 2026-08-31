@@ -10,7 +10,10 @@
 // intact for the round trip. A live popup handle keeps the device-code popup
 // flow. jsdom pinned to a hosted elizacloud origin with the API client mocked.
 
-import { registerStewardTokenPersistence } from "@elizaos/shared/steward-session-client";
+import {
+  registerStewardTokenPersistence,
+  STEWARD_SESSION_CHANGE_EVENT,
+} from "@elizaos/shared/steward-session-client";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { client } from "../api";
@@ -24,6 +27,7 @@ import {
   DEFAULT_STEWARD_TENANT_ID,
 } from "../cloud/shell/steward-config";
 import { getBootConfig, setBootConfig } from "../config/boot-config";
+import { ELIZA_CLOUD_STATUS_UPDATED_EVENT } from "../events";
 import {
   markCloudLoginPending,
   readCloudLoginPending,
@@ -40,15 +44,26 @@ const directBindBoundary = vi.hoisted(() => ({
   calls: [] as Array<{
     validate?: () => boolean;
     finalize?: () => undefined | (() => void);
-    commitBeforePublish?: () => boolean;
+    finalizeRecoveryBeforePublish?: () => (durableRestored: boolean) => void;
   }>,
   override: null as
     | null
     | ((options: {
         validate?: () => boolean;
         finalize?: () => undefined | (() => void);
-        commitBeforePublish?: () => boolean;
+        finalizeRecoveryBeforePublish?: () => (
+          durableRestored: boolean,
+        ) => void;
       }) => Promise<{ restoreIfCurrent(): Promise<void> } | null>),
+}));
+
+const siweBoundary = vi.hoisted(() => ({
+  override: null as
+    | null
+    | ((cloudApiBase: string) => Promise<{
+        token: string;
+        authority: { isCurrent(): boolean };
+      } | null>),
 }));
 
 vi.mock("./bind-direct-cloud-login", async (importOriginal) => {
@@ -64,6 +79,17 @@ vi.mock("./bind-direct-cloud-login", async (importOriginal) => {
         ? directBindBoundary.override(options)
         : actual.bindDirectCloudLoginToPersonalAgent(options);
     },
+  };
+});
+
+vi.mock("./cloud-siwe-login", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./cloud-siwe-login")>();
+  return {
+    ...actual,
+    siweLoginWithInjectedWalletAuthority: async (cloudApiBase: string) =>
+      siweBoundary.override
+        ? siweBoundary.override(cloudApiBase)
+        : actual.siweLoginWithInjectedWalletAuthority(cloudApiBase),
   };
 });
 
@@ -211,6 +237,7 @@ describe("useCloudState — handleCloudLogin same-tab fallback on hosted web", (
     restorePinnedRemote();
     directBindBoundary.calls.length = 0;
     directBindBoundary.override = null;
+    siweBoundary.override = null;
     __resetPreparedDesktopCloudLoginSessionForTests();
     vi.unstubAllEnvs();
     vi.restoreAllMocks();
@@ -224,6 +251,41 @@ describe("useCloudState — handleCloudLogin same-tab fallback on hosted web", (
 
   const deviceCodeCalls = () =>
     cloudLoginSpy.mock.calls.length + cloudLoginDirectSpy.mock.calls.length;
+
+  const createCloudLoginPopup = () => {
+    const popup = {
+      closed: false,
+      close: vi.fn(() => {
+        popup.closed = true;
+      }),
+      location: { href: "" },
+      opener: {},
+    };
+    return popup as unknown as Window;
+  };
+
+  const mockDirectDeviceCodeStart = (sessionId: string) => {
+    cloudLoginDirectSpy.mockResolvedValue({
+      ok: true,
+      apiBase: "https://api.eliza.app",
+      browserUrl: `https://eliza.app/auth/cli-login?session=${sessionId}`,
+      sessionId,
+    });
+  };
+
+  const setCloudLoginReturnLocation = (sessionId: string) => {
+    const search = `?elizaCloudLogin=complete&elizaCloudLoginSession=${sessionId}`;
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: {
+        ...window.location,
+        href: `https://cloud.eliza.app/chat${search}`,
+        pathname: "/chat",
+        search,
+        assign: assignSpy,
+      },
+    });
+  };
 
   it("a dead popup handle navigates same-tab to /login with returnTo and starts no device-code session", async () => {
     const { result } = renderHook(() => useCloudState(makeParams()));
@@ -275,6 +337,152 @@ describe("useCloudState — handleCloudLogin same-tab fallback on hosted web", (
     expect(assignSpy).not.toHaveBeenCalled();
     expect(cloudLoginDirectSpy).toHaveBeenCalledTimes(1);
     expect(result.current.elizaCloudLoginError).toBe(DEVICE_CODE_SENTINEL);
+  });
+
+  it("stops SIWE success effects when login B supersedes its committed authority during verification", async () => {
+    vi.useFakeTimers();
+    let siweAuthorityCurrent = true;
+    (window as Window & { ethereum?: unknown }).ethereum = {
+      isElizaE2eWallet: true,
+      request: vi.fn(async () => []),
+    };
+    siweBoundary.override = async () => {
+      localStorage.setItem("steward_session_token", "account-a-token");
+      return {
+        token: "account-a-token",
+        authority: { isCurrent: () => siweAuthorityCurrent },
+      };
+    };
+    vi.spyOn(client, "getCloudStatus").mockImplementation(async () => {
+      if (localStorage.getItem("steward_session_token") === "account-a-token") {
+        siweAuthorityCurrent = false;
+      }
+      return { connected: true, enabled: true, userId: "account-a-user" };
+    });
+    const params = makeParams();
+    const popup = {
+      closed: false,
+      close: vi.fn(),
+      location: { href: "" },
+      opener: {},
+    } as unknown as Window;
+    vi.spyOn(window, "open").mockReturnValue(popup);
+
+    try {
+      const { result } = renderHook(() => useCloudState(params));
+      await act(async () => {
+        await result.current.handleCloudLogin(popup);
+      });
+
+      expect(siweAuthorityCurrent).toBe(false);
+      expect(popup.close).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      // The named handle may already belong to B when A's fallback timer runs.
+      // A's stale delayed close must not close B's reused popup.
+      expect(popup.close).toHaveBeenCalledTimes(1);
+      expect(params.loadWalletConfig).not.toHaveBeenCalled();
+      expect(result.current.elizaCloudConnected).toBe(false);
+      expect(result.current.elizaCloudLoginBusy).toBe(false);
+      expect(cloudLoginDirectSpy).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not mutate a named popup when SIWE authority changes between the caller guard and close", async () => {
+    let authorityChecks = 0;
+    (window as Window & { ethereum?: unknown }).ethereum = {
+      isElizaE2eWallet: true,
+      request: vi.fn(async () => []),
+    };
+    siweBoundary.override = async () => {
+      localStorage.setItem("steward_session_token", "account-a-token");
+      return {
+        token: "account-a-token",
+        authority: {
+          isCurrent: () => {
+            authorityChecks += 1;
+            return authorityChecks === 1;
+          },
+        },
+      };
+    };
+    const popup = {
+      closed: false,
+      close: vi.fn(),
+      location: { href: "" },
+      opener: {},
+    } as unknown as Window;
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup);
+
+    const { result } = renderHook(() => useCloudState(makeParams()));
+    await act(async () => {
+      await result.current.handleCloudLogin(popup);
+    });
+
+    expect(authorityChecks).toBeGreaterThanOrEqual(2);
+    expect(popup.close).not.toHaveBeenCalled();
+    expect(popup.location.href).toBe("");
+    expect(openSpy).not.toHaveBeenCalled();
+  });
+
+  it("completes an agent-proxied device-code login that returns no browser token", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(client, "getBaseUrl").mockReturnValue("http://127.0.0.1:31337");
+    vi.spyOn(client, "getCloudStatus").mockResolvedValue({
+      connected: false,
+      enabled: true,
+    } as Awaited<ReturnType<typeof client.getCloudStatus>>);
+    const cloudLoginPollSpy = vi
+      .spyOn(client, "cloudLoginPoll")
+      .mockResolvedValue({
+        status: "authenticated",
+        organizationId: "org-agent-proxy",
+        userId: "user-agent-proxy",
+      });
+    cloudLoginSpy.mockResolvedValue({
+      ok: true,
+      browserUrl: "https://eliza.app/auth/device",
+      sessionId: "agent-proxy-session",
+    });
+    const popup = {
+      closed: false,
+      close: vi.fn(() => {
+        (popup as { closed: boolean }).closed = true;
+      }),
+      location: { href: "" },
+      opener: {},
+    } as unknown as Window;
+
+    try {
+      const { result, unmount } = renderHook(() => useCloudState(makeParams()));
+      let login: Promise<void> | undefined;
+      await act(async () => {
+        login = result.current.handleCloudLogin(popup);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(cloudLoginSpy).toHaveBeenCalledTimes(1);
+      expect(cloudLoginDirectSpy).not.toHaveBeenCalled();
+      expect(popup.location.href).toBe("https://eliza.app/auth/device");
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_000);
+        await login;
+      });
+
+      expect(cloudLoginPollSpy).toHaveBeenCalledWith("agent-proxy-session");
+      expect(result.current.elizaCloudConnected).toBe(true);
+      expect(result.current.elizaCloudLoginBusy).toBe(false);
+      expect(localStorage.getItem("steward_session_token")).toBeNull();
+      expect(recoverySnapshot().receipts).toEqual([]);
+      unmount();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("uses a hosted staging session with a local backend and preserves that backend after success", async () => {
@@ -608,6 +816,100 @@ describe("useCloudState — handleCloudLogin same-tab fallback on hosted web", (
     expect(result.current.elizaCloudLoginBusy).toBe(false);
   });
 
+  it("retires device-code recovery when authentication returns no token", async () => {
+    vi.useFakeTimers();
+    const popup = createCloudLoginPopup();
+    mockDirectDeviceCodeStart("sess-missing-token");
+    cloudLoginPollDirectSpy.mockResolvedValue({ status: "authenticated" });
+
+    try {
+      const { result, unmount } = renderHook(() => useCloudState(makeParams()));
+      let login: Promise<void> = Promise.resolve();
+      await act(async () => {
+        login = result.current.handleCloudLogin(popup);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(recoverySnapshot().receipts).toHaveLength(1);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_000);
+        await login;
+      });
+
+      expect(result.current.elizaCloudLoginError).toContain(
+        "did not return a session token",
+      );
+      expect(recoverySnapshot().receipts).toEqual([]);
+      unmount();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("retires device-code recovery after its terminal timeout", async () => {
+    vi.useFakeTimers();
+    const popup = createCloudLoginPopup();
+    mockDirectDeviceCodeStart("sess-timeout");
+    cloudLoginPollDirectSpy.mockResolvedValue({ status: "pending" });
+
+    try {
+      const { result, unmount } = renderHook(() => useCloudState(makeParams()));
+      let login: Promise<void> = Promise.resolve();
+      await act(async () => {
+        login = result.current.handleCloudLogin(popup);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(recoverySnapshot().receipts).toHaveLength(1);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(300_000);
+        await login;
+      });
+
+      expect(result.current.elizaCloudLoginError).toContain("timed out");
+      expect(recoverySnapshot().receipts).toEqual([]);
+      unmount();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("retires device-code recovery after three terminal poll failures", async () => {
+    vi.useFakeTimers();
+    const popup = createCloudLoginPopup();
+    mockDirectDeviceCodeStart("sess-poll-errors");
+    cloudLoginPollDirectSpy.mockRejectedValue(new Error("poll transport down"));
+
+    try {
+      const { result, unmount } = renderHook(() => useCloudState(makeParams()));
+      let login: Promise<void> = Promise.resolve();
+      await act(async () => {
+        login = result.current.handleCloudLogin(popup);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(recoverySnapshot().receipts).toHaveLength(1);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3_000);
+        await login;
+      });
+
+      expect(result.current.elizaCloudLoginError).toContain(
+        "failed after repeated errors",
+      );
+      expect(recoverySnapshot().receipts).toEqual([]);
+      unmount();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
   it("resumes a direct cloud login when the auth tab returns with a CLI session", async () => {
     const search =
       "?elizaCloudLogin=complete&elizaCloudLoginSession=sess-return";
@@ -643,6 +945,128 @@ describe("useCloudState — handleCloudLogin same-tab fallback on hosted web", (
       "sess-return",
     );
     expect(params.setActionNotice).not.toHaveBeenCalled();
+  });
+
+  it("retires same-tab return recovery when authentication returns no token", async () => {
+    setCloudLoginReturnLocation("sess-return-missing-token");
+    cloudLoginPollDirectSpy.mockResolvedValue({ status: "authenticated" });
+
+    const { result } = renderHook(() => useCloudState(makeParams()));
+
+    await waitFor(() =>
+      expect(result.current.elizaCloudLoginError).toContain(
+        "did not return a session token",
+      ),
+    );
+    expect(recoverySnapshot().receipts).toEqual([]);
+  });
+
+  it("retires same-tab return recovery after a terminal transport error", async () => {
+    setCloudLoginReturnLocation("sess-return-transport-error");
+    cloudLoginPollDirectSpy.mockRejectedValue(new Error("return poll failed"));
+
+    const { result } = renderHook(() => useCloudState(makeParams()));
+
+    await waitFor(() =>
+      expect(result.current.elizaCloudLoginError).toBe("return poll failed"),
+    );
+    expect(recoverySnapshot().receipts).toEqual([]);
+  });
+
+  it("retires same-tab return recovery after its deadline", async () => {
+    vi.useFakeTimers();
+    setCloudLoginReturnLocation("sess-return-timeout");
+    cloudLoginPollDirectSpy.mockResolvedValue({ status: "pending" });
+
+    try {
+      const { result, unmount } = renderHook(() => useCloudState(makeParams()));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(60_000);
+      });
+
+      expect(result.current.elizaCloudLoginError).toContain("did not finish");
+      expect(recoverySnapshot().receipts).toEqual([]);
+      unmount();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("preserves same-tab return recovery when teardown interrupts an in-flight poll", async () => {
+    setCloudLoginReturnLocation("sess-return-in-flight");
+    const delayedPoll = deferred<{
+      status: "authenticated";
+      token: string;
+    }>();
+    cloudLoginPollDirectSpy.mockImplementation(() => delayedPoll.promise);
+
+    const { unmount } = renderHook(() => useCloudState(makeParams()));
+    await waitFor(() =>
+      expect(cloudLoginPollDirectSpy).toHaveBeenCalledWith(
+        "https://api.eliza.app",
+        "sess-return-in-flight",
+      ),
+    );
+    expect(recoverySnapshot().receipts).toHaveLength(1);
+
+    unmount();
+    await act(async () => {
+      delayedPoll.resolve({
+        status: "authenticated",
+        token: "response-after-teardown",
+      });
+      await delayedPoll.promise;
+      await Promise.resolve();
+    });
+
+    expect(recoverySnapshot().receipts).toHaveLength(1);
+    expect(localStorage.getItem("steward_session_token")).toBeNull();
+  });
+
+  it("preserves a finalized return token when authority publication unmounts the caller", async () => {
+    const search =
+      "?elizaCloudLogin=complete&elizaCloudLoginSession=sess-unmount-after-authority";
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: {
+        ...window.location,
+        href: `https://cloud.eliza.app/chat${search}`,
+        pathname: "/chat",
+        search,
+        assign: assignSpy,
+      },
+    });
+    setBootConfig({ branding: {}, cloudApiBase: "https://eliza.app" });
+    localStorage.setItem("steward_session_token", "predecessor-token");
+    cloudLoginPollDirectSpy.mockResolvedValue({
+      status: "authenticated",
+      token: "committed-token",
+      userId: "committed-user",
+    });
+    let unmountCurrentHook = () => {};
+    const unmountOnAuthority = () => unmountCurrentHook();
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, unmountOnAuthority, {
+      once: true,
+    });
+
+    try {
+      const rendered = renderHook(() => useCloudState(makeParams()));
+      unmountCurrentHook = rendered.unmount;
+
+      await waitFor(() => {
+        expect(localStorage.getItem("steward_session_token")).toBe(
+          "committed-token",
+        );
+        expect(recoverySnapshot().receipts).toEqual([]);
+      });
+      expect(getBootConfig().cloudApiBase).toBe("https://api.eliza.app");
+    } finally {
+      window.removeEventListener(
+        STEWARD_SESSION_CHANGE_EVENT,
+        unmountOnAuthority,
+      );
+    }
   });
 
   it("keeps login B authoritative when a delayed same-tab return for A settles", async () => {
@@ -978,6 +1402,124 @@ describe("useCloudState — handleCloudLogin same-tab fallback on hosted web", (
     }
   });
 
+  it("does not close a reused named popup when a matching device-code message from A arrives after login B", async () => {
+    vi.useFakeTimers();
+    const popup = {
+      closed: false,
+      close: vi.fn(),
+      location: { href: "" },
+      opener: {},
+    } as unknown as Window;
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup);
+    cloudLoginDirectSpy.mockResolvedValue({
+      ok: true,
+      apiBase: "https://api.eliza.app",
+      browserUrl: "https://eliza.app/auth/cli-login?session=stale-a",
+      sessionId: "stale-a",
+    });
+
+    try {
+      const { result, unmount } = renderHook(() => useCloudState(makeParams()));
+      let login: Promise<void> = Promise.resolve();
+      await act(async () => {
+        login = result.current.handleCloudLogin(popup);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      completeNewerRecovery();
+      await act(async () => {
+        window.dispatchEvent(
+          new MessageEvent("message", {
+            origin: "https://eliza.app",
+            data: {
+              type: "eliza-cloud-auth-complete",
+              sessionId: "stale-a",
+            },
+          }),
+        );
+        await vi.advanceTimersByTimeAsync(1_000);
+        await login;
+      });
+
+      expect(popup.close).not.toHaveBeenCalled();
+      expect(openSpy).not.toHaveBeenCalledWith("", CLOUD_LOGIN_POPUP_NAME);
+      expect(result.current.elizaCloudLoginBusy).toBe(false);
+      unmount();
+      vi.clearAllTimers();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not close or publish an A startup failure after login B supersedes the device-code receipt", async () => {
+    const popup = {
+      closed: false,
+      close: vi.fn(),
+      location: { href: "" },
+      opener: {},
+    } as unknown as Window;
+    vi.spyOn(window, "open").mockReturnValue(popup);
+    const startup = deferred<{
+      ok: false;
+      sessionId: string;
+      browserUrl: string;
+      error: string;
+    }>();
+    cloudLoginDirectSpy.mockImplementation(() => startup.promise);
+    const { result, unmount } = renderHook(() => useCloudState(makeParams()));
+    let login: Promise<void> = Promise.resolve();
+
+    await act(async () => {
+      login = result.current.handleCloudLogin(popup);
+      await Promise.resolve();
+    });
+    completeNewerRecovery();
+    startup.resolve({
+      ok: false,
+      sessionId: "",
+      browserUrl: "",
+      error: "stale account A failure",
+    });
+    await act(async () => {
+      await login;
+    });
+
+    expect(popup.close).not.toHaveBeenCalled();
+    expect(result.current.elizaCloudLoginError).toBeNull();
+    expect(result.current.elizaCloudLoginBusy).toBe(false);
+    unmount();
+  });
+
+  it("does not close or publish an A thrown startup error after login B supersedes the device-code receipt", async () => {
+    const popup = {
+      closed: false,
+      close: vi.fn(),
+      location: { href: "" },
+      opener: {},
+    } as unknown as Window;
+    vi.spyOn(window, "open").mockReturnValue(popup);
+    const startup = deferred<never>();
+    cloudLoginDirectSpy.mockImplementation(() => startup.promise);
+    const { result, unmount } = renderHook(() => useCloudState(makeParams()));
+    let login: Promise<void> = Promise.resolve();
+
+    await act(async () => {
+      login = result.current.handleCloudLogin(popup);
+      await Promise.resolve();
+    });
+    completeNewerRecovery();
+    startup.reject(new Error("stale account A exception"));
+    await act(async () => {
+      await login;
+    });
+
+    expect(popup.close).not.toHaveBeenCalled();
+    expect(result.current.elizaCloudLoginError).toBeNull();
+    expect(result.current.elizaCloudLoginBusy).toBe(false);
+    unmount();
+  });
+
   it("closes the named popup when direct cloud polling authenticates", async () => {
     vi.useFakeTimers();
     const popup = {
@@ -1219,12 +1761,14 @@ describe("useCloudState — handleCloudLogin same-tab fallback on hosted web", (
     });
     const bindingRestore = vi.fn(async () => undefined);
     directBindBoundary.override = async (options) => {
+      const rollbackRecovery = options.finalizeRecoveryBeforePublish?.();
       const restoreBoot = options.finalize?.();
-      expect(options.commitBeforePublish?.()).toBe(true);
+      expect(rollbackRecovery).toEqual(expect.any(Function));
       queueMicrotask(() => completeNewerLogin("account-b-token"));
       return {
         restoreIfCurrent: async () => {
           restoreBoot?.();
+          rollbackRecovery?.(true);
           await bindingRestore();
         },
       };
@@ -1319,13 +1863,15 @@ describe("useCloudState — handleCloudLogin same-tab fallback on hosted web", (
     let bindingRollbackFinished = false;
     directBindBoundary.override = async (options) => {
       localStorage.setItem("steward_session_token", "account-a-token");
+      const rollbackRecovery = options.finalizeRecoveryBeforePublish?.();
       const restoreBoot = options.finalize?.();
-      expect(options.commitBeforePublish?.()).toBe(true);
+      expect(rollbackRecovery).toEqual(expect.any(Function));
       return {
         restoreIfCurrent: async () => {
           bindingRollbackStarted.resolve();
           await bindingRollbackGate.promise;
           restoreBoot?.();
+          rollbackRecovery?.(true);
           bindingRollbackFinished = true;
         },
       };
@@ -1934,6 +2480,86 @@ describe("useCloudState — pollCloudCredits status snapshot", () => {
 
     expect(getCloudStatusSpy).toHaveBeenCalledTimes(1);
     unmount();
+  });
+
+  it("does not admit an ambient account-A poll while login B has a pending receipt", async () => {
+    localStorage.setItem("steward_session_token", "account-a-token");
+    const newerLogin = beginStewardSessionRecovery(
+      configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID),
+      "provider",
+    );
+    const statusEvent = vi.fn();
+    window.addEventListener(ELIZA_CLOUD_STATUS_UPDATED_EVENT, statusEvent);
+
+    try {
+      const { result, unmount } = renderHook(() => useCloudState(makeParams()));
+      let connected = true;
+      await act(async () => {
+        connected = await result.current.pollCloudCredits();
+      });
+
+      expect(connected).toBe(false);
+      expect(getCloudStatusSpy).not.toHaveBeenCalled();
+      expect(getCloudCreditsSpy).not.toHaveBeenCalled();
+      expect(statusEvent).not.toHaveBeenCalled();
+      expect(result.current.elizaCloudConnected).toBe(false);
+      expect(result.current.elizaCloudUserId).toBeNull();
+      unmount();
+    } finally {
+      window.removeEventListener(ELIZA_CLOUD_STATUS_UPDATED_EVENT, statusEvent);
+      completeStewardSessionRecovery(newerLogin);
+    }
+  });
+
+  it("discards the complete account-A snapshot when login B starts during the credits await", async () => {
+    localStorage.setItem("steward_session_token", "account-a-token");
+    getCloudStatusSpy.mockResolvedValue({
+      enabled: true,
+      connected: true,
+      hasApiKey: true,
+      cloudVoiceProxyAvailable: true,
+      userId: "account-a-user",
+    });
+    const credits =
+      deferred<Awaited<ReturnType<typeof client.getCloudCredits>>>();
+    getCloudCreditsSpy.mockReturnValue(credits.promise);
+    const statusEvent = vi.fn();
+    window.addEventListener(ELIZA_CLOUD_STATUS_UPDATED_EVENT, statusEvent);
+    let newerLogin: ReturnType<typeof beginStewardSessionRecovery> | null =
+      null;
+
+    try {
+      const { result, unmount } = renderHook(() => useCloudState(makeParams()));
+      let connected = true;
+      let polling!: Promise<boolean>;
+      act(() => {
+        polling = result.current.pollCloudCredits();
+      });
+      await vi.waitFor(() => expect(getCloudCreditsSpy).toHaveBeenCalledOnce());
+      newerLogin = beginStewardSessionRecovery(
+        configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID),
+        "provider",
+      );
+      await act(async () => {
+        credits.resolve({
+          balance: 42,
+          connected: true,
+          low: false,
+          critical: false,
+        });
+        connected = await polling;
+      });
+
+      expect(connected).toBe(false);
+      expect(statusEvent).not.toHaveBeenCalled();
+      expect(result.current.elizaCloudConnected).toBe(false);
+      expect(result.current.elizaCloudUserId).toBeNull();
+      expect(result.current.elizaCloudCredits).toBeNull();
+      unmount();
+    } finally {
+      window.removeEventListener(ELIZA_CLOUD_STATUS_UPDATED_EVENT, statusEvent);
+      if (newerLogin) completeStewardSessionRecovery(newerLogin);
+    }
   });
 
   it("applies a connected snapshot: enabled, credits balance, low/critical flags, and status reason", async () => {

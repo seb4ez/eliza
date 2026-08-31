@@ -4,7 +4,12 @@
  * same-origin requests without trusting arbitrary eliza.app subdomains.
  */
 
-import { ELIZA_DOMAIN_CONTRACTS, LEGACY_ELIZA_DOMAIN_CONTRACTS } from "@elizaos/shared/elizacloud";
+import {
+  ELIZA_DOMAIN_CONTRACTS,
+  type ElizaCloudEnvironment,
+  LANDING_AB_HOSTNAMES,
+  LEGACY_ELIZA_DOMAIN_CONTRACTS,
+} from "@elizaos/shared/elizacloud";
 
 const ELIZA_BROWSER_ORIGIN_HOSTS: ReadonlySet<string> = new Set([
   ...Object.values(ELIZA_DOMAIN_CONTRACTS).flatMap((contract) => [
@@ -26,7 +31,25 @@ export interface RequestHeaderReader {
   header(name: string): string | undefined;
 }
 
+export interface RequestMetadataReader extends RequestHeaderReader {
+  url: string;
+}
+
 export type BrowserOriginCheck = { ok: true } | { ok: false; reason: string };
+
+export type StewardNonceExchangeOriginCheck =
+  | { ok: true; responseMode: "cookie" | "bearer-only" }
+  | { ok: false; reason: string };
+
+const HARDWARE_CHECKOUT_ORIGINS: ReadonlySet<string> = new Set([
+  "https://elizaos.ai",
+  "https://www.elizaos.ai",
+]);
+
+const PRODUCTION_AB_ORIGINS: ReadonlySet<string> = new Set(
+  LANDING_AB_HOSTNAMES.map((hostname) => `https://${hostname}`),
+);
+const STAGING_PAGES_ORIGIN = "https://develop.eliza-app.pages.dev";
 
 /**
  * Custom header whose presence marks a non-simple request. A cross-origin
@@ -53,6 +76,138 @@ export function browserOriginHost(rawOrigin: string | undefined): string | null 
     // error-policy:J3 malformed browser origin is an explicit invalid result.
     return null;
   }
+}
+
+/**
+ * Parse an Origin header only when it is already in the browser's serialized
+ * origin form. Comparing the complete serialization prevents a scheme or port
+ * variant from inheriting a hostname-only allowlist decision.
+ */
+export function serializedBrowserOrigin(rawOrigin: string | undefined): string | null {
+  if (!rawOrigin || rawOrigin === "null") return null;
+  try {
+    const parsed = new URL(rawOrigin);
+    return parsed.origin === rawOrigin ? parsed.origin : null;
+  } catch {
+    // error-policy:J3 malformed browser origin is an explicit invalid result.
+    return null;
+  }
+}
+
+function stewardEnvironment(environment: string | undefined): ElizaCloudEnvironment {
+  return environment === "staging" ? "staging" : "production";
+}
+
+function requestUrlOrigin(req: RequestMetadataReader): string | null {
+  try {
+    return new URL(req.url).origin;
+  } catch {
+    // error-policy:J3 a malformed request URL fails the browser boundary.
+    return null;
+  }
+}
+
+function isLoopbackOrigin(origin: string): boolean {
+  try {
+    const hostname = new URL(origin).hostname;
+    return LOCAL_DEV_ORIGIN_HOSTS.has(hostname) || hostname === "::1";
+  } catch {
+    // error-policy:J3 malformed browser origin is an explicit invalid result.
+    return false;
+  }
+}
+
+function isHostedStewardFrontendOrigin(
+  origin: string,
+  environment: ElizaCloudEnvironment,
+): boolean {
+  const contract = ELIZA_DOMAIN_CONTRACTS[environment];
+  if (origin === contract.marketingOrigin || origin === contract.cloudAppOrigin) {
+    return true;
+  }
+  if (environment === "staging") return origin === STAGING_PAGES_ORIGIN;
+  return environment === "production" && PRODUCTION_AB_ORIGINS.has(origin);
+}
+
+/**
+ * Strict Fetch Metadata boundary for browser routes that may emit Steward
+ * cookies. Hosted requests must come from a canonical Pages document in the
+ * same environment and carry `Sec-Fetch-Site: same-origin`; API origins,
+ * redirects, legacy hosts, sibling environments, and missing metadata fail.
+ *
+ * Session POST may opt into the one required cross-origin exception: the
+ * canonical marketing origin calling its matching canonical API origin with
+ * `Sec-Fetch-Site: same-site` during the OIDC continuation.
+ */
+export function checkStewardCookieWriterRequest(
+  req: RequestMetadataReader,
+  environment: string | undefined,
+  isProduction: boolean,
+  options: { allowCanonicalOidcSameSite?: boolean } = {},
+): BrowserOriginCheck {
+  const rawOrigin = req.header("origin");
+  const origin = serializedBrowserOrigin(rawOrigin);
+  if (!rawOrigin) return { ok: false, reason: "missing_origin" };
+  if (!origin) return { ok: false, reason: "invalid_origin" };
+
+  const fetchSite = req.header("sec-fetch-site");
+  if (!fetchSite) return { ok: false, reason: "missing_sec_fetch_site" };
+
+  const selectedEnvironment = stewardEnvironment(environment);
+  if (fetchSite === "same-origin" && isHostedStewardFrontendOrigin(origin, selectedEnvironment)) {
+    return { ok: true };
+  }
+
+  const targetOrigin = requestUrlOrigin(req);
+  if (
+    !isProduction &&
+    fetchSite === "same-origin" &&
+    targetOrigin === origin &&
+    isLoopbackOrigin(origin)
+  ) {
+    return { ok: true };
+  }
+
+  const contract = ELIZA_DOMAIN_CONTRACTS[selectedEnvironment];
+  if (
+    options.allowCanonicalOidcSameSite === true &&
+    fetchSite === "same-site" &&
+    origin === contract.marketingOrigin &&
+    targetOrigin === contract.cloudApiOrigin
+  ) {
+    return { ok: true };
+  }
+
+  return {
+    ok: false,
+    reason: `disallowed_origin_or_fetch_site:${fetchSite}`,
+  };
+}
+
+/**
+ * Nonce exchange has one non-cookie mode for the hardware checkout. The two
+ * exact checkout origins may call the matching canonical API cross-site and
+ * receive an access token, but the route must emit zero Set-Cookie headers.
+ */
+export function checkStewardNonceExchangeRequest(
+  req: RequestMetadataReader,
+  environment: string | undefined,
+  isProduction: boolean,
+): StewardNonceExchangeOriginCheck {
+  const cookieWriter = checkStewardCookieWriterRequest(req, environment, isProduction);
+  if (cookieWriter.ok) return { ok: true, responseMode: "cookie" };
+
+  const origin = serializedBrowserOrigin(req.header("origin"));
+  const selectedEnvironment = stewardEnvironment(environment);
+  if (
+    origin &&
+    HARDWARE_CHECKOUT_ORIGINS.has(origin) &&
+    req.header("sec-fetch-site") === "cross-site" &&
+    requestUrlOrigin(req) === ELIZA_DOMAIN_CONTRACTS[selectedEnvironment].cloudApiOrigin
+  ) {
+    return { ok: true, responseMode: "bearer-only" };
+  }
+  return cookieWriter;
 }
 
 export function isPermittedElizaBrowserOrigin(

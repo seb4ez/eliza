@@ -152,6 +152,14 @@ import {
 } from "./renderer-secure-store-authority";
 import { rendererSecureStoreRevisions } from "./renderer-secure-store-revisions";
 import {
+  type RendererConnectionTransactionAccess,
+  type RendererConnectionTransactionCompensationReceipt,
+  type RendererConnectionTransactionKind,
+  type RendererConnectionTransactionParticipantInput,
+  type RendererConnectionTransactionReceipt,
+  RendererSecureStoreTransactionAuthority,
+} from "./renderer-secure-store-transaction";
+import {
   buildDynamicViewRpcHandlers,
   buildNotificationRpcHandlers,
   buildWindowRpcHandlers,
@@ -334,6 +342,8 @@ const rendererSecureStore = createNodePlatformSecureStore();
 const rendererSecureStoreAuthority = new RendererSecureStoreAuthority(
   rendererSecureStore,
 );
+const rendererSecureStoreTransactions =
+  new RendererSecureStoreTransactionAuthority(rendererSecureStore);
 const rendererSecureStoreKinds = new Set<RendererSecureStoreKind>([
   "session.device_auth",
   "session.steward_token",
@@ -344,6 +354,12 @@ const RENDERER_SECURE_STORE_MAX_VALUE_BYTES = 256 * 1024;
 const RENDERER_SECURE_STORE_MAX_RECEIPT_BYTES = 512;
 const RENDERER_SECURE_STORE_MAX_MUTATION_ID_BYTES = 128;
 const RENDERER_SECURE_STORE_MAX_DOCUMENT_CAPABILITY_BYTES = 128;
+const rendererConnectionTransactionKinds =
+  new Set<RendererConnectionTransactionKind>([
+    "session.steward_token",
+    "runtime.active_server",
+    "runtime.agent_profiles",
+  ]);
 
 export interface RendererSecureStoreDocumentAuthority {
   run<T>(
@@ -424,10 +440,266 @@ function requireRendererSecureStoreRevision(value: unknown): number {
   return value as number;
 }
 
+function requireRendererConnectionTransactionKind(
+  value: unknown,
+): RendererConnectionTransactionKind {
+  const kind = requireRendererSecureStoreKind(value);
+  if (
+    !rendererConnectionTransactionKinds.has(
+      kind as RendererConnectionTransactionKind,
+    )
+  ) {
+    throw new Error("runtime connection transaction kind is not allowed");
+  }
+  return kind as RendererConnectionTransactionKind;
+}
+
+function requireRendererConnectionTransactionParticipants(
+  value: unknown,
+): RendererConnectionTransactionParticipantInput[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error("runtime connection transaction participants are missing");
+  }
+  return value.map((participant) => {
+    if (!participant || typeof participant !== "object") {
+      throw new Error("runtime connection transaction participant is invalid");
+    }
+    const record = participant as Record<string, unknown>;
+    return {
+      kind: requireRendererConnectionTransactionKind(record.kind),
+      value: requireRendererSecureStoreValue(record.value),
+    };
+  });
+}
+
+function requireRendererConnectionTransactionReceipts(
+  value: unknown,
+  allowEmpty = false,
+): RendererConnectionTransactionReceipt[] {
+  if (!Array.isArray(value) || (!allowEmpty && value.length === 0)) {
+    throw new Error("runtime connection transaction receipts are missing");
+  }
+  return value.map((receipt) => {
+    if (!receipt || typeof receipt !== "object") {
+      throw new Error("runtime connection transaction receipt is invalid");
+    }
+    const record = receipt as Record<string, unknown>;
+    return {
+      kind: requireRendererConnectionTransactionKind(record.kind),
+      rollbackReceipt: requireRendererSecureStoreRollbackReceipt(
+        record.rollbackReceipt,
+      ),
+    };
+  });
+}
+
+function requireRendererConnectionTransactionCompensationReceipts(
+  value: unknown,
+): RendererConnectionTransactionCompensationReceipt[] {
+  return requireRendererConnectionTransactionReceipts(value).map(
+    (receipt, index) => ({
+      ...receipt,
+      expectedRevision: requireRendererSecureStoreRevision(
+        (value as Array<Record<string, unknown>>)[index]?.expectedRevision,
+      ),
+    }),
+  );
+}
+
+async function publishRendererConnectionTransactionRevisions(
+  vaultId: string,
+  kinds: Iterable<RendererConnectionTransactionKind>,
+): Promise<
+  Array<{ kind: RendererConnectionTransactionKind; revision: number }>
+> {
+  const revisions: Array<{
+    kind: RendererConnectionTransactionKind;
+    revision: number;
+  }> = [];
+  for (const kind of new Set(kinds)) {
+    const result = await rendererSecureStoreRevisions.run(
+      vaultId,
+      kind,
+      async () => ({ reconciled: true }),
+      { invalidates: () => true },
+    );
+    revisions.push({ kind, revision: result.revision });
+  }
+  return revisions;
+}
+
+async function commitRendererConnectionTransactionReceipts(
+  vaultId: string,
+  owner: RendererSecureStoreOwner,
+  receipts: readonly RendererConnectionTransactionReceipt[],
+): Promise<void> {
+  for (const receipt of receipts) {
+    const result = await rendererSecureStoreAuthority.commitReceipt(
+      vaultId,
+      receipt.kind,
+      receipt.rollbackReceipt,
+      owner,
+    );
+    if (!result.ok || !result.committed) {
+      throw new Error(
+        "Runtime connection transaction receipt could not be committed.",
+      );
+    }
+  }
+}
+
+async function settleAbortedRendererConnectionTransactionReceipts(
+  vaultId: string,
+  owner: RendererSecureStoreOwner,
+  receipts: readonly RendererConnectionTransactionReceipt[],
+  participantKinds: readonly RendererConnectionTransactionKind[],
+): Promise<void> {
+  for (const receipt of receipts) {
+    const result = await rendererSecureStoreAuthority.compareAndRestore(
+      vaultId,
+      receipt.kind,
+      receipt.rollbackReceipt,
+      owner,
+    );
+    if (!result.ok) {
+      throw new Error(
+        "Runtime connection transaction receipt could not be settled after abort.",
+      );
+    }
+  }
+  // A SET may have reached the host while every renderer response was lost,
+  // leaving no receipt for the UI to echo. BEGIN guaranteed this owner had no
+  // pre-existing receipts and active transaction access excludes unrelated
+  // writes, so settling every participant slot removes exactly those unknown
+  // transaction receipts after the WAL has restored their predecessors.
+  for (const kind of participantKinds) {
+    const result = await rendererSecureStoreAuthority.releaseOwnerSlot(
+      owner,
+      vaultId,
+      kind,
+    );
+    void result;
+  }
+}
+
+async function compensateFinishedRendererConnectionTransactionReceipts(
+  vaultId: string,
+  owner: RendererSecureStoreOwner,
+  receipts: readonly RendererConnectionTransactionCompensationReceipt[],
+): Promise<void> {
+  for (const receipt of receipts) {
+    const result = await rendererSecureStoreRevisions.runWithRevision(
+      vaultId,
+      receipt.kind,
+      (currentRevision) =>
+        rendererSecureStoreAuthority.compensateCommittedReceipt(
+          vaultId,
+          receipt.kind,
+          receipt.rollbackReceipt,
+          receipt.expectedRevision,
+          currentRevision,
+          owner,
+          true,
+        ),
+      { invalidates: () => false },
+    );
+    if (!result.ok || !result.restored) {
+      throw new Error(
+        "Runtime connection transaction compensation lost authority.",
+      );
+    }
+  }
+}
+
+async function reconcileRendererConnectionTransactionBeforeAccess(
+  vaultId: string,
+  owner: RendererSecureStoreOwner,
+  rawTransactionId: unknown,
+  rawTransactionEpoch?: unknown,
+): Promise<string | undefined> {
+  const transactionId =
+    rawTransactionId === undefined
+      ? undefined
+      : requireRendererSecureStoreMutationId(rawTransactionId);
+  const transactionEpoch =
+    rawTransactionEpoch === undefined
+      ? undefined
+      : requireRendererSecureStoreMutationId(rawTransactionEpoch);
+  await rendererSecureStoreTransactions.beforeAccess(
+    vaultId,
+    owner,
+    transactionId,
+    transactionEpoch,
+    (kinds) => publishRendererConnectionTransactionRevisions(vaultId, kinds),
+  );
+  return transactionId;
+}
+
+async function runWithRendererConnectionTransactionAccess<T>(
+  vaultId: string,
+  owner: RendererSecureStoreOwner,
+  rawTransactionId: unknown,
+  rawTransactionEpoch: unknown,
+  access:
+    | {
+        kind: RendererSecureStoreKind;
+        operation: "read" | "receipt" | "mutation";
+      }
+    | { kind: RendererSecureStoreKind; operation: "set"; value: string }
+    | null,
+  operation: (transactionId: string | undefined) => Promise<T>,
+  allowCommittedReceiptReplay?: () => boolean,
+): Promise<T> {
+  const transactionId =
+    rawTransactionId === undefined
+      ? undefined
+      : requireRendererSecureStoreMutationId(rawTransactionId);
+  const transactionEpoch =
+    rawTransactionEpoch === undefined
+      ? undefined
+      : requireRendererSecureStoreMutationId(rawTransactionEpoch);
+  if ((transactionId === undefined) !== (transactionEpoch === undefined)) {
+    throw new Error("Runtime connection transaction capability is incomplete.");
+  }
+  let transactionAccess: RendererConnectionTransactionAccess | undefined;
+  if (transactionId && access) {
+    const kind = requireRendererConnectionTransactionKind(access.kind);
+    transactionAccess =
+      access.operation === "set"
+        ? { kind, operation: "set", value: access.value }
+        : { kind, operation: access.operation };
+  }
+  const result = await rendererSecureStoreTransactions.runAccess(
+    vaultId,
+    owner,
+    transactionId,
+    transactionAccess,
+    () => operation(transactionId),
+    allowCommittedReceiptReplay,
+    transactionEpoch,
+    (kinds) => publishRendererConnectionTransactionRevisions(vaultId, kinds),
+  );
+  if (result.result === undefined) {
+    throw new Error(
+      "Runtime connection secure-store operation did not complete.",
+    );
+  }
+  return result.result;
+}
+
 export async function releaseRendererSecureStoreOwner(
   owner: RendererSecureStoreOwner,
 ): Promise<void> {
+  const vaultId = deriveAgentVaultId();
+  await rendererSecureStoreTransactions.releaseOwner(
+    vaultId,
+    owner,
+    (receipts) =>
+      commitRendererConnectionTransactionReceipts(vaultId, owner, receipts),
+    (kinds) => publishRendererConnectionTransactionRevisions(vaultId, kinds),
+  );
   rendererSecureStoreAuthority.markOwnerReleased(owner);
+  rendererSecureStoreTransactions.forgetOwner(owner);
   const failures: unknown[] = [];
   for (const { kind, vaultId } of rendererSecureStoreAuthority.ownerSlots(
     owner,
@@ -1516,11 +1788,19 @@ export function buildBunRpcHandlers({
       return runWithSecureStoreOwner(params, async (owner) => {
         const vaultId = deriveAgentVaultId();
         const kind = requireRendererSecureStoreKind(params?.kind);
-        return rendererSecureStoreRevisions.run(
+        return runWithRendererConnectionTransactionAccess(
           vaultId,
-          kind,
-          () => rendererSecureStoreAuthority.get(vaultId, kind, owner),
-          { invalidates: () => false },
+          owner,
+          params?.transactionId,
+          params?.transactionEpoch,
+          { kind, operation: "read" },
+          () =>
+            rendererSecureStoreRevisions.run(
+              vaultId,
+              kind,
+              () => rendererSecureStoreAuthority.get(vaultId, kind, owner),
+              { invalidates: () => false },
+            ),
         );
       });
     },
@@ -1528,14 +1808,22 @@ export function buildBunRpcHandlers({
       runWithSecureStoreOwner(params, async (owner) => {
         const vaultId = deriveAgentVaultId();
         const kind = requireRendererSecureStoreKind(params?.kind);
-        return rendererSecureStoreRevisions.run(
+        return runWithRendererConnectionTransactionAccess(
           vaultId,
-          kind,
-          async () => {
-            rendererSecureStoreAuthority.assertOwnerActive(owner);
-            return { ok: true as const };
-          },
-          { invalidates: () => false },
+          owner,
+          params?.transactionId,
+          params?.transactionEpoch,
+          { kind, operation: "read" },
+          () =>
+            rendererSecureStoreRevisions.run(
+              vaultId,
+              kind,
+              async () => {
+                rendererSecureStoreAuthority.assertOwnerActive(owner);
+                return { ok: true as const };
+              },
+              { invalidates: () => false },
+            ),
         );
       }),
     secureStoreSet: async (params) =>
@@ -1546,21 +1834,30 @@ export function buildBunRpcHandlers({
         const mutationId = requireRendererSecureStoreMutationId(
           params?.mutationId,
         );
-        return rendererSecureStoreRevisions.run(
+        return runWithRendererConnectionTransactionAccess(
           vaultId,
-          kind,
-          () =>
-            rendererSecureStoreAuthority.set(
+          owner,
+          params?.transactionId,
+          params?.transactionEpoch,
+          { kind, operation: "set", value },
+          (transactionId) =>
+            rendererSecureStoreRevisions.run(
               vaultId,
               kind,
-              value,
-              owner,
-              mutationId,
+              () =>
+                rendererSecureStoreAuthority.set(
+                  vaultId,
+                  kind,
+                  value,
+                  owner,
+                  mutationId,
+                ),
+              {
+                invalidates: (result) =>
+                  !transactionId && result.changed !== false,
+                invalidatesOnError: !transactionId,
+              },
             ),
-          {
-            invalidates: (result) => result.changed !== false,
-            invalidatesOnError: true,
-          },
         );
       }),
     secureStoreCommitReceipt: async (params) =>
@@ -1570,17 +1867,59 @@ export function buildBunRpcHandlers({
         const receipt = requireRendererSecureStoreRollbackReceipt(
           params?.rollbackReceipt,
         );
-        return rendererSecureStoreRevisions.run(
+        const expectedRevision = requireRendererSecureStoreRevision(
+          params?.expectedRevision,
+        );
+        return runWithRendererConnectionTransactionAccess(
           vaultId,
-          kind,
+          owner,
+          params?.transactionId,
+          params?.transactionEpoch,
+          { kind, operation: "mutation" },
+          async () => {
+            const replay =
+              rendererSecureStoreAuthority.hasCommittedReceiptReplay(
+                vaultId,
+                kind,
+                receipt,
+                owner,
+              );
+            const result = await rendererSecureStoreRevisions.runWithRevision(
+              vaultId,
+              kind,
+              async (currentRevision) => {
+                const committed =
+                  await rendererSecureStoreAuthority.commitReceipt(
+                    vaultId,
+                    kind,
+                    receipt,
+                    owner,
+                    currentRevision === expectedRevision || replay,
+                  );
+                return committed.ok && committed.committed
+                  ? {
+                      ...committed,
+                      publishable: currentRevision === expectedRevision,
+                    }
+                  : committed;
+              },
+              {
+                invalidates: (result) =>
+                  "changed" in result && result.changed === true,
+              },
+            );
+            if (result.ok && result.committed && result.publishable === false) {
+              return { ...result, revision: expectedRevision };
+            }
+            return result;
+          },
           () =>
-            rendererSecureStoreAuthority.commitReceipt(
+            rendererSecureStoreAuthority.hasCommittedReceiptReplay(
               vaultId,
               kind,
               receipt,
               owner,
             ),
-          { invalidates: () => false },
         );
       }),
     secureStoreCompensateCommittedReceipt: async (params) =>
@@ -1593,33 +1932,53 @@ export function buildBunRpcHandlers({
         const expectedRevision = requireRendererSecureStoreRevision(
           params?.expectedRevision,
         );
-        return rendererSecureStoreRevisions.runWithRevision(
+        return runWithRendererConnectionTransactionAccess(
           vaultId,
-          kind,
-          (currentRevision) =>
-            rendererSecureStoreAuthority.compensateCommittedReceipt(
+          owner,
+          params?.transactionId,
+          params?.transactionEpoch,
+          { kind, operation: "mutation" },
+          (transactionId) =>
+            rendererSecureStoreRevisions.runWithRevision(
               vaultId,
               kind,
-              receipt,
-              expectedRevision,
-              currentRevision,
-              owner,
+              (currentRevision) =>
+                rendererSecureStoreAuthority.compensateCommittedReceipt(
+                  vaultId,
+                  kind,
+                  receipt,
+                  expectedRevision,
+                  currentRevision,
+                  owner,
+                ),
+              {
+                invalidates: (result) =>
+                  !transactionId && result.ok && result.changed,
+                invalidatesOnError: !transactionId,
+              },
             ),
-          {
-            invalidates: (result) => result.ok && result.changed,
-            invalidatesOnError: true,
-          },
         );
       }),
     secureStoreDelete: async (params) =>
       runWithSecureStoreOwner(params, async (owner) => {
         const vaultId = deriveAgentVaultId();
         const kind = requireRendererSecureStoreKind(params?.kind);
-        return rendererSecureStoreRevisions.run(
+        return runWithRendererConnectionTransactionAccess(
           vaultId,
-          kind,
-          () => rendererSecureStoreAuthority.delete(vaultId, kind, owner),
-          { invalidates: () => true, invalidatesOnError: true },
+          owner,
+          params?.transactionId,
+          params?.transactionEpoch,
+          { kind, operation: "mutation" },
+          (transactionId) =>
+            rendererSecureStoreRevisions.run(
+              vaultId,
+              kind,
+              () => rendererSecureStoreAuthority.delete(vaultId, kind, owner),
+              {
+                invalidates: () => !transactionId,
+                invalidatesOnError: !transactionId,
+              },
+            ),
         );
       }),
     secureStoreCompareAndDelete: async (params) =>
@@ -1636,23 +1995,32 @@ export function buildBunRpcHandlers({
         const mutationId = requireRendererSecureStoreMutationId(
           params?.mutationId,
         );
-        return rendererSecureStoreRevisions.runWithRevision(
+        return runWithRendererConnectionTransactionAccess(
           vaultId,
-          kind,
-          (currentRevision) =>
-            rendererSecureStoreAuthority.compareAndDelete(
+          owner,
+          params?.transactionId,
+          params?.transactionEpoch,
+          { kind, operation: "mutation" },
+          (transactionId) =>
+            rendererSecureStoreRevisions.runWithRevision(
               vaultId,
               kind,
-              expectedValue,
-              expectedRevision,
-              currentRevision,
-              owner,
-              mutationId,
+              (currentRevision) =>
+                rendererSecureStoreAuthority.compareAndDelete(
+                  vaultId,
+                  kind,
+                  expectedValue,
+                  expectedRevision,
+                  currentRevision,
+                  owner,
+                  mutationId,
+                ),
+              {
+                invalidates: (result) =>
+                  !transactionId && result.changed !== false,
+                invalidatesOnError: !transactionId,
+              },
             ),
-          {
-            invalidates: (result) => result.changed !== false,
-            invalidatesOnError: true,
-          },
         );
       }),
     secureStoreCompareAndSet: async (params) =>
@@ -1669,24 +2037,33 @@ export function buildBunRpcHandlers({
         const mutationId = requireRendererSecureStoreMutationId(
           params?.mutationId,
         );
-        return rendererSecureStoreRevisions.runWithRevision(
+        return runWithRendererConnectionTransactionAccess(
           vaultId,
-          kind,
-          (currentRevision) =>
-            rendererSecureStoreAuthority.compareAndSet(
+          owner,
+          params?.transactionId,
+          params?.transactionEpoch,
+          { kind, operation: "mutation" },
+          (transactionId) =>
+            rendererSecureStoreRevisions.runWithRevision(
               vaultId,
               kind,
-              expectedValue,
-              value,
-              expectedRevision,
-              currentRevision,
-              owner,
-              mutationId,
+              (currentRevision) =>
+                rendererSecureStoreAuthority.compareAndSet(
+                  vaultId,
+                  kind,
+                  expectedValue,
+                  value,
+                  expectedRevision,
+                  currentRevision,
+                  owner,
+                  mutationId,
+                ),
+              {
+                invalidates: (result) =>
+                  !transactionId && result.changed !== false,
+                invalidatesOnError: !transactionId,
+              },
             ),
-          {
-            invalidates: (result) => result.changed !== false,
-            invalidatesOnError: true,
-          },
         );
       }),
     secureStoreCompareAndRestore: async (params) =>
@@ -1696,21 +2073,178 @@ export function buildBunRpcHandlers({
         const receipt = requireRendererSecureStoreRollbackReceipt(
           params?.rollbackReceipt,
         );
-        return rendererSecureStoreRevisions.run(
+        return runWithRendererConnectionTransactionAccess(
           vaultId,
-          kind,
-          () =>
-            rendererSecureStoreAuthority.compareAndRestore(
+          owner,
+          params?.transactionId,
+          params?.transactionEpoch,
+          { kind, operation: "mutation" },
+          (transactionId) =>
+            rendererSecureStoreRevisions.run(
               vaultId,
               kind,
-              receipt,
-              owner,
+              () =>
+                rendererSecureStoreAuthority.compareAndRestore(
+                  vaultId,
+                  kind,
+                  receipt,
+                  owner,
+                ),
+              // A stale rollback can still cancel an abandoned ancestor.
+              // Broadcast its returned host snapshot as an invalidation even
+              // when no value was restored, so renderers drop old authority.
+              {
+                invalidates: () => !transactionId,
+                invalidatesOnError: !transactionId,
+              },
             ),
-          // A stale rollback can still cancel an abandoned ancestor. Broadcast
-          // its returned host snapshot as an invalidation even when no value
-          // was restored, so every renderer drops credentials from an older epoch.
-          { invalidates: () => true, invalidatesOnError: true },
         );
+      }),
+    secureStoreConnectionTransactionBegin: async (params) =>
+      runWithSecureStoreOwner(params, async (owner) => {
+        const vaultId = deriveAgentVaultId();
+        await reconcileRendererConnectionTransactionBeforeAccess(
+          vaultId,
+          owner,
+          undefined,
+        );
+        const transactionId = requireRendererSecureStoreMutationId(
+          params?.transactionId,
+        );
+        const result = await rendererSecureStoreTransactions.begin(
+          vaultId,
+          owner,
+          transactionId,
+          requireRendererConnectionTransactionParticipants(
+            params?.participants,
+          ),
+          () => rendererSecureStoreAuthority.assertNoPendingReceipts(vaultId),
+        );
+        return { ok: true as const, ...result };
+      }),
+    secureStoreConnectionTransactionStage: async (params) =>
+      runWithSecureStoreOwner(params, async (owner) => {
+        const vaultId = deriveAgentVaultId();
+        const transactionId = requireRendererSecureStoreMutationId(
+          params?.transactionId,
+        );
+        const participant = requireRendererConnectionTransactionParticipants([
+          params?.participant,
+        ])[0];
+        await rendererSecureStoreTransactions.stage(
+          vaultId,
+          owner,
+          transactionId,
+          participant,
+          requireRendererSecureStoreMutationId(params?.epoch),
+        );
+        return { ok: true as const };
+      }),
+    secureStoreConnectionTransactionDecide: async (params) =>
+      runWithSecureStoreOwner(params, async (owner) => {
+        const vaultId = deriveAgentVaultId();
+        const transactionId = requireRendererSecureStoreMutationId(
+          params?.transactionId,
+        );
+        const receipts = requireRendererConnectionTransactionReceipts(
+          params?.receipts,
+        );
+        const result = await rendererSecureStoreTransactions.decideCommit(
+          vaultId,
+          owner,
+          transactionId,
+          receipts,
+          (pending) =>
+            commitRendererConnectionTransactionReceipts(
+              vaultId,
+              owner,
+              pending,
+            ),
+          requireRendererSecureStoreMutationId(params?.epoch),
+          (kinds) =>
+            publishRendererConnectionTransactionRevisions(vaultId, kinds),
+        );
+        return { ok: true as const, ...result };
+      }),
+    secureStoreConnectionTransactionFinish: async (params) =>
+      runWithSecureStoreOwner(params, async (owner) => {
+        const vaultId = deriveAgentVaultId();
+        const transactionId = requireRendererSecureStoreMutationId(
+          params?.transactionId,
+        );
+        const result = await rendererSecureStoreTransactions.finishCommit(
+          vaultId,
+          owner,
+          transactionId,
+          requireRendererSecureStoreMutationId(params?.epoch),
+        );
+        return { ok: true as const, ...result };
+      }),
+    secureStoreConnectionTransactionAbort: async (params) =>
+      runWithSecureStoreOwner(params, async (owner) => {
+        const vaultId = deriveAgentVaultId();
+        const transactionId = requireRendererSecureStoreMutationId(
+          params?.transactionId,
+        );
+        const receipts = requireRendererConnectionTransactionReceipts(
+          params?.receipts,
+          true,
+        );
+        const result = await rendererSecureStoreTransactions.abort(
+          vaultId,
+          owner,
+          transactionId,
+          receipts,
+          (pending, participantKinds) =>
+            settleAbortedRendererConnectionTransactionReceipts(
+              vaultId,
+              owner,
+              pending,
+              participantKinds,
+            ),
+          requireRendererSecureStoreMutationId(params?.epoch),
+          (kinds) =>
+            publishRendererConnectionTransactionRevisions(vaultId, kinds),
+        );
+        return {
+          ok: true as const,
+          aborted: result.aborted,
+          committed: result.committed,
+        };
+      }),
+    secureStoreConnectionTransactionStatus: async (params) =>
+      runWithSecureStoreOwner(params, async (owner) => {
+        const result = await rendererSecureStoreTransactions.status(
+          owner,
+          requireRendererSecureStoreMutationId(params?.transactionId),
+          params?.epoch === undefined
+            ? undefined
+            : requireRendererSecureStoreMutationId(params.epoch),
+        );
+        return { ok: true as const, ...result };
+      }),
+    secureStoreConnectionTransactionCompensate: async (params) =>
+      runWithSecureStoreOwner(params, async (owner) => {
+        const vaultId = deriveAgentVaultId();
+        const result =
+          await rendererSecureStoreTransactions.compensateFinishedCommit(
+            vaultId,
+            owner,
+            requireRendererSecureStoreMutationId(params?.transactionId),
+            requireRendererSecureStoreMutationId(params?.epoch),
+            requireRendererConnectionTransactionCompensationReceipts(
+              params?.receipts,
+            ),
+            (receipts) =>
+              compensateFinishedRendererConnectionTransactionReceipts(
+                vaultId,
+                owner,
+                receipts,
+              ),
+            (kinds) =>
+              publishRendererConnectionTransactionRevisions(vaultId, kinds),
+          );
+        return { ok: true as const, ...result };
       }),
     secureStoreStatus: async () =>
       describeNodePlatformSecureStore(rendererSecureStore),

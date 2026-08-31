@@ -13,6 +13,10 @@ import type {
   AppBlockerSettingsCardProps,
   WebsiteBlockerSettingsCardProps,
 } from "@elizaos/shared";
+import {
+  BOOT_CONFIG_CHANGE_EVENT,
+  dispatchBootConfigChangeEvent,
+} from "@elizaos/shared/config/boot-config-store";
 import type { ComponentType } from "react";
 import type { CodingAgentSession } from "../api/client-types-cloud";
 import type { BrandingConfig } from "./branding";
@@ -193,6 +197,8 @@ export const DEFAULT_BOOT_CONFIG: AppBootConfig = {
 const BOOT_CONFIG_STORE_KEY = Symbol.for("elizaos.app.boot-config");
 const BOOT_CONFIG_WINDOW_KEY = "__ELIZAOS_APP_BOOT_CONFIG__";
 
+export { BOOT_CONFIG_CHANGE_EVENT };
+
 interface BootConfigStore {
   current: AppBootConfig;
 }
@@ -238,6 +244,7 @@ export function setBootConfig(config: AppBootConfig): void {
   const store = getBootConfigStore();
   store.current = config;
   getGlobalSlot()[BOOT_CONFIG_WINDOW_KEY] = config;
+  dispatchBootConfigChangeEvent();
 }
 
 /** Read the boot config from non-React code. */

@@ -279,7 +279,6 @@ describe("runAgentSessionRecovery", () => {
 
   it("routes a native redirect without a pair token to Cloud management", async () => {
     const redirectUrl = "https://agent.elizacloud.ai";
-    const clearStalePairCredentials = vi.fn();
 
     const result = await runAgentSessionRecovery({
       ...baseDeps,
@@ -290,7 +289,6 @@ describe("runAgentSessionRecovery", () => {
         ) as unknown as typeof fetch,
       navigate: vi.fn(),
       consumeRedirectInProcess: true,
-      clearStalePairCredentials,
     });
 
     expect(result).toEqual({
@@ -298,7 +296,6 @@ describe("runAgentSessionRecovery", () => {
       reason: "manage-required",
       message: "Pairing token returned a redirect without a pair token",
     });
-    expect(clearStalePairCredentials).toHaveBeenCalledOnce();
   });
 
   it.each([
@@ -309,7 +306,6 @@ describe("runAgentSessionRecovery", () => {
         "cloud_auth_required",
       ),
       "unauthorized",
-      true,
     ],
     [
       new CloudPairExchangeError(
@@ -318,7 +314,6 @@ describe("runAgentSessionRecovery", () => {
         "pairing_token_invalid",
       ),
       "error",
-      false,
     ],
     [
       new CloudPairExchangeError(
@@ -327,13 +322,11 @@ describe("runAgentSessionRecovery", () => {
         "sandbox_credential_unavailable",
       ),
       "manage-required",
-      true,
     ],
   ] as const)(
     "classifies typed native exchange failures without guessing from one status",
-    async (exchangeError, expectedReason, shouldPurge) => {
+    async (exchangeError, expectedReason) => {
       const redirectUrl = "https://agent.elizacloud.ai/pair?token=one-time";
-      const clearStalePairCredentials = vi.fn();
 
       const result = await runAgentSessionRecovery({
         ...baseDeps,
@@ -345,16 +338,10 @@ describe("runAgentSessionRecovery", () => {
         navigate: vi.fn(),
         consumeRedirectInProcess: true,
         exchangePairToken: vi.fn().mockRejectedValue(exchangeError),
-        clearStalePairCredentials,
       });
 
       expect(result.ok).toBe(false);
       if (!result.ok) expect(result.reason).toBe(expectedReason);
-      if (shouldPurge) {
-        expect(clearStalePairCredentials).toHaveBeenCalledOnce();
-      } else {
-        expect(clearStalePairCredentials).not.toHaveBeenCalled();
-      }
     },
   );
 
@@ -363,21 +350,18 @@ describe("runAgentSessionRecovery", () => {
       .fn()
       .mockResolvedValue(jsonResponse(401, { error: "unauthorized" }));
     const navigate = vi.fn();
-    const clearStalePairCredentials = vi.fn();
 
     const result = await runAgentSessionRecovery({
       ...baseDeps,
       fetchFn: fetchFn as unknown as typeof fetch,
       navigate,
-      clearStalePairCredentials,
     });
 
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toBe("unauthorized");
     expect(navigate).not.toHaveBeenCalled();
-    // The caller opted in (it independently proved the adopted pair bearer
-    // stale), so the mint's refusal triggers its purge exactly once (#16666).
-    expect(clearStalePairCredentials).toHaveBeenCalledTimes(1);
+    // Classification stays pure; only the owning hook may purge after it
+    // revalidates generation + same-agent authority.
   });
 
   it("performs NO purge on 401/403 when the caller does not opt in (#16666)", async () => {
@@ -439,18 +423,15 @@ describe("runAgentSessionRecovery", () => {
     const fetchFn = vi
       .fn()
       .mockResolvedValue(jsonResponse(403, { error: "forbidden" }));
-    const clearStalePairCredentials = vi.fn();
 
     const result = await runAgentSessionRecovery({
       ...baseDeps,
       fetchFn: fetchFn as unknown as typeof fetch,
       navigate: vi.fn(),
-      clearStalePairCredentials,
     });
 
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toBe("manage-required");
-    expect(clearStalePairCredentials).toHaveBeenCalledTimes(1);
   });
 
   it.each([
@@ -486,36 +467,30 @@ describe("runAgentSessionRecovery", () => {
     // for: a fetch throw must never be treated as proof of staleness. The
     // runner folds it into reason "error" — never "unauthorized".
     const fetchFn = vi.fn().mockRejectedValue(new Error("offline"));
-    const clearStalePairCredentials = vi.fn();
 
     const result = await runAgentSessionRecovery({
       ...baseDeps,
       fetchFn: fetchFn as unknown as typeof fetch,
       navigate: vi.fn(),
-      clearStalePairCredentials,
     });
 
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toBe("error");
-    expect(clearStalePairCredentials).not.toHaveBeenCalled();
   });
 
   it("does NOT purge pair credentials on a 5xx mint failure (#16666)", async () => {
     const fetchFn = vi
       .fn()
       .mockResolvedValue(jsonResponse(500, { error: "boom" }));
-    const clearStalePairCredentials = vi.fn();
 
     const result = await runAgentSessionRecovery({
       ...baseDeps,
       fetchFn: fetchFn as unknown as typeof fetch,
       navigate: vi.fn(),
-      clearStalePairCredentials,
     });
 
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toBe("error");
-    expect(clearStalePairCredentials).not.toHaveBeenCalled();
   });
 
   it("does not loop forever: gives up with not-ready after the deadline", async () => {

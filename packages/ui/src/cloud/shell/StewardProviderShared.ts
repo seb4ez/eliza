@@ -208,8 +208,6 @@ export async function clearStaleStewardSession(
   mutationLease?: StewardSessionMutationLease,
   authority?: {
     expectedToken: string | null;
-    /** Exact-bearer logout must not send or delete a newer ambient cookie B. */
-    preserveAmbientCookies?: boolean;
     validate: () => boolean;
   },
 ): Promise<boolean> {
@@ -272,9 +270,7 @@ export async function clearStaleStewardSession(
   // to a second read that could target account B.
   await clearSharedOrScrubActiveServerTokenDurably(terminalStorageOptions);
   await clearManagedSharedCloudProfilesAndTokensDurably(terminalStorageOptions);
-  if (!authority?.preserveAmbientCookies) {
-    await clearServerStewardSessionCookies(mutationLease);
-  }
+  await clearServerStewardSessionCookies(mutationLease);
   if (authority?.validate() !== false) {
     try {
       window.dispatchEvent(new CustomEvent("steward-token-sync"));

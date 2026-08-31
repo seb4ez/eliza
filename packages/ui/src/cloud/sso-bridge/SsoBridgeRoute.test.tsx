@@ -2,9 +2,23 @@
 // @vitest-environment jsdom
 
 import { STEWARD_TOKEN_KEY } from "@elizaos/shared/steward-session-client";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
-import { afterEach, describe, expect, it } from "vitest";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import { StrictMode } from "react";
+import {
+  MemoryRouter,
+  Route,
+  Routes,
+  useLocation,
+  useNavigate,
+} from "react-router-dom";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { appModeNavigation } from "../app-mode/app-mode";
 import { SsoBridgeRoute } from "./SsoBridgeRoute";
 
@@ -67,6 +81,15 @@ function json(status: number, body: unknown): Response {
 function LocationProbe({ id }: { id: string }): React.JSX.Element {
   const location = useLocation();
   return <div data-testid={id}>{`${location.pathname}${location.search}`}</div>;
+}
+
+function LeaveBridgeButton(): React.JSX.Element {
+  const navigate = useNavigate();
+  return (
+    <button type="button" onClick={() => navigate("/away")}>
+      Leave bridge
+    </button>
+  );
 }
 
 function renderBridge(hostname: string, search: string): void {
@@ -186,6 +209,143 @@ describe("SsoBridgeRoute — mint leg (eliza.app auth host)", () => {
     });
   });
 
+  it("finishes one mint and one bounce through the StrictMode effect replay", async () => {
+    setReferrer("https://cloud.eliza.app/");
+    localStorage.setItem(STEWARD_TOKEN_KEY, liveToken());
+    const mintResponse = (() => {
+      let resolve!: (response: Response) => void;
+      const promise = new Promise<Response>((resolvePromise) => {
+        resolve = resolvePromise;
+      });
+      return { promise, resolve };
+    })();
+    fetchLog = [];
+    replacedUrls = [];
+    globalThis.fetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      fetchLog.push({ url: String(input), init });
+      return mintResponse.promise;
+    }) as typeof fetch;
+    appModeNavigation.replace = (url: string) => {
+      replacedUrls.push(url);
+    };
+
+    render(
+      <StrictMode>
+        <MemoryRouter initialEntries={[`/auth/bridge${MINT_QS}`]}>
+          <Routes>
+            <Route
+              path="/auth/bridge"
+              element={<SsoBridgeRoute hostname="eliza.app" />}
+            />
+          </Routes>
+        </MemoryRouter>
+      </StrictMode>,
+    );
+
+    await waitFor(() => expect(fetchLog).toHaveLength(1));
+    await act(async () => {
+      mintResponse.resolve(json(200, { ok: true, code: CODE }));
+      await mintResponse.promise;
+    });
+
+    await waitFor(() =>
+      expect(replacedUrls).toEqual([
+        `https://cloud.eliza.app/auth/bridge?code=${CODE}&state=${STATE}&returnTo=%2Fchat`,
+      ]),
+    );
+    expect(fetchLog).toHaveLength(1);
+  });
+
+  it("burns a superseded mint and reaches recoverable app login instead of spinning", async () => {
+    setReferrer("https://cloud.eliza.app/");
+    localStorage.setItem(STEWARD_TOKEN_KEY, liveToken());
+    fetchLog = [];
+    replacedUrls = [];
+    globalThis.fetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      const url = String(input);
+      fetchLog.push({ url, init });
+      if (fetchLog.length > 1) {
+        return json(401, { error: "invalid_verifier" });
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => {
+          const body: { code?: string } = {};
+          Object.defineProperty(body, "code", {
+            enumerable: true,
+            get: () => {
+              // This microtask runs after mintSsoCode's final internal fence but
+              // before runMintLegOperation resumes from awaiting its result.
+              queueMicrotask(() =>
+                localStorage.setItem(STEWARD_TOKEN_KEY, "account-b-token"),
+              );
+              return CODE;
+            },
+          });
+          return body;
+        },
+      } as Response;
+    }) as typeof fetch;
+    appModeNavigation.replace = (url: string) => {
+      replacedUrls.push(url);
+    };
+
+    renderBridge("eliza.app", MINT_QS);
+
+    await waitFor(() =>
+      expect(replacedUrls).toEqual([
+        "https://cloud.eliza.app/login?returnTo=%2Fchat",
+      ]),
+    );
+    expect(fetchLog).toHaveLength(2);
+    expect(JSON.parse(String(fetchLog[1].init?.body))).toEqual({ code: CODE });
+  });
+
+  it("does not navigate a mint result after the bridge route unmounts", async () => {
+    setReferrer("https://cloud.eliza.app/");
+    localStorage.setItem(STEWARD_TOKEN_KEY, liveToken());
+    let resolveMint!: (response: Response) => void;
+    globalThis.fetch = vi.fn(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveMint = resolve;
+        }),
+    ) as typeof fetch;
+    replacedUrls = [];
+    appModeNavigation.replace = (url: string) => {
+      replacedUrls.push(url);
+    };
+
+    render(
+      <MemoryRouter initialEntries={[`/auth/bridge${MINT_QS}`]}>
+        <LeaveBridgeButton />
+        <Routes>
+          <Route
+            path="/auth/bridge"
+            element={<SsoBridgeRoute hostname="eliza.app" />}
+          />
+          <Route path="/away" element={<div>away</div>} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledOnce());
+    fireEvent.click(screen.getByText("Leave bridge"));
+    expect(await screen.findByText("away")).toBeTruthy();
+    await act(async () => {
+      resolveMint(json(200, { ok: true, code: CODE }));
+      await Promise.resolve();
+    });
+    expect(replacedUrls).toEqual([]);
+  });
+
   it("mint failure → the app host's own login, never a loop back here", async () => {
     setReferrer("https://cloud.eliza.app/");
     localStorage.setItem(STEWARD_TOKEN_KEY, liveToken());
@@ -299,6 +459,120 @@ describe("SsoBridgeRoute — exchange leg (app host)", () => {
       code: CODE,
       codeVerifier: VERIFIER,
     });
+  });
+
+  it("finishes one exchange, one hydration, and one landing through the StrictMode effect replay", async () => {
+    armHandshake();
+    const token = liveToken();
+    const exchangeResponse = (() => {
+      let resolve!: (response: Response) => void;
+      const promise = new Promise<Response>((resolvePromise) => {
+        resolve = resolvePromise;
+      });
+      return { promise, resolve };
+    })();
+    fetchLog = [];
+    globalThis.fetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      const url = String(input);
+      fetchLog.push({ url, init });
+      return url.includes("/sso-bridge/exchange")
+        ? exchangeResponse.promise
+        : json(200, { ok: true });
+    }) as typeof fetch;
+
+    render(
+      <StrictMode>
+        <MemoryRouter
+          initialEntries={[
+            `/auth/bridge?code=${CODE}&state=${STATE}&returnTo=%2Fchat`,
+          ]}
+        >
+          <Routes>
+            <Route
+              path="/auth/bridge"
+              element={<SsoBridgeRoute hostname="cloud.eliza.app" />}
+            />
+            <Route path="*" element={<LocationProbe id="landed" />} />
+          </Routes>
+        </MemoryRouter>
+      </StrictMode>,
+    );
+
+    await waitFor(() =>
+      expect(
+        fetchLog.filter(({ url }) => url.includes("/sso-bridge/exchange")),
+      ).toHaveLength(1),
+    );
+    await act(async () => {
+      exchangeResponse.resolve(json(200, { ok: true, token }));
+      await exchangeResponse.promise;
+    });
+
+    expect((await screen.findByTestId("landed")).textContent).toBe("/chat");
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(token);
+    expect(
+      fetchLog.filter(({ url }) => url.includes("/sso-bridge/exchange")),
+    ).toHaveLength(1);
+    expect(
+      fetchLog.filter(({ url }) => url.endsWith("/api/auth/steward-session")),
+    ).toHaveLength(1);
+  });
+
+  it("does not let a completed exchange navigate after its route unmounts", async () => {
+    armHandshake();
+    const exchangeResponse = (() => {
+      let resolve!: (response: Response) => void;
+      const promise = new Promise<Response>((resolvePromise) => {
+        resolve = resolvePromise;
+      });
+      return { promise, resolve };
+    })();
+    fetchLog = [];
+    replacedUrls = [];
+    globalThis.fetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      const url = String(input);
+      fetchLog.push({ url, init });
+      return url.includes("/sso-bridge/exchange")
+        ? exchangeResponse.promise
+        : json(200, { ok: true });
+    }) as typeof fetch;
+
+    render(
+      <MemoryRouter
+        initialEntries={[
+          `/auth/bridge?code=${CODE}&state=${STATE}&returnTo=%2Fchat`,
+        ]}
+      >
+        <LeaveBridgeButton />
+        <Routes>
+          <Route
+            path="/auth/bridge"
+            element={<SsoBridgeRoute hostname="cloud.eliza.app" />}
+          />
+          <Route path="/away" element={<LocationProbe id="away" />} />
+          <Route path="*" element={<LocationProbe id="landed" />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(fetchLog).toHaveLength(1));
+    fireEvent.click(screen.getByRole("button", { name: "Leave bridge" }));
+    expect(screen.getByTestId("away").textContent).toBe("/away");
+
+    await act(async () => {
+      exchangeResponse.resolve(json(200, { ok: true, token: liveToken() }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(screen.getByTestId("away").textContent).toBe("/away");
+    expect(screen.queryByTestId("landed")).toBeNull();
   });
 
   it("a denied exchange (replayed/expired code) falls back to the local login", async () => {

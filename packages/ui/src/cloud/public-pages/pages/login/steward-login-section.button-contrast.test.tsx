@@ -147,7 +147,11 @@ describe("StewardLoginSection button label contrast", () => {
     emailLoginSpies.poll.mockResolvedValue("pending");
     sessionSpies.sync.mockResolvedValue(undefined);
     sessionSpies.recover.mockResolvedValue({ ok: true });
-    sessionSpies.recoverEmail.mockResolvedValue({ ok: true });
+    sessionSpies.recoverEmail.mockResolvedValue({
+      ok: true,
+      token: "recovered-token",
+      isCurrent: () => true,
+    });
     sessionSpies.hasAuthedCookie.mockReturnValue(false);
   });
 

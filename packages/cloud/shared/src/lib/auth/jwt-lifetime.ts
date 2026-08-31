@@ -1,6 +1,7 @@
 /**
  * Validates the bounded lifetime shared by Cloud's symmetric bearer-token verifiers.
- * Clock tolerance applies to verifier/issuer disagreement, never to the minted lifetime.
+ * Clock tolerances apply to verifier/issuer disagreement, never to the minted lifetime.
+ * Future `iat` tolerance may be kept tighter than expiry/not-before tolerance.
  */
 
 import type { JWTPayload } from "jose";
@@ -8,6 +9,12 @@ import type { JWTPayload } from "jose";
 export interface JwtLifetimePolicy {
   maxTtlSeconds: number;
   clockToleranceSeconds: number;
+  /**
+   * Maximum issuer-ahead allowance for `iat`. Defaults to the general clock
+   * tolerance for existing callers; security-sensitive ordering policies
+   * should provide a tighter value explicitly.
+   */
+  futureIssuedAtToleranceSeconds?: number;
   nowSeconds?: number;
 }
 
@@ -23,6 +30,8 @@ export function validateJwtLifetime(
   policy: JwtLifetimePolicy,
 ): JwtLifetimeResult {
   const now = policy.nowSeconds ?? Math.floor(Date.now() / 1000);
+  const futureIssuedAtToleranceSeconds =
+    policy.futureIssuedAtToleranceSeconds ?? policy.clockToleranceSeconds;
 
   if (!isNumericDate(payload.iat)) {
     return { valid: false, reason: "iat must be a non-negative safe-integer NumericDate" };
@@ -39,7 +48,7 @@ export function validateJwtLifetime(
   if (payload.exp - payload.iat > policy.maxTtlSeconds) {
     return { valid: false, reason: "issued lifetime exceeds the configured maximum" };
   }
-  if (payload.iat > now + policy.clockToleranceSeconds) {
+  if (payload.iat > now + futureIssuedAtToleranceSeconds) {
     return { valid: false, reason: "iat is beyond the allowed future clock tolerance" };
   }
   if (payload.exp <= now - policy.clockToleranceSeconds) {

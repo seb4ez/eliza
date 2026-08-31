@@ -17,7 +17,7 @@ function req(headers: Record<string, string>) {
 }
 
 const FIRST_PARTY = { origin: "https://cloud.eliza.app" };
-const COOKIE = { cookie: "steward-token=session-1" };
+const COOKIE = { cookie: "__Host-steward-token-v2=session-1" };
 
 describe("hasNonAmbientCredential", () => {
   test("API key, service key, and Bearer tokens are non-ambient", () => {
@@ -41,8 +41,11 @@ describe("hasAmbientSessionCookie", () => {
     expect(hasAmbientSessionCookie(req(COOKIE), "production")).toBe(true);
     // A production-named cookie is not the staging environment's credential.
     expect(hasAmbientSessionCookie(req(COOKIE), "staging")).toBe(false);
-    expect(hasAmbientSessionCookie(req({ cookie: "steward-token-staging=s" }), "staging")).toBe(
-      true,
+    expect(
+      hasAmbientSessionCookie(req({ cookie: "__Host-steward-token-v2-staging=s" }), "staging"),
+    ).toBe(true);
+    expect(hasAmbientSessionCookie(req({ cookie: "steward-token=session-v1" }), "production")).toBe(
+      false,
     );
     expect(hasAmbientSessionCookie(req({ cookie: "steward-refresh-token=s" }), undefined)).toBe(
       false,
@@ -52,6 +55,29 @@ describe("hasAmbientSessionCookie", () => {
 
   test("the Playwright test-session cookie counts as ambient", () => {
     expect(hasAmbientSessionCookie(req({ cookie: "eliza-test-session=t" }), undefined)).toBe(true);
+  });
+
+  test("v2 authority never falls back to a late v1 access cookie", () => {
+    expect(
+      hasAmbientSessionCookie(
+        req({
+          cookie: "__Host-steward-authed-v2=1; __Host-steward-token-v2=session-v2",
+        }),
+        "production",
+      ),
+    ).toBe(true);
+    expect(
+      hasAmbientSessionCookie(
+        req({ cookie: "__Host-steward-authed-v2=0; steward-token=late-v1" }),
+        "production",
+      ),
+    ).toBe(false);
+    expect(
+      hasAmbientSessionCookie(
+        req({ cookie: "__Host-steward-authed-v2=malformed; steward-token=late-v1" }),
+        "production",
+      ),
+    ).toBe(false);
   });
 });
 

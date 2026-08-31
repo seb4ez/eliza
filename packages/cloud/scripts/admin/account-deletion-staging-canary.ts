@@ -720,6 +720,9 @@ class CloudClient {
         headers: {
           "content-type": "application/json",
           origin: this.config.cloudOrigin,
+          // Emulate the Pages service-binding hop. The browser supplied this
+          // Fetch Metadata value before Pages rewrote the request URL to API.
+          "sec-fetch-site": "same-origin",
           // This singleton CLI has no browser cookie jar or concurrent writer;
           // its sequential control flow is the session-mutation lease.
           [STEWARD_CSRF_HEADER]: STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,

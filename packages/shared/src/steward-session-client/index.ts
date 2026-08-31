@@ -70,8 +70,15 @@ export interface StewardTokenPersistenceTransaction {
 type StewardTokenPersistenceResult =
   // biome-ignore lint/suspicious/noConfusingVoidType: void preserves compatibility with adapters that need no host receipt.
   void | StewardTokenPersistenceCommit | StewardTokenPersistenceTransaction;
+export interface StewardTokenHostPersistenceContext {
+  /** Opaque capability supplied by the caller and interpreted by the host. */
+  hostContext?: unknown;
+  previousScope: string | null;
+  requiredScope: string | null;
+}
 type StewardTokenPersistence = (
   token: string,
+  context: StewardTokenHostPersistenceContext,
 ) => Promise<StewardTokenPersistenceResult>;
 interface PersistedStewardTokenTransaction {
   commit: StewardTokenPersistenceCommit;
@@ -215,7 +222,8 @@ export function registerStewardTokenCompareAndRestore(
 /**
  * localStorage key for the Steward refresh token.
  *
- * Refresh tokens are persisted only as the HttpOnly `steward-refresh-token`
+ * Refresh tokens are persisted only as the rollout-isolated HttpOnly
+ * `__Host-steward-refresh-token-v2`
  * cookie (set by `/api/auth/steward-session` and
  * `/api/auth/steward-nonce-exchange`). This key is retained solely so
  * `clearStoredStewardToken()` can drain the stale localStorage value left in
@@ -223,8 +231,12 @@ export function registerStewardTokenCompareAndRestore(
  */
 export const STEWARD_REFRESH_TOKEN_KEY = "steward_refresh_token";
 
-/** Non-HttpOnly cookie set to "1" while the server-side session is live. */
-export const STEWARD_AUTHED_COOKIE = "steward-authed";
+/**
+ * Non-HttpOnly v2 authority marker. `1` means the v2 server session is live;
+ * `0` is a persistent logout tombstone that prevents fallback to v1 cookies.
+ */
+export const STEWARD_AUTHED_COOKIE = "__Host-steward-authed-v2";
+const LOCAL_STEWARD_AUTHED_COOKIE = "steward-authed-v2";
 
 /** Steward multi-tenant identifier for Eliza Cloud. */
 export const STEWARD_TENANT_ID = "elizacloud";
@@ -263,9 +275,10 @@ export const STEWARD_CSRF_HEADER_VALUE = "1";
  * Exact CSRF-header value sent by browser cookie writers only after entering
  * the origin-wide Steward session mutation queue, or by an isolated non-browser
  * client whose singleton control flow supplies the same no-concurrent-writer
- * guarantee. Cookie-mutating auth routes require this version during the Web
- * Locks rollout, so an older tab that can still race a newer login is rejected
- * before it consumes upstream authority or emits any Set-Cookie header.
+ * guarantee. This value explicitly activates the v2 cookie namespace. The
+ * legacy `1` marker remains on v1 only before activation; after any v2
+ * authority exists, an older tab is rejected before it consumes upstream
+ * authority or emits a Set-Cookie header.
  *
  * This is a first-party protocol/version marker, not an authentication
  * credential. Origin/CSRF validation and the HttpOnly refresh cookie remain
@@ -340,6 +353,10 @@ export type StewardSessionErrorCode =
    * SSO logout marker). A real revocation: clients clear the stored session
    * instead of retrying the sync. */
   | "session_ended"
+  /** A newly issued token landed inside the logout marker's bounded issuer
+   * clock-skew window. It remains blocked, but is not claimed to be revoked:
+   * wait for `retryAfterSeconds`, then authenticate again for a new token. */
+  | "logout_cooldown"
   /** The SSO logout-marker store is unreachable and the token is
    * bridge-issued, so the sync fails closed (503). Transient: clients hold
    * the stored session and retry, as with `server_secret_missing`. */
@@ -375,16 +392,34 @@ export type StewardSessionErrorCode =
 export class StewardSessionError extends Error {
   readonly status: number;
   readonly code: StewardSessionErrorCode | string | null;
+  readonly retryAfterSeconds: number | null;
+  readonly retryAtEpochSeconds: number | null;
 
   constructor(
     message: string,
     status: number,
     code: StewardSessionErrorCode | string | null,
+    options?: {
+      retryAfterSeconds?: number | null;
+      retryAtEpochSeconds?: number | null;
+    },
   ) {
     super(message);
     this.name = "StewardSessionError";
     this.status = status;
     this.code = code;
+    this.retryAfterSeconds =
+      typeof options?.retryAfterSeconds === "number" &&
+      Number.isFinite(options.retryAfterSeconds) &&
+      options.retryAfterSeconds >= 0
+        ? Math.ceil(options.retryAfterSeconds)
+        : null;
+    this.retryAtEpochSeconds =
+      typeof options?.retryAtEpochSeconds === "number" &&
+      Number.isFinite(options.retryAtEpochSeconds) &&
+      options.retryAtEpochSeconds >= 0
+        ? Math.floor(options.retryAtEpochSeconds)
+        : null;
   }
 }
 
@@ -401,8 +436,8 @@ export interface SyncOpts {
   fetchImpl?: typeof fetch;
   /**
    * Present only when the caller owns the origin-wide Steward mutation lease.
-   * Omitting it deliberately emits the legacy marker, which current cookie
-   * writers reject rather than accepting an unserialized mutation.
+   * Omitting it deliberately emits the legacy marker. That marker may mutate
+   * only v1 while v2 is wholly absent and is rejected after v2 activation.
    */
   sessionMutationProtocol?: typeof STEWARD_SESSION_MUTATION_PROTOCOL_VALUE;
 }
@@ -492,12 +527,17 @@ async function persistStoredStewardToken(
   requiredScope: string | null,
   previousToken: string | null,
   previousScope: string | null,
+  hostContext?: unknown,
 ): Promise<PersistedStewardTokenTransaction | null> {
   let tokenPersisted = false;
   let transaction: PersistedStewardTokenTransaction | null = null;
   try {
     if (stewardTokenPersistence) {
-      const result = await stewardTokenPersistence(token);
+      const result = await stewardTokenPersistence(token, {
+        ...(hostContext === undefined ? {} : { hostContext }),
+        previousScope,
+        requiredScope,
+      });
       if (typeof result === "function") {
         transaction = {
           commit: result,
@@ -513,18 +553,10 @@ async function persistStoredStewardToken(
       window.localStorage.setItem(STEWARD_TOKEN_KEY, token);
     }
     tokenPersisted = true;
-    // Publish the scope only after the new token is durable. During an awaited
-    // protected-store write, the previous scope therefore keeps both the old
-    // token and any early secure-store mirror of the new token quarantined.
-    // If this write fails after the token became durable, the catch path below
-    // rolls both token and scope back before returning the failure; the commit
-    // closure remains deliberately unacknowledged.
-    if (
-      requiredScope &&
-      window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY) !== requiredScope
-    ) {
-      window.localStorage.setItem(STEWARD_TOKEN_SCOPE_KEY, requiredScope);
-    }
+    // Scope is deliberately published only after transaction.commit below.
+    // A process death while a host WAL is still prepared therefore leaves the
+    // predecessor scope beside the predecessor token instead of making an old
+    // production credential readable under a staging scope (or vice versa).
     return transaction;
   } catch (error) {
     if (tokenPersisted) {
@@ -625,12 +657,26 @@ export interface StewardTokenWriteAuthority {
  * are already canonical. A false value must clear the staged successor
  * fail-closed instead of installing a predecessor beside a still-current token.
  */
-export type StewardTokenPublicationRollback = (
+export type StewardTokenPublicationRollback = ((
   durableRestored: boolean,
-) => void;
+) => void) & {
+  /** Restore durable ambiguity proof before any awaited token compensation. */
+  beforeDurableRestore?: () => void;
+};
+
+interface PreparedStewardTokenPublicationRollback {
+  afterDurableRestore(durableRestored: boolean): void;
+  beforeDurableRestore(): void;
+}
 
 export interface StewardTokenWriteOptions {
   signal?: AbortSignal;
+  /**
+   * Opaque capability interpreted only by the installed host persistence
+   * adapter. The Electrobun adapter uses an identity-branded transaction
+   * handle so an unrelated writer cannot join an ambient connection WAL.
+   */
+  hostPersistenceContext?: unknown;
   /**
    * Revalidates the caller's external authority after every awaited durable
    * boundary and immediately before publishing `present`. Returning false
@@ -655,19 +701,27 @@ export interface StewardTokenWriteOptions {
 
 function oneShotPublicationRollback(
   rollback: StewardTokenPublicationRollback | undefined,
-): StewardTokenPublicationRollback | null {
+): PreparedStewardTokenPublicationRollback | null {
   if (!rollback) return null;
-  let completed = false;
-  return (durableRestored) => {
-    if (completed) return;
-    completed = true;
-    rollback(durableRestored);
+  let beforeCompleted = false;
+  let afterCompleted = false;
+  return {
+    beforeDurableRestore() {
+      if (beforeCompleted) return;
+      rollback.beforeDurableRestore?.();
+      beforeCompleted = true;
+    },
+    afterDurableRestore(durableRestored) {
+      if (afterCompleted) return;
+      rollback(durableRestored);
+      afterCompleted = true;
+    },
   };
 }
 
 function synchronousPublicationRollback(
   value: unknown,
-): StewardTokenPublicationRollback | null {
+): PreparedStewardTokenPublicationRollback | null {
   if (
     value !== null &&
     typeof value === "object" &&
@@ -694,50 +748,60 @@ async function compensateUnpublishedStewardTokenWrite(
   restorePredecessor?:
     | ((validate?: StewardTokenWriteValidator) => Promise<boolean>)
     | null,
-  rollbackPublication?: StewardTokenPublicationRollback | null,
+  rollbackPublication?: PreparedStewardTokenPublicationRollback | null,
 ): Promise<void> {
   const failures: unknown[] = [];
   let canonicalPredecessorRestored = false;
+  let durableRestoreAllowed = true;
   try {
-    const restored = restorePredecessor
-      ? await restorePredecessor()
-      : await compareAndRestoreStoredStewardToken(token, previousToken);
-    const currentToken = window.localStorage.getItem(STEWARD_TOKEN_KEY);
-    if (!restored && currentToken === token) {
-      throw new Error("Protected Steward token rollback lost authority.");
-    }
-    if (
-      restored &&
-      currentToken === previousToken &&
-      requiredScope &&
-      window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY) === requiredScope
-    ) {
-      if (previousScope === null) {
-        window.localStorage.removeItem(STEWARD_TOKEN_SCOPE_KEY);
-      } else {
-        window.localStorage.setItem(STEWARD_TOKEN_SCOPE_KEY, previousScope);
-      }
-    }
-    canonicalPredecessorRestored =
-      restored &&
-      window.localStorage.getItem(STEWARD_TOKEN_KEY) === previousToken &&
-      (!requiredScope ||
-        window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY) === previousScope);
-    if (canonicalPredecessorRestored) {
-      advanceStewardTokenMutationAuthority();
-    }
+    rollbackPublication?.beforeDurableRestore();
   } catch (error) {
     failures.push(error);
+    durableRestoreAllowed = false;
   }
-  // Restore canonical durable state before reverting the staged live/client
-  // pair. A listener can therefore never observe a predecessor client while
-  // the unpublished successor is still canonical. The rollback remains
-  // best-effort even when durable compensation fails so callers fail closed
-  // instead of leaving the staged client authoritative in memory.
-  try {
-    rollbackPublication?.(canonicalPredecessorRestored);
-  } catch (error) {
-    failures.push(error);
+  if (durableRestoreAllowed) {
+    try {
+      const restored = restorePredecessor
+        ? await restorePredecessor()
+        : await compareAndRestoreStoredStewardToken(token, previousToken);
+      const currentToken = window.localStorage.getItem(STEWARD_TOKEN_KEY);
+      if (!restored && currentToken === token) {
+        throw new Error("Protected Steward token rollback lost authority.");
+      }
+      if (
+        restored &&
+        currentToken === previousToken &&
+        requiredScope &&
+        window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY) === requiredScope
+      ) {
+        if (previousScope === null) {
+          window.localStorage.removeItem(STEWARD_TOKEN_SCOPE_KEY);
+        } else {
+          window.localStorage.setItem(STEWARD_TOKEN_SCOPE_KEY, previousScope);
+        }
+      }
+      canonicalPredecessorRestored =
+        restored &&
+        window.localStorage.getItem(STEWARD_TOKEN_KEY) === previousToken &&
+        (!requiredScope ||
+          window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY) ===
+            previousScope);
+      if (canonicalPredecessorRestored) {
+        advanceStewardTokenMutationAuthority();
+      }
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (durableRestoreAllowed) {
+    // Durable ambiguity markers have already been restored above. Revert the
+    // staged live/client pair only after canonical token compensation so no
+    // listener can observe a predecessor client beside successor bytes.
+    try {
+      rollbackPublication?.afterDurableRestore(canonicalPredecessorRestored);
+    } catch (error) {
+      failures.push(error);
+    }
   }
   if (failures.length === 1) {
     throw new StewardTokenPersistenceError(failures[0]);
@@ -761,7 +825,7 @@ function publishedWriteAuthority(
     | ((validate?: StewardTokenWriteValidator) => Promise<boolean>)
     | null,
   writeAuthority: symbol,
-  rollbackPublication: StewardTokenPublicationRollback | null,
+  rollbackPublication: PreparedStewardTokenPublicationRollback | null,
 ): StewardTokenWriteAuthority {
   let restoration: Promise<boolean> | null = null;
   let pendingRestoredState: StewardSessionChangeDetail["state"] | null = null;
@@ -789,10 +853,19 @@ function publishedWriteAuthority(
         }
         const failures: unknown[] = [];
         let restored = false;
+        let durableRestoreAllowed = true;
         try {
-          restored = await exactRestore(options?.validate);
+          rollbackPublication?.beforeDurableRestore();
         } catch (error) {
           failures.push(error);
+          durableRestoreAllowed = false;
+        }
+        if (durableRestoreAllowed) {
+          try {
+            restored = await exactRestore(options?.validate);
+          } catch (error) {
+            failures.push(error);
+          }
         }
         if (restored) {
           advanceStewardTokenMutationAuthority();
@@ -823,11 +896,13 @@ function publishedWriteAuthority(
           (!requiredScope ||
             window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY) ===
               previousScope);
-        try {
-          rollbackPublication?.(coherentPredecessor);
-        } catch (error) {
-          failures.push(error);
-          coherentPredecessor = false;
+        if (durableRestoreAllowed) {
+          try {
+            rollbackPublication?.afterDurableRestore(coherentPredecessor);
+          } catch (error) {
+            failures.push(error);
+            coherentPredecessor = false;
+          }
         }
         coherentPredecessor =
           coherentPredecessor &&
@@ -923,6 +998,7 @@ export async function writeStoredStewardToken(
       requiredScope,
       previousToken,
       previousScope,
+      options?.hostPersistenceContext,
     );
     const abortedAfterPersistence = options?.signal?.aborted === true;
     const validAfterPersistence = options?.validate?.() !== false;
@@ -943,7 +1019,29 @@ export async function writeStoredStewardToken(
       // below because another tab can synchronously plant a durable intent
       // while the host RPC itself is awaiting its response.
       await transaction?.commit(options?.validate);
+      if (
+        requiredScope &&
+        window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY) !== requiredScope
+      ) {
+        window.localStorage.setItem(STEWARD_TOKEN_SCOPE_KEY, requiredScope);
+      }
     } catch (error) {
+      try {
+        await compensateUnpublishedStewardTokenWrite(
+          token,
+          previousToken,
+          requiredScope,
+          previousScope,
+          transaction?.restorePredecessor,
+        );
+      } catch (compensationError) {
+        throw new StewardTokenPersistenceError(
+          new AggregateError(
+            [error, compensationError],
+            "Steward token commit and compensation both failed.",
+          ),
+        );
+      }
       throw new StewardTokenPersistenceError(error);
     }
     // Receipt acknowledgement can itself await a renderer/host RPC. A newer
@@ -964,7 +1062,8 @@ export async function writeStoredStewardToken(
       options?.signal?.throwIfAborted();
     }
     const writeAuthority = advanceStewardTokenMutationAuthority();
-    let rollbackPublication: StewardTokenPublicationRollback | null = null;
+    let rollbackPublication: PreparedStewardTokenPublicationRollback | null =
+      null;
     try {
       rollbackPublication = synchronousPublicationRollback(
         options?.finalizeBeforePublish?.(),
@@ -1092,7 +1191,29 @@ export async function replaceStoredStewardTokenIfCurrent(
     }
     try {
       await transaction?.commit(options?.validate);
+      if (
+        requiredScope &&
+        window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY) !== requiredScope
+      ) {
+        window.localStorage.setItem(STEWARD_TOKEN_SCOPE_KEY, requiredScope);
+      }
     } catch (error) {
+      try {
+        await compensateUnpublishedStewardTokenWrite(
+          token,
+          previousToken,
+          requiredScope,
+          previousScope,
+          transaction?.restorePredecessor,
+        );
+      } catch (compensationError) {
+        throw new StewardTokenPersistenceError(
+          new AggregateError(
+            [error, compensationError],
+            "Steward token replacement and compensation both failed.",
+          ),
+        );
+      }
       throw new StewardTokenPersistenceError(error);
     }
     if (options?.validate?.() === false) {
@@ -1162,12 +1283,13 @@ export async function clearStoredStewardToken(
 }
 
 /**
- * Returns true when the non-HttpOnly `steward-authed=1` marker cookie is
- * present. The JWT cookie itself is HttpOnly, so JS uses this hint to know
- * "there is a server session" without ever touching the token.
+ * Returns true only when the exact non-HttpOnly v2 authority marker is `1`.
+ * Legacy v1 markers never authorize automatic refresh, and duplicate exact
+ * marker names fail closed instead of inheriting cookie-header ordering.
  */
 export function stewardAuthedCookieName(environment?: string | null): string {
   const env = environment?.trim();
+  if (env === "local") return `${LOCAL_STEWARD_AUTHED_COOKIE}-local`;
   if (!env || env === "production") return STEWARD_AUTHED_COOKIE;
   return `${STEWARD_AUTHED_COOKIE}-${env}`;
 }
@@ -1176,9 +1298,17 @@ function inferStewardCookieEnvironment(): string | null {
   if (typeof window === "undefined") return null;
   const hostname = window.location.hostname.toLowerCase();
   if (
+    hostname === "localhost" ||
+    hostname === "127.0.0.1" ||
+    hostname === "[::1]"
+  ) {
+    return "local";
+  }
+  if (
     hostname === "staging.eliza.app" ||
     hostname === "cloud-staging.eliza.app" ||
     hostname === "api-staging.eliza.app" ||
+    hostname === "develop.eliza-app.pages.dev" ||
     hostname === "staging.elizacloud.ai" ||
     hostname === "app-staging.elizacloud.ai" ||
     hostname === "api-staging.elizacloud.ai"
@@ -1197,23 +1327,38 @@ function inferStewardCookieEnvironment(): string | null {
 
 export function hasStewardAuthedCookie(environment?: string | null): boolean {
   if (typeof document === "undefined") return false;
-  const cookieName = stewardAuthedCookieName(
-    environment ?? inferStewardCookieEnvironment(),
-  );
-  return document.cookie
-    .split(";")
-    .some((part) => part.trim().startsWith(`${cookieName}=1`));
+  const resolvedEnvironment = environment ?? inferStewardCookieEnvironment();
+  const expectedName = stewardAuthedCookieName(resolvedEnvironment);
+  let value: string | undefined;
+  let matches = 0;
+  for (const part of document.cookie.split(";")) {
+    const trimmed = part.trim();
+    const separator = trimmed.indexOf("=");
+    if (separator < 0) continue;
+    if (trimmed.slice(0, separator) !== expectedName) continue;
+    matches += 1;
+    value = trimmed.slice(separator + 1);
+  }
+  return matches === 1 && value === "1";
 }
 
 // ---------------------------------------------------------------------------
 // Network helpers
 // ---------------------------------------------------------------------------
 
-async function readErrorBody(
-  response: Response,
-): Promise<{ error?: string; code?: string } | null> {
+async function readErrorBody(response: Response): Promise<{
+  error?: string;
+  code?: string;
+  retryAfterSeconds?: number;
+  retryAtEpochSeconds?: number;
+} | null> {
   try {
-    return (await response.json()) as { error?: string; code?: string };
+    return (await response.json()) as {
+      error?: string;
+      code?: string;
+      retryAfterSeconds?: number;
+      retryAtEpochSeconds?: number;
+    };
   } catch {
     return null;
   }
@@ -1232,7 +1377,8 @@ export async function syncStewardSession(
   const endpoint = opts.endpoint ?? STEWARD_SESSION_ENDPOINT;
   const f = opts.fetchImpl ?? fetch;
   // Refresh tokens now live exclusively in the HttpOnly
-  // `steward-refresh-token` cookie. We forward whatever the caller passes
+  // host-bound `__Host-steward-refresh-token-v2` cookie. We forward whatever
+  // the caller passes
   // (e.g. the value still arriving in a legacy URL fragment during the
   // rollout window) so the server can set the cookie on first login, but we
   // do NOT read it back from localStorage — that path is being removed.
@@ -1256,6 +1402,10 @@ export async function syncStewardSession(
       errBody?.error || "Could not establish an Eliza Cloud session.",
       response.status,
       errBody?.code ?? null,
+      {
+        retryAfterSeconds: errBody?.retryAfterSeconds,
+        retryAtEpochSeconds: errBody?.retryAtEpochSeconds,
+      },
     );
   }
   return (await response.json()) as StewardSessionResponse;
@@ -1339,6 +1489,10 @@ export async function exchangeStewardCode(
       errBody?.error || "Could not complete Eliza Cloud sign-in.",
       response.status,
       errBody?.code ?? null,
+      {
+        retryAfterSeconds: errBody?.retryAfterSeconds,
+        retryAtEpochSeconds: errBody?.retryAtEpochSeconds,
+      },
     );
   }
   return (await response.json()) as StewardNonceExchangeResponse;

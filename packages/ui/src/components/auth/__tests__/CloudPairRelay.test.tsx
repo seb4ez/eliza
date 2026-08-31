@@ -234,6 +234,79 @@ describe("CloudPairRelay", () => {
     ).toEqual(expect.objectContaining({ apiToken: "agent-key" }));
   });
 
+  it.each([3, 4, 5, 6])(
+    "compensates scoped bytes without resurrecting a terminal legacy deletion at validation %i",
+    async (failAtValidation) => {
+      const scoped = cloudPairTokenKeyForAgent("agent-123");
+      window.localStorage.setItem(CLOUD_PAIR_LOCAL_STORAGE_KEY, "legacy-a");
+      window.sessionStorage.setItem(CLOUD_PAIR_SESSION_STORAGE_KEY, "legacy-a");
+      let validations = 0;
+
+      await expect(
+        persistCloudPairApiToken("new-account-a", "agent-123", {
+          publishSession: false,
+          validate: () => {
+            validations += 1;
+            return validations < failAtValidation;
+          },
+        }),
+      ).rejects.toMatchObject({ name: "AbortError" });
+
+      expect(window.localStorage.getItem(scoped)).toBeNull();
+      expect(window.sessionStorage.getItem(scoped)).toBeNull();
+      expect(window.localStorage.getItem(CLOUD_PAIR_LOCAL_STORAGE_KEY)).toBe(
+        failAtValidation >= 6 ? null : "legacy-a",
+      );
+      expect(
+        window.sessionStorage.getItem(CLOUD_PAIR_SESSION_STORAGE_KEY),
+      ).toBe(failAtValidation >= 5 ? null : "legacy-a");
+      expect(getBootConfig().apiToken).toBeUndefined();
+    },
+  );
+
+  it("does not resurrect legacy A when compensation observes the ABA-ambiguous null left by B", async () => {
+    const scoped = cloudPairTokenKeyForAgent("agent-123");
+    window.localStorage.setItem(scoped, "previous-local");
+    window.sessionStorage.setItem(scoped, "previous-session");
+    window.localStorage.setItem(CLOUD_PAIR_LOCAL_STORAGE_KEY, "legacy-local");
+    window.sessionStorage.setItem(
+      CLOUD_PAIR_SESSION_STORAGE_KEY,
+      "legacy-session",
+    );
+    let compensate: (() => Promise<void>) | null = null;
+
+    await persistCloudPairApiToken("new-account-a", "agent-123", {
+      publishSession: false,
+      validate: () => true,
+      captureCompensation: (rollback) => {
+        compensate = rollback;
+      },
+    });
+
+    expect(window.localStorage.getItem(scoped)).toBe("new-account-a");
+    expect(window.sessionStorage.getItem(scoped)).toBe("new-account-a");
+    expect(
+      window.localStorage.getItem(CLOUD_PAIR_LOCAL_STORAGE_KEY),
+    ).toBeNull();
+    expect(
+      window.sessionStorage.getItem(CLOUD_PAIR_SESSION_STORAGE_KEY),
+    ).toBeNull();
+    const rollback = compensate as (() => Promise<void>) | null;
+    expect(rollback).toEqual(expect.any(Function));
+    await rollback?.();
+
+    expect(window.localStorage.getItem(scoped)).toBe("previous-local");
+    expect(window.sessionStorage.getItem(scoped)).toBe("previous-session");
+    // B intentionally leaves the migrated legacy slot absent. Null carries no
+    // revision, so compensation must never infer that A still owns it.
+    expect(
+      window.localStorage.getItem(CLOUD_PAIR_LOCAL_STORAGE_KEY),
+    ).toBeNull();
+    expect(
+      window.sessionStorage.getItem(CLOUD_PAIR_SESSION_STORAGE_KEY),
+    ).toBeNull();
+  });
+
   it("refuses to persist a token without an owning agent id", async () => {
     await expect(persistCloudPairApiToken("agent-key", "  ")).rejects.toThrow(
       /owner agent id/,

@@ -2,16 +2,15 @@
  * POST /api/auth/steward-session availability scoping during an SSO
  * logout-marker STORE outage, through the real route module with the marker
  * service mocked to throw (what the repository read does when Postgres is
- * unreachable). Bridge-issued tokens (`bridged` claim, stamped by the
- * sso-bridge exchange re-mint) must fail CLOSED with the bridge legs' 503
- * `sso_unavailable` and plant no cookies; ordinary tokens must never touch
- * the marker store at all and keep minting — the pre-bridge no-datastore
- * availability posture the Redis-outage suite pins.
+ * unreachable). Every Steward token must fail CLOSED with the bridge legs'
+ * 503 `sso_unavailable` and plant no cookies: a direct token can survive on
+ * the paired host after logout just as a bridge-issued token can.
  */
 
 import { beforeEach, describe, expect, mock, test } from "bun:test";
-import { STEWARD_SESSION_MUTATION_PROTOCOL_VALUE } from "@elizaos/shared/steward-session-client";
+import { STEWARD_CSRF_HEADER_VALUE } from "@elizaos/shared/steward-session-client";
 import { Hono } from "hono";
+import { STEWARD_REFRESH_AUTHORITY_TTL_SECONDS } from "@/lib/auth/steward-cookies";
 
 const emitAudit = mock(async () => undefined);
 const verifyStewardTokenCached = mock(async (_env: unknown, token: string) => {
@@ -51,6 +50,7 @@ mock.module("@/api-app/services/audit-dispatcher-singleton", () => ({
 }));
 
 mock.module("@/lib/auth/steward-client", () => ({
+  STEWARD_VERIFY_CLOCK_SKEW_SECONDS: 300,
   verifyStewardTokenCached,
 }));
 
@@ -63,6 +63,10 @@ mock.module("@/lib/steward-sync", () => ({
 }));
 
 mock.module("@/lib/services/sso-bridge-codes", () => ({
+  classifySsoBridgeLogout: async (userId: string, issuedAt: number) =>
+    (await isBlockedBySsoBridgeLogout(userId, issuedAt))
+      ? { status: "definitely_revoked" as const }
+      : { status: "allowed" as const },
   isBlockedBySsoBridgeLogout,
 }));
 
@@ -97,8 +101,9 @@ function postStewardSession(body: unknown, cookie?: string) {
       headers: {
         "cf-connecting-ip": `203.0.113.${ipCounter}`,
         "content-type": "application/json",
-        origin: "https://staging.elizacloud.ai",
-        "x-eliza-csrf": STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+        origin: "https://staging.eliza.app",
+        "sec-fetch-site": "same-origin",
+        "x-eliza-csrf": STEWARD_CSRF_HEADER_VALUE,
         ...(cookie ? { cookie } : {}),
       },
       body: JSON.stringify(body),
@@ -126,22 +131,21 @@ describe("POST /api/auth/steward-session — logout-marker store outage", () => 
     expect(syncUserFromSteward).not.toHaveBeenCalled();
   });
 
-  test("an ORDINARY token never touches the marker store and still mints", async () => {
+  test("an ORDINARY token also fails closed while global logout authority is unavailable", async () => {
     const res = await postStewardSession({ token: "plain-token" });
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(503);
     await expect(res.json()).resolves.toMatchObject({
-      ok: true,
-      userId: "cloud-user-1",
-      stewardUserId: "steward-user-1",
+      code: "sso_unavailable",
     });
-    expect(res.headers.get("set-cookie") ?? "").toContain(
-      "steward-token-staging=plain-token",
-    );
-    expect(isBlockedBySsoBridgeLogout).not.toHaveBeenCalled();
+    expect(res.headers.get("set-cookie")).toBeNull();
+    expect(isBlockedBySsoBridgeLogout).toHaveBeenCalledTimes(1);
+    expect(syncUserFromSteward).not.toHaveBeenCalled();
   });
 
   test("an access-only bridge login removes an older refresh cookie", async () => {
-    isBlockedBySsoBridgeLogout.mockResolvedValueOnce(false);
+    isBlockedBySsoBridgeLogout
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false);
 
     const res = await postStewardSession(
       { token: "bridged-token" },
@@ -156,9 +160,35 @@ describe("POST /api/auth/steward-session — logout-marker store outage", () => 
     expect(deleted).toContain("steward-refresh-token-staging");
     expect(deleted).not.toContain("steward-refresh-token");
     expect(cookies.join("\n")).toContain("steward-token-staging=bridged-token");
+    expect(
+      cookies.find((cookie) =>
+        cookie.startsWith("steward-token-staging=bridged-token"),
+      ),
+    ).toContain(`Max-Age=${STEWARD_REFRESH_AUTHORITY_TTL_SECONDS}`);
+    expect(isBlockedBySsoBridgeLogout).toHaveBeenCalledTimes(2);
+  });
+
+  test("a logout stamped during sync blocks the final cookie emission", async () => {
+    isBlockedBySsoBridgeLogout
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+
+    const res = await postStewardSession({ token: "bridged-token" });
+
+    expect(res.status).toBe(401);
+    await expect(res.json()).resolves.toMatchObject({
+      code: "session_ended",
+    });
+    expect(res.headers.get("set-cookie")).toBeNull();
+    expect(syncUserFromSteward).toHaveBeenCalledTimes(1);
+    expect(isBlockedBySsoBridgeLogout).toHaveBeenCalledTimes(2);
   });
 
   test("an access-only account switch removes the prior identity's refresh cookie", async () => {
+    isBlockedBySsoBridgeLogout
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false);
+
     const res = await postStewardSession(
       { token: "different-user-token" },
       "steward-token-staging=plain-token; steward-refresh-token-staging=stale-refresh",
@@ -170,7 +200,7 @@ describe("POST /api/auth/steward-session — logout-marker store outage", () => 
       .filter((cookie) => /Max-Age=0/i.test(cookie))
       .map((cookie) => cookie.split("=")[0]);
     expect(deleted).toEqual(["steward-refresh-token-staging"]);
-    expect(isBlockedBySsoBridgeLogout).not.toHaveBeenCalled();
+    expect(isBlockedBySsoBridgeLogout).toHaveBeenCalledTimes(2);
   });
 
   test.each([
@@ -180,6 +210,10 @@ describe("POST /api/auth/steward-session — logout-marker store outage", () => 
   ])(
     "an access-only login removes a stale refresh when the prior access is %s",
     async (_label, priorAccessToken) => {
+      isBlockedBySsoBridgeLogout
+        .mockResolvedValueOnce(false)
+        .mockResolvedValueOnce(false);
+
       const priorCookies = [
         priorAccessToken ? `steward-token-staging=${priorAccessToken}` : null,
         "steward-refresh-token-staging=stale-refresh-a",
@@ -201,11 +235,15 @@ describe("POST /api/auth/steward-session — logout-marker store outage", () => 
       expect(res.headers.getSetCookie().join("\n")).toContain(
         "steward-token-staging=different-user-token",
       );
-      expect(isBlockedBySsoBridgeLogout).not.toHaveBeenCalled();
+      expect(isBlockedBySsoBridgeLogout).toHaveBeenCalledTimes(2);
     },
   );
 
   test("an ordinary same-identity passive sync preserves its refresh cookie", async () => {
+    isBlockedBySsoBridgeLogout
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false);
+
     const res = await postStewardSession(
       { token: "plain-token" },
       "steward-token-staging=plain-token; steward-refresh-token-staging=live-refresh",

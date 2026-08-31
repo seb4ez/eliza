@@ -58,20 +58,43 @@ export class SsoBridgeRepository {
   }
 
   /**
-   * Stamp "this user explicitly logged out at `at`". Upsert keeps one row per
-   * user; GREATEST means the marker only ever moves forward, so a delayed or
-   * replayed stamp can never rewind a newer logout.
+   * Stamp "this user explicitly logged out now" using the primary database's
+   * clock at the effective write. Using `clock_timestamp()` in both branches
+   * matters when an upsert waits on a conflicting row lock: the marker must be
+   * newer than tokens issued while that write was pending. GREATEST keeps the
+   * marker monotonic. RETURNING also exposes an independent database clock for
+   * cleanup: a legacy marker anomalously in the future must not advance the
+   * global retention cutoff for other users.
    */
-  async stampLogout(stewardUserId: string, at: Date = new Date()): Promise<void> {
-    await dbWrite
+  async stampLogout(stewardUserId: string): Promise<{ loggedOutAt: Date; databaseNow: Date }> {
+    const [marker] = await dbWrite
       .insert(ssoBridgeLogoutMarkers)
-      .values({ steward_user_id: stewardUserId, logged_out_at: at })
+      .values({
+        steward_user_id: stewardUserId,
+        logged_out_at: sql<Date>`clock_timestamp()`,
+      })
       .onConflictDoUpdate({
         target: ssoBridgeLogoutMarkers.steward_user_id,
         set: {
-          logged_out_at: sql`GREATEST(${ssoBridgeLogoutMarkers.logged_out_at}, excluded.logged_out_at)`,
+          logged_out_at: sql<Date>`GREATEST(${ssoBridgeLogoutMarkers.logged_out_at}, clock_timestamp())`,
         },
+      })
+      .returning({
+        loggedOutAt: ssoBridgeLogoutMarkers.logged_out_at,
+        databaseNow: sql<Date | string>`clock_timestamp()`,
       });
+
+    if (!marker) {
+      throw new Error("SsoBridgeRepository: failed to stamp logout marker");
+    }
+    // Raw SQL expressions are decoded as strings by PGlite (and may be by
+    // other Postgres drivers), unlike the schema-backed timestamp column.
+    const databaseNow =
+      marker.databaseNow instanceof Date ? marker.databaseNow : new Date(marker.databaseNow);
+    if (!Number.isFinite(databaseNow.getTime())) {
+      throw new Error("SsoBridgeRepository: primary database clock is unavailable");
+    }
+    return { loggedOutAt: marker.loggedOutAt, databaseNow };
   }
 
   /** Read the user's logout marker; throws on backend failure (callers fail closed). */
@@ -98,8 +121,9 @@ export class SsoBridgeRepository {
   }
 
   /**
-   * Drop markers older than `olderThan`. A marker only needs to outlive the
-   * access-token lifetime — every pre-logout token has expired by then.
+   * Drop markers older than the service-provided cutoff. That cutoff outlives
+   * both the access-token lifetime and the verifier's expiry tolerance, so no
+   * still-accepted pre-logout token can survive its marker.
    */
   async purgeLogoutMarkersOlderThan(olderThan: Date): Promise<number> {
     const purged = await dbWrite

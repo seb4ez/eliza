@@ -16,7 +16,6 @@ import {
   RefreshCw,
   Trash2,
 } from "lucide-react";
-import { getCloudAuthToken } from "../../api/client-cloud";
 import { loadPersistedActiveServer } from "../../state/persistence";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
@@ -26,6 +25,7 @@ import {
   statusToneForState,
 } from "../ui/status-badge.helpers";
 import { useCloudAgentManagement } from "./cloud-panel/cloud-agent-management-pattern";
+import { currentCloudManagementToken } from "./cloud-panel/cloud-management-auth";
 import { SettingsGroup, SettingsRow, SettingsStack } from "./settings-layout";
 
 /** Maximum length accepted for a (new or edited) cloud agent name. */
@@ -63,10 +63,7 @@ function _activeCloudAgentId(): string | null {
 
 /** The cloud access token for the current session. */
 function currentCloudToken(): string {
-  // Agent management crosses the control-plane boundary, so only the
-  // independently stored Steward session is admissible. The active server's
-  // access token authenticates its container and must never substitute here.
-  return getCloudAuthToken() ?? "";
+  return currentCloudManagementToken();
 }
 
 /**

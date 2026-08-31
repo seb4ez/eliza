@@ -90,16 +90,6 @@ export interface RunAgentSessionRecoveryDeps {
     apiToken: string,
     agentId: string,
   ) => void | Promise<void>;
-  /**
-   * OPT-IN purge for terminal mint/exchange outcomes (#16666). Those outcomes
-   * alone prove nothing about the durable agent bearer, so there is
-   * deliberately NO default: only a caller that independently observed the
-   * adopted dedicated-agent bearer rejected (for example `/api/auth/me` 401
-   * `remote_auth_required`) may supply a purge. It should be
-   * `clearStalePairCredentialsForAgent(agentId)` so deletion stays scoped to
-   * the proven credential. Generic pairing callers omit it.
-   */
-  clearStalePairCredentials?: () => void;
   /** Rejects any late response or side effect that belongs to an old target. */
   isRecoveryTargetCurrent?: () => boolean;
   /**
@@ -217,7 +207,6 @@ export async function runAgentSessionRecovery(
         cloudApiBase,
       }),
     persistPairApiToken = persistCloudPairApiToken,
-    clearStalePairCredentials,
     isRecoveryTargetCurrent,
     commitPairedInProcess,
     onPairedInProcess,
@@ -278,11 +267,10 @@ export async function runAgentSessionRecovery(
 
     if (res.status === 401) {
       // Cloud rejected the credential, so the caller may require a fresh login.
-      // The purge remains opt-in: this response proves only the STEWARD
-      // credential was refused; callers that separately observed the adopted
-      // agent bearer fail may remove that scoped credential (#16666).
-      // Network-shaped failures deliberately do not reach this branch.
-      clearStalePairCredentials?.();
+      // Classification is deliberately side-effect free. The owning hook may
+      // purge its independently-proven stale agent bearer only after it has
+      // revalidated account generation + same-agent ownership. Purging here
+      // would invalidate the runner guard before fallback publication.
       return {
         ok: false,
         reason: "unauthorized",
@@ -298,9 +286,8 @@ export async function runAgentSessionRecovery(
     if (requiresCloudManagement) {
       // These responses prove the account/agent needs attention, not that the
       // Cloud bearer is invalid. Preserve Cloud auth and route the user to the
-      // management surface. The opt-in agent-bearer purge is still safe because
-      // the caller independently observed that dedicated bearer rejected.
-      clearStalePairCredentials?.();
+      // management surface. Credential cleanup belongs to the owning hook,
+      // after this result is classified and its generation fence is re-read.
       return {
         ok: false,
         reason: "manage-required",
@@ -339,7 +326,6 @@ export async function runAgentSessionRecovery(
           // A managed URL without a pair token means the sandbox has no usable
           // ELIZA_API_TOKEN. Reloading cannot repair that configuration; keep
           // Cloud auth and send the user to the management recovery surface.
-          clearStalePairCredentials?.();
           return {
             ok: false,
             reason: "manage-required",
@@ -379,12 +365,6 @@ export async function runAgentSessionRecovery(
           // recovery category. Unknown/network/storage failures stay retryable
           // and cannot invalidate the Cloud credential.
           const failure = classifyNativePairExchangeError(err);
-          if (
-            failure.reason === "unauthorized" ||
-            failure.reason === "manage-required"
-          ) {
-            clearStalePairCredentials?.();
-          }
           return failure;
         }
       }

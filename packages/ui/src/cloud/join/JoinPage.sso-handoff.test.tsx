@@ -2,16 +2,19 @@
 // @vitest-environment jsdom
 // @vitest-environment-options {"url": "https://cloud.eliza.app/join"}
 
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { appModeNavigation } from "../app-mode/app-mode";
 import { markSsoLoggedOut } from "../sso-bridge/sso-bridge";
 
-const { authenticatedRef, runJoinFlowMock } = vi.hoisted(() => ({
-  authenticatedRef: { current: false },
-  runJoinFlowMock: vi.fn(),
-}));
+const { authenticatedRef, publishHandoffMock, runJoinFlowMock, tokenRef } =
+  vi.hoisted(() => ({
+    authenticatedRef: { current: false },
+    publishHandoffMock: vi.fn(),
+    runJoinFlowMock: vi.fn(),
+    tokenRef: { current: "steward-token" },
+  }));
 
 vi.mock("react-router-dom", () => ({
   Navigate: ({ to }: { to: string }) => <div data-testid="navigate">{to}</div>,
@@ -21,6 +24,7 @@ vi.mock("./lib/use-join-session", () => ({
   useJoinSessionAuth: () => ({
     ready: true,
     authenticated: authenticatedRef.current,
+    authToken: authenticatedRef.current ? tokenRef.current : null,
   }),
 }));
 
@@ -29,8 +33,12 @@ vi.mock("./lib/run-join-flow", () => ({
 }));
 
 vi.mock("./lib/resolve-cloud-connection", () => ({
-  resolveJoinAuthToken: () => "steward-token",
+  resolveJoinAuthToken: () => tokenRef.current,
   resolveJoinCloudApiBase: () => "https://api.eliza.app",
+}));
+
+vi.mock("../app-mode/use-personal-entry", () => ({
+  publishPersonalEntryHandoff: publishHandoffMock,
 }));
 
 vi.mock("../shell/CloudI18nProvider", () => ({
@@ -47,6 +55,9 @@ let assignedUrls: string[];
 
 beforeEach(() => {
   authenticatedRef.current = false;
+  tokenRef.current = "steward-token";
+  localStorage.setItem("steward_session_token", tokenRef.current);
+  publishHandoffMock.mockReset();
   runJoinFlowMock.mockReset();
   replacedUrls = [];
   assignedUrls = [];
@@ -135,5 +146,59 @@ describe("JoinPage managed-app SSO handoff", () => {
 
     await waitFor(() => expect(runJoinFlowMock).toHaveBeenCalledTimes(2));
     expect((await screen.findByTestId("navigate")).textContent).toBe("/");
+  });
+
+  it("restarts for token B and suppresses every late publication from token A", async () => {
+    authenticatedRef.current = true;
+    let finishA: ((value: { agentId: string }) => void) | null = null;
+    let finishB: ((value: { agentId: string }) => void) | null = null;
+    let accountAProgress: ((status: string, detail?: string) => void) | null =
+      null;
+    runJoinFlowMock
+      .mockImplementationOnce(
+        ({
+          onProgress,
+        }: {
+          onProgress: (status: string, detail?: string) => void;
+        }) => {
+          accountAProgress = onProgress;
+          return new Promise((resolve) => {
+            finishA = resolve;
+          });
+        },
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishB = resolve;
+          }),
+      );
+
+    const view = render(<JoinPage />);
+    await waitFor(() => expect(runJoinFlowMock).toHaveBeenCalledTimes(1));
+
+    tokenRef.current = "steward-token-b";
+    localStorage.setItem("steward_session_token", tokenRef.current);
+    view.rerender(<JoinPage />);
+
+    await waitFor(() => expect(runJoinFlowMock).toHaveBeenCalledTimes(2));
+    expect(runJoinFlowMock.mock.calls[0]?.[0].validateAuthority()).toBe(false);
+    expect(runJoinFlowMock.mock.calls[1]?.[0].validateAuthority()).toBe(true);
+    await act(async () => {
+      finishB?.({ agentId: "agent-b" });
+    });
+    expect((await screen.findByTestId("navigate")).textContent).toBe("/");
+
+    await act(async () => {
+      accountAProgress?.("connecting", "Wrong account A");
+      finishA?.({ agentId: "agent-a" });
+    });
+
+    expect(publishHandoffMock).toHaveBeenCalledTimes(1);
+    expect(publishHandoffMock).toHaveBeenCalledWith(
+      "steward-token-b",
+      expect.objectContaining({ agentId: "agent-b" }),
+    );
+    expect(screen.queryByText("Wrong account A")).toBeNull();
   });
 });

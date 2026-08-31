@@ -3,6 +3,7 @@
 
 import {
   STEWARD_CSRF_HEADER,
+  STEWARD_SESSION_CHANGE_EVENT,
   STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
   STEWARD_TOKEN_KEY,
 } from "@elizaos/shared/steward-session-client";
@@ -369,6 +370,39 @@ describe("mintSsoCode", () => {
     });
   });
 
+  it("burns a delayed mint code instead of exposing account A after login B starts", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, liveToken());
+    const mintResponse = deferred<Response>();
+    const calls: string[] = [];
+    const fetchFn = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      calls.push(url);
+      return calls.length === 1
+        ? mintResponse.promise
+        : Promise.resolve(json(401, { error: "invalid_verifier" }));
+    }) as typeof fetch;
+
+    const mint = mintSsoCode("eliza.app", CHALLENGE, fetchFn);
+    await vi.waitFor(() => expect(fetchFn).toHaveBeenCalledOnce());
+    const loginB = beginStewardSessionRecovery("elizacloud", "provider");
+    localStorage.setItem(STEWARD_TOKEN_KEY, "account-b-token");
+    mintResponse.resolve(json(200, { ok: true, code: CODE }));
+
+    try {
+      await expect(mint).resolves.toEqual({
+        ok: false,
+        error: "SSO mint was superseded",
+      });
+      await vi.waitFor(() => expect(fetchFn).toHaveBeenCalledTimes(2));
+      expect(calls).toEqual([
+        "https://eliza.app/api/auth/sso-bridge/mint",
+        "https://eliza.app/api/auth/sso-bridge/exchange",
+      ]);
+    } finally {
+      completeStewardSessionRecovery(loginB);
+    }
+  });
+
   it("refuses a malformed challenge without calling out", async () => {
     localStorage.setItem(STEWARD_TOKEN_KEY, liveToken());
     const { fn, calls } = fetchStub(() => json(200, { ok: true, code: CODE }));
@@ -445,26 +479,54 @@ describe("performSsoExchange", () => {
     expect(isSsoLoggedOut()).toBe(false);
   });
 
-  it("keeps a durable recovery receipt if the tab closes after exchange dispatch", async () => {
-    const responseBody = deferred<{ ok: true; token: string }>();
+  it("does not return SSO success when token-sync queues login B", async () => {
+    const token = liveToken();
+    const { fn } = fetchStub((url) =>
+      url.includes("/sso-bridge/exchange")
+        ? json(200, { ok: true, token })
+        : json(200, { ok: true }),
+    );
+    let recoveryB: ReturnType<typeof beginStewardSessionRecovery> | undefined;
+    const onSync = () => {
+      queueMicrotask(() => {
+        recoveryB = beginStewardSessionRecovery("elizacloud", "provider");
+      });
+    };
+    window.addEventListener("steward-token-sync", onSync, { once: true });
+
+    try {
+      await expect(
+        performSsoExchange(CODE, VERIFIER, "cloud.eliza.app", fn),
+      ).resolves.toEqual({
+        ok: false,
+        error: "SSO exchange was superseded",
+      });
+    } finally {
+      window.removeEventListener("steward-token-sync", onSync);
+    }
+
+    expect(recoveryB?.preexistingReceipts).toEqual([]);
+    expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([
+      recoveryB?.receipt,
+    ]);
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(token);
+  });
+
+  it("keeps a durable recovery receipt if the tab closes after cookie mutation dispatch", async () => {
+    const cookieResponse = deferred<Response>();
     const calls: FetchCall[] = [];
     const fn = ((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       calls.push({ url, init });
       if (url.includes("/sso-bridge/exchange")) {
-        return Promise.resolve({
-          ok: true,
-          status: 200,
-          json: () => responseBody.promise,
-        } as Response);
+        return Promise.resolve(json(200, { ok: true, token: liveToken() }));
       }
-      return Promise.resolve(json(200, { ok: true }));
+      return cookieResponse.promise;
     }) as typeof fetch;
 
     const exchange = performSsoExchange(CODE, VERIFIER, "cloud.eliza.app", fn);
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await vi.waitFor(() => expect(calls).toHaveLength(2));
 
-    expect(calls).toHaveLength(1);
     const beforeClose = readStewardSessionRecovery("elizacloud");
     expect(beforeClose.receipts).toHaveLength(1);
     sessionStorage.clear();
@@ -472,9 +534,34 @@ describe("performSsoExchange", () => {
       beforeClose.receipts,
     );
 
-    responseBody.resolve({ ok: true, token: liveToken() });
+    cookieResponse.resolve(json(200, { ok: true }));
     await expect(exchange).resolves.toEqual({ ok: true });
     expect(readStewardSessionRecovery("elizacloud").receipts).toHaveLength(0);
+  });
+
+  it("does not arm cookie recovery when a newer generation supersedes the exchange", async () => {
+    const exchangeResponse = deferred<Response>();
+    const calls: FetchCall[] = [];
+    const fn = ((input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), init });
+      return exchangeResponse.promise;
+    }) as typeof fetch;
+
+    const exchange = performSsoExchange(CODE, VERIFIER, "cloud.eliza.app", fn);
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+    const recoveryB = beginStewardSessionRecovery("elizacloud", "provider");
+    exchangeResponse.resolve(json(200, { ok: true, token: liveToken() }));
+
+    await expect(exchange).resolves.toEqual({
+      ok: false,
+      error: "SSO exchange was superseded",
+    });
+    expect(calls).toHaveLength(1);
+    expect(readStewardSessionRecovery("elizacloud")).toMatchObject({
+      generation: recoveryB.receipt,
+      receipts: [recoveryB.receipt],
+    });
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
   });
 
   it("never publishes exchange A when login B starts during the cookie POST", async () => {
@@ -507,6 +594,93 @@ describe("performSsoExchange", () => {
     );
   });
 
+  it("retires exchange A before its authority event and preserves reentrant login B", async () => {
+    const tokenA = liveToken();
+    const { fn } = fetchStub((url) =>
+      url.includes("/sso-bridge/exchange")
+        ? json(200, { ok: true, token: tokenA })
+        : json(200, { ok: true }),
+    );
+    let recoveryB: ReturnType<typeof beginStewardSessionRecovery> | undefined;
+    let receiptsAtPublication: readonly string[] | undefined;
+    const onAuthority = () => {
+      receiptsAtPublication = readStewardSessionRecovery("elizacloud").receipts;
+      recoveryB = beginStewardSessionRecovery("elizacloud", "provider");
+    };
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, onAuthority, {
+      once: true,
+    });
+
+    try {
+      await expect(
+        performSsoExchange(CODE, VERIFIER, "cloud.eliza.app", fn),
+      ).resolves.toEqual({
+        ok: false,
+        error: "SSO exchange was superseded",
+      });
+    } finally {
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, onAuthority);
+    }
+
+    expect(receiptsAtPublication).toEqual([]);
+    expect(recoveryB).toBeDefined();
+    expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([
+      recoveryB?.receipt,
+    ]);
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(tokenA);
+  });
+
+  it("compensates the bridged token when receipt retirement fails", async () => {
+    const token = liveToken();
+    const { fn } = fetchStub((url) =>
+      url.includes("/sso-bridge/exchange")
+        ? json(200, { ok: true, token })
+        : json(200, { ok: true }),
+    );
+    // Install an explicit wrapper rather than spying on jsdom's Storage
+    // prototype: newer Node/Vitest combinations can resolve that spy through
+    // a different Web Storage receiver than `window.localStorage`.
+    const originalStorage = window.localStorage;
+    const originalDescriptor = Object.getOwnPropertyDescriptor(
+      window,
+      "localStorage",
+    );
+    const deniedStorage: Storage = {
+      get length() {
+        return originalStorage.length;
+      },
+      clear: () => originalStorage.clear(),
+      getItem: (key) => originalStorage.getItem(key),
+      key: (index) => originalStorage.key(index),
+      removeItem: (key) => {
+        if (key.startsWith("eliza.steward.server-session-recovery.v2:")) {
+          throw new DOMException("Storage denied", "SecurityError");
+        }
+        originalStorage.removeItem(key);
+      },
+      setItem: (key, value) => originalStorage.setItem(key, value),
+    };
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      value: deniedStorage,
+    });
+
+    try {
+      await expect(
+        performSsoExchange(CODE, VERIFIER, "cloud.eliza.app", fn),
+      ).resolves.toEqual({
+        ok: false,
+        error: "SSO exchange was superseded",
+      });
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+      expect(readStewardSessionRecovery("elizacloud").receipts).toHaveLength(1);
+    } finally {
+      if (originalDescriptor) {
+        Object.defineProperty(window, "localStorage", originalDescriptor);
+      }
+    }
+  });
+
   it("establishes bridged auth without sending or consuming a Telegram claim", async () => {
     storePendingOnboardingSession(
       "opaque-telegram-claim-token",
@@ -532,7 +706,7 @@ describe("performSsoExchange", () => {
     expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(token);
   });
 
-  it("keeps Telegram claim authority when best-effort cookie sync is rejected", async () => {
+  it("keeps Telegram claim authority and rejects deterministic cookie-sync recovery", async () => {
     storePendingOnboardingSession(
       "opaque-telegram-claim-token",
       TELEGRAM_ACCOUNT_CLAIM_PURPOSE,
@@ -550,11 +724,115 @@ describe("performSsoExchange", () => {
       fn,
     );
 
-    expect(result).toEqual({ ok: true });
+    expect(result).toEqual({
+      ok: false,
+      error: "SSO session sync failed (HTTP 409)",
+    });
     expect(peekPendingOnboardingSession(TELEGRAM_ACCOUNT_CLAIM_PURPOSE)).toBe(
       "opaque-telegram-claim-token",
     );
-    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeTruthy();
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(readStewardSessionRecovery("elizacloud").receipts).toHaveLength(0);
+  });
+
+  it.each([429, 500])(
+    "does not silently recover cookie account A after session HTTP %i rejects exchange account B",
+    async (status) => {
+      // Account A exists only in the pre-existing server cookie. Account B is
+      // returned by the one-shot exchange but must stay quarantined when the
+      // contractually pre-commit session endpoint rejects it.
+      // biome-ignore lint/suspicious/noDocumentCookie: jsdom models account A's pre-existing cookie.
+      document.cookie = "steward-authed=1; path=/";
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+      const tokenB = jwt({
+        userId: "account-b",
+        exp: Math.floor(Date.now() / 1000) + 3600,
+      });
+      const { fn, calls } = fetchStub((url) =>
+        url.includes("/sso-bridge/exchange")
+          ? json(200, { ok: true, token: tokenB })
+          : json(status, { code: "session_not_committed" }),
+      );
+      const events: string[] = [];
+      const onSync = () => events.push("steward-token-sync");
+      window.addEventListener("steward-token-sync", onSync);
+
+      try {
+        await expect(
+          performSsoExchange(CODE, VERIFIER, "cloud.eliza.app", fn),
+        ).resolves.toEqual({
+          ok: false,
+          error: `SSO session sync failed (HTTP ${status})`,
+        });
+      } finally {
+        window.removeEventListener("steward-token-sync", onSync);
+      }
+
+      expect(calls).toHaveLength(2);
+      expect(document.cookie).toContain("steward-authed=1");
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+      expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([]);
+      expect(events).toEqual([]);
+    },
+  );
+
+  it.each([
+    [new TypeError("session transport failed"), "session transport failed"],
+    [
+      new DOMException("session aborted", "AbortError"),
+      "AbortError: session aborted",
+    ],
+  ])(
+    "preserves recovery only for ambiguous session transport failure: %s",
+    async (failure, expectedError) => {
+      const tokenB = jwt({
+        userId: "account-b",
+        exp: Math.floor(Date.now() / 1000) + 3600,
+      });
+      const calls: FetchCall[] = [];
+      const fn = ((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        calls.push({ url, init });
+        return url.includes("/sso-bridge/exchange")
+          ? Promise.resolve(json(200, { ok: true, token: tokenB }))
+          : Promise.reject(failure);
+      }) as typeof fetch;
+
+      await expect(
+        performSsoExchange(CODE, VERIFIER, "cloud.eliza.app", fn),
+      ).resolves.toEqual({ ok: false, error: expectedError });
+      expect(calls).toHaveLength(2);
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+      expect(readStewardSessionRecovery("elizacloud")).toMatchObject({
+        receipts: [expect.any(String)],
+        currentReceiptPhase: "cookie_pending",
+        expectedIdentity: {
+          userId: "account-b",
+          tenantId: "elizacloud",
+        },
+      });
+    },
+  );
+
+  it("never republishes a bridge token when paired-origin logout wins before session sync", async () => {
+    const token = liveToken();
+    const { fn } = fetchStub((url) =>
+      url.includes("/sso-bridge/exchange")
+        ? json(200, { ok: true, token })
+        : json(401, {
+            error: "Session was signed out",
+            code: "session_ended",
+          }),
+    );
+
+    await expect(
+      performSsoExchange(CODE, VERIFIER, "cloud.eliza.app", fn),
+    ).resolves.toEqual({
+      ok: false,
+      error: "SSO session was signed out",
+    });
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(readStewardSessionRecovery("elizacloud").receipts).toHaveLength(0);
   });
 
   it("refuses a malformed verifier without calling out", async () => {
@@ -603,20 +881,41 @@ describe("performSsoExchange", () => {
     expect(readStewardSessionRecovery("elizacloud").receipts).toHaveLength(0);
   });
 
-  it("keeps the receipt when a 200 response cannot hydrate the committed session", async () => {
-    const { fn } = fetchStub(() => json(200, { ok: true }));
-    const result = await performSsoExchange(
-      CODE,
-      VERIFIER,
-      "cloud.eliza.app",
-      fn,
-    );
+  it("leaves no recovery receipt when the non-mutating exchange transport fails", async () => {
+    const fn = (() =>
+      Promise.reject(new TypeError("network unavailable"))) as typeof fetch;
 
-    expect(result).toEqual({
-      ok: false,
-      error: "Exchange returned no usable session",
-    });
-    expect(readStewardSessionRecovery("elizacloud").receipts).toHaveLength(1);
+    await expect(
+      performSsoExchange(CODE, VERIFIER, "cloud.eliza.app", fn),
+    ).resolves.toEqual({ ok: false, error: "network unavailable" });
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([]);
+  });
+
+  it("leaves no recovery receipt or stale-cookie publication after a malformed 200", async () => {
+    // The cookie predates this attempt and must not become locally authoritative
+    // merely because a non-mutating exchange response cannot be hydrated.
+    // biome-ignore lint/suspicious/noDocumentCookie: jsdom models the stale server-session marker.
+    document.cookie = "steward-authed=1; path=/";
+    const { fn, calls } = fetchStub(() => json(200, { ok: true }));
+    const events: string[] = [];
+    const onSync = () => events.push("steward-token-sync");
+    window.addEventListener("steward-token-sync", onSync);
+    try {
+      await expect(
+        performSsoExchange(CODE, VERIFIER, "cloud.eliza.app", fn),
+      ).resolves.toEqual({
+        ok: false,
+        error: "Exchange returned no usable session",
+      });
+    } finally {
+      window.removeEventListener("steward-token-sync", onSync);
+    }
+
+    expect(calls).toHaveLength(1);
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(events).toEqual([]);
+    expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([]);
   });
 });
 
@@ -704,7 +1003,7 @@ describe("signOutFromSsoBridgedHost", () => {
       expect(calls[0].url).toBe("https://cloud.eliza.app/api/auth/logout");
       expect(calls[0].init).toMatchObject({
         method: "POST",
-        credentials: "omit",
+        credentials: "include",
         keepalive: true,
       });
       expect(new Headers(calls[0].init?.headers).get("content-type")).toBe(
@@ -718,7 +1017,13 @@ describe("signOutFromSsoBridgedHost", () => {
       );
       expect(proofAtServerLogoutIssue).toBe(false);
       expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
-      expect(globalCalls).toEqual([]);
+      expect(
+        globalCalls.some(
+          (call) =>
+            call.startsWith("DELETE ") &&
+            call.endsWith("/api/auth/steward-session"),
+        ),
+      ).toBe(true);
     } finally {
       globalThis.fetch = realFetch;
     }

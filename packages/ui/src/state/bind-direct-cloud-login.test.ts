@@ -12,6 +12,7 @@ const STEWARD_TOKEN_KEY = "steward_session_token";
 const PERSONAL_ID = "personal:00000000-0000-5000-8000-000000000001";
 const DEDICATED_ID = "00000000-0000-4000-8000-000000000020";
 const API_BASE = `https://${DEDICATED_ID}.cloud.eliza.app`;
+const SHARED_API_BASE = `https://api.eliza.app/api/v1/eliza/agents/${encodeURIComponent(PERSONAL_ID)}`;
 
 describe("bindDirectCloudLoginToPersonalAgent", () => {
   beforeEach(() => localStorage.clear());
@@ -28,12 +29,12 @@ describe("bindDirectCloudLoginToPersonalAgent", () => {
       }),
     );
     const client = {
-      ensurePersonalDedicatedEliza: vi.fn(async () => ({
+      getPersonalSharedEliza: vi.fn(async () => ({
         personalElizaId: PERSONAL_ID,
-        activeAgentId: DEDICATED_ID,
+        activeAgentId: PERSONAL_ID,
         agentName: "Eliza",
-        apiBase: API_BASE,
-        runtime: "dedicated" as const,
+        apiBase: `${SHARED_API_BASE}/`,
+        runtime: "shared" as const,
       })),
       stageSessionTarget: vi.fn(() => ({
         publish: vi.fn(() => true),
@@ -42,32 +43,35 @@ describe("bindDirectCloudLoginToPersonalAgent", () => {
       })),
     };
 
-    await expect(
-      bindDirectCloudLoginToPersonalAgent({
-        client,
-        cloudApiBase: "https://api.eliza.app",
-        token: "production-token",
-      }),
-    ).resolves.toEqual(
-      expect.objectContaining({
-        restoreIfCurrent: expect.any(Function),
-      }),
+    const authority = await bindDirectCloudLoginToPersonalAgent({
+      client,
+      cloudApiBase: "https://api.eliza.app",
+      token: "production-token",
+    });
+    expect(authority).toEqual(
+      expect.objectContaining({ restoreIfCurrent: expect.any(Function) }),
     );
+    expect(authority?.result).toMatchObject({
+      personalElizaId: PERSONAL_ID,
+      activeAgentId: PERSONAL_ID,
+      apiBase: SHARED_API_BASE,
+      runtime: "shared",
+    });
 
     expect(loadPersistedActiveServer()).toMatchObject({
       id: `cloud:${PERSONAL_ID}`,
-      apiBase: API_BASE,
+      apiBase: SHARED_API_BASE,
       accessToken: "production-token",
-      cloudRuntimeAgentId: DEDICATED_ID,
-      cloudRuntime: "dedicated",
+      cloudRuntimeAgentId: PERSONAL_ID,
+      cloudRuntime: "shared",
     });
     expect(getActiveProfile()).toMatchObject({
       cloudAgentId: PERSONAL_ID,
-      apiBase: API_BASE,
+      apiBase: SHARED_API_BASE,
       accessToken: "production-token",
     });
     expect(client.stageSessionTarget).toHaveBeenCalledWith(
-      { baseUrl: API_BASE, token: "production-token" },
+      { baseUrl: SHARED_API_BASE, token: "production-token" },
       { persist: false },
     );
     expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("production-token");
@@ -75,7 +79,7 @@ describe("bindDirectCloudLoginToPersonalAgent", () => {
 
   it("rolls both records back and publishes nothing when B appears during active-server persistence", async () => {
     const client = {
-      ensurePersonalDedicatedEliza: vi.fn(async () => ({
+      getPersonalSharedEliza: vi.fn(async () => ({
         personalElizaId: PERSONAL_ID,
         activeAgentId: DEDICATED_ID,
         agentName: "Eliza",
@@ -113,24 +117,34 @@ describe("bindDirectCloudLoginToPersonalAgent", () => {
 
   it("rolls token, records, boot finalizer, and client authority back when B appears during publication", async () => {
     let authorityLive = true;
-    const restoreIfCurrent = vi.fn(() => true);
+    let clientBase = "https://old.example.test";
+    let clientToken = "old-token";
+    const restoreIfCurrent = vi.fn(() => {
+      clientBase = "https://old.example.test";
+      clientToken = "old-token";
+      return true;
+    });
     const rollbackFinalizer = vi.fn();
     const client = {
-      ensurePersonalDedicatedEliza: vi.fn(async () => ({
+      getPersonalSharedEliza: vi.fn(async () => ({
         personalElizaId: PERSONAL_ID,
         activeAgentId: DEDICATED_ID,
         agentName: "Eliza",
         apiBase: API_BASE,
         runtime: "dedicated" as const,
       })),
-      stageSessionTarget: vi.fn(() => {
-        authorityLive = false;
-        return {
-          publish: vi.fn(() => true),
+      stageSessionTarget: vi.fn(
+        (target: { baseUrl: string; token: string }) => ({
+          publish: vi.fn(() => {
+            clientBase = target.baseUrl;
+            clientToken = target.token;
+            authorityLive = false;
+            return true;
+          }),
           restoreIfCurrent,
           clearIfCurrent: vi.fn(() => true),
-        };
-      }),
+        }),
+      ),
     };
 
     await expect(
@@ -148,12 +162,14 @@ describe("bindDirectCloudLoginToPersonalAgent", () => {
     expect(loadPersistedActiveServer()).toBeNull();
     expect(getActiveProfile()).toBeNull();
     expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(clientBase).toBe("https://old.example.test");
+    expect(clientToken).toBe("old-token");
   });
 
   it("compensates durable records and token when the boot finalizer throws", async () => {
     const restoreIfCurrent = vi.fn(() => true);
     const client = {
-      ensurePersonalDedicatedEliza: vi.fn(async () => ({
+      getPersonalSharedEliza: vi.fn(async () => ({
         personalElizaId: PERSONAL_ID,
         activeAgentId: DEDICATED_ID,
         agentName: "Eliza",
@@ -189,7 +205,7 @@ describe("bindDirectCloudLoginToPersonalAgent", () => {
     const restoreIfCurrent = vi.fn(() => true);
     const rollbackFinalizer = vi.fn();
     const client = {
-      ensurePersonalDedicatedEliza: vi.fn(async () => ({
+      getPersonalSharedEliza: vi.fn(async () => ({
         personalElizaId: PERSONAL_ID,
         activeAgentId: DEDICATED_ID,
         agentName: "Eliza",
@@ -241,7 +257,7 @@ describe("bindDirectCloudLoginToPersonalAgent", () => {
     };
     window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, onSession);
     const client = {
-      ensurePersonalDedicatedEliza: vi.fn(async () => ({
+      getPersonalSharedEliza: vi.fn(async () => ({
         personalElizaId: PERSONAL_ID,
         activeAgentId: DEDICATED_ID,
         agentName: "Eliza",
@@ -281,9 +297,11 @@ describe("bindDirectCloudLoginToPersonalAgent", () => {
             bootPublished = false;
           };
         },
-        commitBeforePublish: () => {
+        finalizeRecoveryBeforePublish: () => {
           receiptCommitted = true;
-          return true;
+          return () => {
+            receiptCommitted = false;
+          };
         },
       });
     } finally {

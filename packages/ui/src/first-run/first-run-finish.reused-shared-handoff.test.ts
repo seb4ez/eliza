@@ -41,6 +41,18 @@ import {
 
 const SHARED_AGENT_BASE =
   "https://staging.elizacloud.ai/api/v1/eliza/agents/cad3c071";
+const SELECTION_SUPERSEDED_MESSAGE =
+  "Cloud agent setup was superseded by a newer login.";
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
+}
 
 const clientMock = vi.hoisted(() => ({
   getPersonalSharedEliza: vi.fn(),
@@ -147,7 +159,14 @@ function ports(): FirstRunFinishPorts {
 
 function mockSelection(
   created: boolean,
-  opts: { bridgeUrl?: string | null; requiresAgentPairing?: boolean } = {},
+  opts: {
+    authority?: {
+      isCurrent(): boolean;
+      compensateIfSuperseded(): Promise<void>;
+    };
+    bridgeUrl?: string | null;
+    requiresAgentPairing?: boolean;
+  } = {},
 ): void {
   clientMock.selectOrProvisionCloudAgent.mockResolvedValue({
     agentId: "cad3c071",
@@ -155,6 +174,7 @@ function mockSelection(
     bridgeUrl: opts.bridgeUrl ?? null,
     requiresAgentPairing: opts.requiresAgentPairing ?? false,
     created,
+    ...(opts.authority ? { authority: opts.authority } : {}),
   });
 }
 
@@ -199,12 +219,13 @@ beforeEach(() => {
     apiBase: "https://00000000-0000-4000-8000-000000000020.cloud.eliza.app",
     runtime: "dedicated",
   });
-  // Default boot config: shared-first with NO auto-upgrade (#18204).
+  // This suite's shared-first fixture has NO auto-upgrade (#18204).
   bootConfigMock.autoUpgradeSharedToDedicated = false;
 });
 
 afterEach(() => {
   window.localStorage.clear();
+  vi.unstubAllGlobals();
 });
 
 describe("shared→dedicated handoff firing on shared-agent completion", () => {
@@ -258,11 +279,223 @@ describe("shared→dedicated handoff firing on shared-agent completion", () => {
     expect(runCloudAgentHandoffMock).not.toHaveBeenCalled();
     expect(clientMock.createCloudCompatAgent).not.toHaveBeenCalled();
   });
+
+  it("conditionally removes a fresh dedicated target when login B wins during its create POST", async () => {
+    let selectionCurrent = true;
+    mockSelection(true, {
+      authority: {
+        isCurrent: () => selectionCurrent,
+        compensateIfSuperseded: vi.fn(async () => {}),
+      },
+    });
+    const handoffCapture: { work: (() => Promise<unknown>) | null } = {
+      work: null,
+    };
+    runCloudAgentHandoffMock.mockImplementation(
+      (_sharedAgentId, work: () => Promise<unknown>) => {
+        handoffCapture.work = work;
+      },
+    );
+    const createResponse = deferred<{
+      success: true;
+      created: true;
+      data: {
+        agentId: string;
+        agentName: string;
+        jobId: string;
+        status: string;
+        nodeId: null;
+        message: string;
+        createdAt: string;
+        executionTier: "dedicated-always";
+      };
+    }>();
+    clientMock.createCloudCompatAgent.mockReturnValue(createResponse.promise);
+    const cleanupSpy = vi.fn(
+      async (_input: RequestInfo | URL, _init?: RequestInit) =>
+        new Response(JSON.stringify({ success: true }), {
+          status: 202,
+          headers: { "Content-Type": "application/json" },
+        }),
+    );
+    vi.stubGlobal("fetch", cleanupSpy);
+
+    await bindCloudAgent(draft(), "steward-token-a", {}, ports());
+    expect(handoffCapture.work).not.toBeNull();
+    const handoff = handoffCapture.work?.() ?? Promise.resolve();
+    await vi.waitFor(() =>
+      expect(clientMock.createCloudCompatAgent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          forceCreate: true,
+          validateAuthority: expect.any(Function),
+        }),
+      ),
+    );
+    selectionCurrent = false;
+    createResponse.resolve({
+      success: true,
+      created: true,
+      data: {
+        agentId: "dedicated-account-a",
+        agentName: "Eliza",
+        jobId: "job-account-a",
+        status: "pending",
+        nodeId: null,
+        message: "accepted",
+        createdAt: "2026-08-30T05:00:00.000Z",
+        executionTier: "dedicated-always",
+      },
+    });
+
+    await expect(handoff).rejects.toThrow(SELECTION_SUPERSEDED_MESSAGE);
+    expect(cleanupSpy).toHaveBeenCalledOnce();
+    const [cleanupUrl, cleanupInit] = cleanupSpy.mock.calls[0] ?? [];
+    expect(String(cleanupUrl)).toContain(
+      "/api/v1/eliza/agents/dedicated-account-a",
+    );
+    expect(new Headers(cleanupInit?.headers).get("Authorization")).toBe(
+      "Bearer steward-token-a",
+    );
+    expect(cleanupInit).toMatchObject({
+      method: "DELETE",
+      body: JSON.stringify({
+        expectedAgentName: "Eliza",
+        expectedCreatedAt: "2026-08-30T05:00:00.000Z",
+        expectedExecutionTier: "dedicated-always",
+      }),
+    });
+    expect(loadPendingCloudHandoff()).toBeNull();
+    expect(clientMock.startCloudAgentHandoff).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { created: false, createdAt: "2026-08-30T05:00:00.000Z" },
+    { created: true, createdAt: null },
+  ])(
+    "never deletes a reused or incomplete dedicated create receipt (%o)",
+    async ({ created, createdAt }) => {
+      let selectionCurrent = true;
+      mockSelection(true, {
+        authority: {
+          isCurrent: () => selectionCurrent,
+          compensateIfSuperseded: vi.fn(async () => {}),
+        },
+      });
+      const handoffCapture: { work: (() => Promise<unknown>) | null } = {
+        work: null,
+      };
+      runCloudAgentHandoffMock.mockImplementation(
+        (_sharedAgentId, work: () => Promise<unknown>) => {
+          handoffCapture.work = work;
+        },
+      );
+      clientMock.createCloudCompatAgent.mockImplementation(async () => {
+        selectionCurrent = false;
+        return {
+          success: true,
+          created,
+          data: {
+            agentId: "ambiguous-account-a",
+            agentName: "Eliza",
+            jobId: "",
+            status: "pending",
+            nodeId: null,
+            message: "accepted",
+            createdAt,
+            executionTier: "dedicated-always",
+          },
+        };
+      });
+      const cleanupSpy = vi.fn();
+      vi.stubGlobal("fetch", cleanupSpy);
+
+      await bindCloudAgent(draft(), "steward-token-a", {}, ports());
+      const handoff = handoffCapture.work?.() ?? Promise.resolve();
+      await expect(handoff).rejects.toThrow(SELECTION_SUPERSEDED_MESSAGE);
+      expect(cleanupSpy).not.toHaveBeenCalled();
+      expect(loadPendingCloudHandoff()).toBeNull();
+      expect(clientMock.startCloudAgentHandoff).not.toHaveBeenCalled();
+    },
+  );
+
+  it("conditionally removes a fresh dedicated target when login B wins during the long handoff", async () => {
+    let selectionCurrent = true;
+    mockSelection(true, {
+      authority: {
+        isCurrent: () => selectionCurrent,
+        compensateIfSuperseded: vi.fn(async () => {}),
+      },
+    });
+    const handoffCapture: {
+      validate: (() => boolean) | null;
+      work: (() => Promise<unknown>) | null;
+    } = { validate: null, work: null };
+    runCloudAgentHandoffMock.mockImplementation(
+      (
+        _sharedAgentId,
+        work: () => Promise<unknown>,
+        _onSuccess: unknown,
+        validate: () => boolean,
+      ) => {
+        handoffCapture.work = work;
+        handoffCapture.validate = validate;
+      },
+    );
+    clientMock.createCloudCompatAgent.mockResolvedValue({
+      success: true,
+      created: true,
+      data: {
+        agentId: "dedicated-account-a",
+        agentName: "Eliza",
+        jobId: "job-account-a",
+        status: "pending",
+        nodeId: null,
+        message: "accepted",
+        createdAt: "2026-08-30T05:00:00.000Z",
+        executionTier: "dedicated-always",
+      },
+    });
+    clientMock.startCloudAgentHandoff.mockImplementation(async (options) => {
+      selectionCurrent = false;
+      try {
+        await options.onSwitch("https://dedicated-account-a.cloud.eliza.app");
+        return { status: "switched", imported: 1 };
+      } catch (error) {
+        return {
+          status: "failed",
+          imported: 0,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+    });
+    const cleanupSpy = vi.fn(
+      async (_input: RequestInfo | URL, _init?: RequestInit) =>
+        new Response(JSON.stringify({ success: true }), {
+          status: 202,
+          headers: { "Content-Type": "application/json" },
+        }),
+    );
+    vi.stubGlobal("fetch", cleanupSpy);
+
+    await bindCloudAgent(draft(), "steward-token-a", {}, ports());
+    expect(handoffCapture.work).not.toBeNull();
+    expect(handoffCapture.validate?.()).toBe(true);
+    const handoff = handoffCapture.work?.() ?? Promise.resolve();
+
+    await expect(handoff).rejects.toThrow(SELECTION_SUPERSEDED_MESSAGE);
+    expect(handoffCapture.validate?.()).toBe(false);
+    expect(clientMock.startCloudAgentHandoff).toHaveBeenCalledWith(
+      expect.objectContaining({ validateAuthority: expect.any(Function) }),
+    );
+    expect(silentlyRepointToDedicatedMock).not.toHaveBeenCalled();
+    expect(cleanupSpy).toHaveBeenCalledOnce();
+    expect(loadPendingCloudHandoff()).toBeNull();
+  });
 });
 
 describe("shared-only onboarding: no billed dedicated mutation without opt-in (#18204)", () => {
-  // The DEFAULT boot config is preferSharedCloudTier: true with
-  // autoUpgradeSharedToDedicated: false (left at default by the top-level
+  // This describe uses the suite's explicit preferSharedCloudTier: true fixture
+  // with autoUpgradeSharedToDedicated: false (restored by the top-level
   // beforeEach). No background dedicated create may fire on this path — the
   // user stays on the shared agent until they explicitly choose an upgrade
   // through Settings (#15355 confirmation flow).
@@ -393,24 +626,25 @@ describe("listOrAutoProvisionCloudAgent / runFirstRunFinish routing", () => {
     window.localStorage.setItem("steward_session_token", "steward-jwt");
   });
 
-  it("routes Cloud first run through Dedicated personal activation", async () => {
+  it("routes Cloud first run through read-only personal resolution", async () => {
     const outcome = await runFirstRunFinish(
       { ...draft(), runtime: "cloud" },
       ports(),
     );
     expect(outcome.kind).toBe("done");
-    expect(clientMock.ensurePersonalDedicatedEliza).toHaveBeenCalledWith(
+    expect(clientMock.getPersonalSharedEliza).toHaveBeenCalledWith(
       expect.objectContaining({
         cloudApiBase: "https://staging.elizacloud.ai",
         authToken: "steward-jwt",
       }),
     );
+    expect(clientMock.ensurePersonalDedicatedEliza).not.toHaveBeenCalled();
     expect(clientMock.getCloudCompatAgents).not.toHaveBeenCalled();
     expect(clientMock.selectOrProvisionCloudAgent).not.toHaveBeenCalled();
   });
 
   it("surfaces personal identity failure without provisioning a fallback", async () => {
-    clientMock.ensurePersonalDedicatedEliza.mockRejectedValueOnce(
+    clientMock.getPersonalSharedEliza.mockRejectedValueOnce(
       new Error("identity unavailable"),
     );
     await expect(
@@ -444,9 +678,10 @@ describe("listOrAutoProvisionCloudAgent / runFirstRunFinish routing", () => {
       requireClientAuth: true,
     });
     expect(outcome.kind).toBe("done");
-    expect(clientMock.ensurePersonalDedicatedEliza).toHaveBeenCalledWith(
+    expect(clientMock.getPersonalSharedEliza).toHaveBeenCalledWith(
       expect.objectContaining({ authToken: "fresh-client-token" }),
     );
+    expect(clientMock.ensurePersonalDedicatedEliza).not.toHaveBeenCalled();
     expect(clientMock.selectOrProvisionCloudAgent).not.toHaveBeenCalled();
   });
 
@@ -460,6 +695,7 @@ describe("listOrAutoProvisionCloudAgent / runFirstRunFinish routing", () => {
       requireClientAuth: true,
     });
     expect(outcome.kind).toBe("needs-cloud-login");
+    expect(clientMock.getPersonalSharedEliza).not.toHaveBeenCalled();
     expect(clientMock.ensurePersonalDedicatedEliza).not.toHaveBeenCalled();
     expect(clientMock.selectOrProvisionCloudAgent).not.toHaveBeenCalled();
   });

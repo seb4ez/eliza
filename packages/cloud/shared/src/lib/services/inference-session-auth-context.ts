@@ -2,10 +2,11 @@
  * Cache-only Steward session authorization for model-inference routes.
  *
  * Every request still verifies the signed JWT locally (with the existing
- * Redis/in-memory verification cache). Cloud user, organization, and
- * moderation state are consumed only from a combined cache decision. A cold
- * Worker request returns a retryable warming result while authoritative
- * hydration runs under `waitUntil`, so Postgres never joins model dispatch.
+ * Redis/in-memory verification cache), then checks the primary SSO logout
+ * marker before any cached identity can authorize. Cloud user, organization,
+ * and moderation state are consumed only from a combined cache decision. A
+ * cold Worker request returns a retryable warming result while authoritative
+ * identity hydration runs under `waitUntil`.
  *
  * Cache READS and WRITES are both gated on `useAuthCache`
  * (`INFERENCE_AUTH_CACHE_ENABLED`): while the flag is off, the origin path
@@ -15,7 +16,7 @@
  */
 
 import { usersRepository } from "../../db/repositories/users";
-import { AuthenticationError, ForbiddenError } from "../api/cloud-worker-errors";
+import { ApiError, AuthenticationError, ForbiddenError } from "../api/cloud-worker-errors";
 import { loadVerifiedStagingSessionUser } from "../auth/staging-session-binding";
 import { verifyStewardTokenCached } from "../auth/steward-client";
 import { readStewardAccessCookieFromHeader } from "../auth/steward-cookies";
@@ -36,6 +37,7 @@ import {
   assertInferenceCredentialActive,
   InferenceCredentialRevokedError,
 } from "./inference-credential-revocation";
+import { isBlockedBySsoBridgeLogout } from "./sso-bridge-codes";
 
 const sessionHydrations = new Map<string, Promise<InferenceSessionAuthDecision>>();
 const AUTH_CONTEXT_REFRESH_AFTER_MS = 30_000;
@@ -269,6 +271,21 @@ export async function resolveInferenceSessionAuthContext(
     },
   );
   if (!claims) return { kind: "rejected", status: 401 };
+
+  try {
+    if (await isBlockedBySsoBridgeLogout(claims.userId, claims.issuedAt)) {
+      return { kind: "rejected", status: 401 };
+    }
+  } catch (error) {
+    logger.error("[InferenceSessionAuth] SSO logout-marker store unavailable", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw new ApiError(
+      503,
+      "service_unavailable",
+      "Session revocation is temporarily unavailable. Please retry.",
+    );
+  }
 
   if (claims.stagingSessionBinding) {
     // QA bindings are continuously primary-store-authorized and must never be

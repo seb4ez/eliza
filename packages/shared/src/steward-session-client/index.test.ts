@@ -20,6 +20,7 @@ import {
   STEWARD_TOKEN_KEY,
   STEWARD_TOKEN_SCOPE_KEY,
   type StewardSessionChangeDetail,
+  StewardSessionError,
   sanitizeTelegramAccountClaimContinuation,
   stewardAuthedCookieName,
   syncStewardSession,
@@ -108,6 +109,35 @@ describe("Steward session client CSRF marker header", () => {
       STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
     );
   });
+
+  it("preserves structured logout cooldown timing without treating it as session_ended", async () => {
+    const fetchImpl = (async () =>
+      jsonResponse(
+        {
+          error:
+            "You signed out moments ago. Wait 4 seconds, then sign in again to create a new session.",
+          code: "logout_cooldown",
+          retryAfterSeconds: 4,
+          retryAtEpochSeconds: 2_000_000_004,
+        },
+        409,
+      )) as unknown as typeof fetch;
+
+    let failure: unknown;
+    try {
+      await syncStewardSession("ambiguous-token", null, { fetchImpl });
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(StewardSessionError);
+    expect(failure).toMatchObject({
+      code: "logout_cooldown",
+      status: 409,
+      retryAfterSeconds: 4,
+      retryAtEpochSeconds: 2_000_000_004,
+    });
+  });
 });
 
 describe("Telegram account-claim credential", () => {
@@ -134,22 +164,81 @@ describe("steward session marker cookie", () => {
     vi.unstubAllGlobals();
   });
 
-  it("keeps production and unset environments on the historical marker", () => {
-    expect(stewardAuthedCookieName()).toBe("steward-authed");
-    expect(stewardAuthedCookieName("production")).toBe("steward-authed");
+  it("uses rollout-isolated v2 markers in production and unset environments", () => {
+    expect(stewardAuthedCookieName()).toBe("__Host-steward-authed-v2");
+    expect(stewardAuthedCookieName("production")).toBe(
+      "__Host-steward-authed-v2",
+    );
   });
 
   it("suffixes non-production marker cookies by environment", () => {
-    expect(stewardAuthedCookieName("staging")).toBe("steward-authed-staging");
-    expect(stewardAuthedCookieName("dev")).toBe("steward-authed-dev");
+    expect(stewardAuthedCookieName("staging")).toBe(
+      "__Host-steward-authed-v2-staging",
+    );
+    expect(stewardAuthedCookieName("dev")).toBe("__Host-steward-authed-v2-dev");
+    expect(stewardAuthedCookieName("local")).toBe("steward-authed-v2-local");
   });
 
-  it("does not let a staging page trust the production marker", () => {
+  it("never treats a v1 marker alone as automatic-refresh authority", () => {
     stubDocumentCookie("steward-authed=1");
-    expect(hasStewardAuthedCookie("staging")).toBe(false);
+    expect(hasStewardAuthedCookie("production")).toBe(false);
 
     stubDocumentCookie("steward-authed-staging=1; steward-authed=1");
-    expect(hasStewardAuthedCookie("staging")).toBe(true);
+    expect(hasStewardAuthedCookie("staging")).toBe(false);
+  });
+
+  it("keeps v2 authentication alive after a late v1 logout", () => {
+    stubDocumentCookie("__Host-steward-authed-v2=1");
+    expect(hasStewardAuthedCookie("production")).toBe(true);
+  });
+
+  it("does not let a late v1 login cross the v2 logout tombstone", () => {
+    stubDocumentCookie("__Host-steward-authed-v2=0; steward-authed=1");
+    expect(hasStewardAuthedCookie("production")).toBe(false);
+  });
+
+  it("fails closed instead of falling back on a malformed v2 marker", () => {
+    stubDocumentCookie("__Host-steward-authed-v2=maybe; steward-authed=1");
+    expect(hasStewardAuthedCookie("production")).toBe(false);
+  });
+
+  it("ignores an unprefixed domain-cookie lookalike", () => {
+    stubDocumentCookie("steward-authed-v2=1; __Host-steward-authed-v2=0");
+    expect(hasStewardAuthedCookie("production")).toBe(false);
+  });
+
+  it("fails closed on duplicate exact host-bound markers", () => {
+    stubDocumentCookie(
+      "__Host-steward-authed-v2=0; __Host-steward-authed-v2=1",
+    );
+    expect(hasStewardAuthedCookie("production")).toBe(false);
+  });
+
+  it("infers staging markers only for the exact develop Pages hostname", () => {
+    vi.stubGlobal("window", {
+      location: { hostname: "develop.eliza-app.pages.dev" },
+    });
+    stubDocumentCookie("__Host-steward-authed-v2-staging=1");
+    expect(hasStewardAuthedCookie()).toBe(true);
+
+    stubDocumentCookie("steward-authed-staging=1");
+    expect(hasStewardAuthedCookie()).toBe(false);
+
+    vi.stubGlobal("window", {
+      location: { hostname: "preview.develop.eliza-app.pages.dev" },
+    });
+    expect(hasStewardAuthedCookie()).toBe(false);
+  });
+
+  it("infers the explicit non-prefixed local marker on loopback", () => {
+    vi.stubGlobal("window", {
+      location: { hostname: "127.0.0.1" },
+    });
+    stubDocumentCookie("steward-authed-v2-local=1");
+    expect(hasStewardAuthedCookie()).toBe(true);
+
+    stubDocumentCookie("__Host-steward-authed-v2=1");
+    expect(hasStewardAuthedCookie()).toBe(false);
   });
 });
 
@@ -301,7 +390,7 @@ describe("Steward session storage transitions", () => {
       unregister();
     }
 
-    expect(commit).not.toHaveBeenCalled();
+    expect(commit).toHaveBeenCalledTimes(1);
     expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("production-token");
     expect(localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY)).toBe(
       "eliza-cloud:production",
@@ -638,6 +727,49 @@ describe("Steward session storage transitions", () => {
     expect(transitions).toEqual([]);
   });
 
+  it("rearms durable recovery markers before awaiting host predecessor restore", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, "token-old");
+    const order: string[] = [];
+    const unregister = registerStewardTokenPersistence(async (token) => {
+      localStorage.setItem(STEWARD_TOKEN_KEY, token);
+      return {
+        commit: async () => undefined,
+        restorePredecessor: async () => {
+          order.push("durable-restore");
+          localStorage.setItem(STEWARD_TOKEN_KEY, "token-old");
+          return true;
+        },
+      };
+    });
+
+    try {
+      const authority = await writeStoredStewardToken("token-b", {
+        finalizeBeforePublish: () => {
+          const rollback = ((_durableRestored: boolean) => {
+            order.push("live-rollback");
+          }) as ((durableRestored: boolean) => void) & {
+            beforeDurableRestore?: () => void;
+          };
+          rollback.beforeDurableRestore = () => {
+            order.push("marker-restore");
+          };
+          return rollback;
+        },
+        commitBeforePublish: () => false,
+      });
+      expect(authority).toBeNull();
+    } finally {
+      unregister();
+    }
+
+    expect(order).toEqual([
+      "marker-restore",
+      "durable-restore",
+      "live-rollback",
+    ]);
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("token-old");
+  });
+
   it("clears staged live authority when durable compensation loses", async () => {
     localStorage.setItem(STEWARD_TOKEN_KEY, "token-old");
     let liveClientToken: string | null = "token-old";
@@ -855,7 +987,10 @@ describe("Steward session storage transitions", () => {
       unregister();
     }
 
-    expect(persist).toHaveBeenCalledWith("cached-token");
+    expect(persist).toHaveBeenCalledWith("cached-token", {
+      previousScope: null,
+      requiredScope: null,
+    });
   });
 
   it("publishes canonical invalidation before stale refresh-key cleanup can fail", async () => {

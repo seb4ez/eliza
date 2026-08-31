@@ -58,11 +58,11 @@ import { publishCloudAuthComplete } from "../cloud/auth/cloud-auth-complete-sign
 import { enqueueStewardSessionMutation } from "../cloud/lib/steward-session-mutation-queue";
 import {
   beginStewardSessionRecovery,
-  commitStewardSessionRecoveryForPublication,
+  createStewardSessionRecoveryPublicationFence,
   isStewardSessionRecoveryReceiptLive,
-  readStewardSessionGeneration,
   readStewardSessionRecovery,
   rejectStewardSessionRecovery,
+  type StewardSessionRecoveryPublicationRollback,
   type StewardSessionRecoveryReceipt,
 } from "../cloud/lib/steward-session-recovery-marker";
 import {
@@ -104,7 +104,7 @@ import {
 import { clearCloudPairApiToken } from "./cloud-pair-token";
 import {
   getInjectedEthereumProvider,
-  siweLoginWithInjectedWallet,
+  siweLoginWithInjectedWalletAuthority,
 } from "./cloud-siwe-login";
 import {
   hasStewardLoginLauncher,
@@ -163,44 +163,65 @@ interface CloudLoginPublicationAuthority {
   restoreIfCurrent(): Promise<void>;
 }
 
-function isCommittedCloudLoginAuthorityLive(
-  recovery: StewardSessionRecoveryReceipt,
-): boolean {
-  const snapshot = readStewardSessionRecovery(recovery.tenantId);
-  return (
-    snapshot.storageAvailable &&
-    snapshot.generation === recovery.receipt &&
-    !snapshot.receipts.includes(recovery.receipt)
-  );
+interface CommittedCloudLoginAuthority {
+  /** Re-check after every await continuation before external completion UI. */
+  isCurrent(): boolean;
+  /** CAS-safe composite rollback for a continuation superseded after await. */
+  restoreIfCurrent(): Promise<void>;
+}
+
+interface ExactCloudSessionAuthority {
+  token: string | null;
+  isCurrent(): boolean;
+}
+
+function captureExactCloudSessionAuthority(
+  expectedToken: string | null = getCloudAuthToken(client),
+): ExactCloudSessionAuthority | null {
+  const token = expectedToken?.trim() || null;
+  const tenantId = configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID);
+  const snapshot = readStewardSessionRecovery(tenantId);
+  if (!snapshot.storageAvailable || snapshot.receipts.length > 0) return null;
+  return {
+    token,
+    isCurrent: () => {
+      const current = readStewardSessionRecovery(tenantId);
+      return (
+        current.storageAvailable &&
+        current.generation === snapshot.generation &&
+        current.receipts.length === 0 &&
+        getCloudAuthToken(client) === token
+      );
+    },
+  };
 }
 
 async function commitCloudLoginAuthority(
   recovery: StewardSessionRecoveryReceipt,
   publish: (
     validate: () => boolean,
-    commitReceipt: () => boolean,
+    finalizeReceipt: () => StewardSessionRecoveryPublicationRollback,
   ) => Promise<CloudLoginPublicationAuthority | false>,
-): Promise<boolean> {
+): Promise<CommittedCloudLoginAuthority | null> {
   return enqueueStewardSessionMutation(async () => {
-    let receiptCommitted = false;
-    const validate = () =>
-      receiptCommitted
-        ? isCommittedCloudLoginAuthorityLive(recovery)
-        : isStewardSessionRecoveryReceiptLive(recovery);
-    const commitReceipt = (): boolean => {
-      if (receiptCommitted) return validate();
-      if (!validate()) return false;
-      receiptCommitted = commitStewardSessionRecoveryForPublication(recovery);
-      return receiptCommitted;
-    };
-    if (!validate()) return false;
-    const publication = await publish(validate, commitReceipt);
-    if (publication === false) return false;
-    if (!receiptCommitted || !validate()) {
+    const recoveryPublication =
+      createStewardSessionRecoveryPublicationFence(recovery);
+    const validate = recoveryPublication.validate;
+    if (!validate()) return null;
+    const publication = await publish(
+      validate,
+      recoveryPublication.finalizeBeforePublish,
+    );
+    if (publication === false) return null;
+    if (!recoveryPublication.isFinalized() || !validate()) {
       await publication.restoreIfCurrent();
-      return false;
+      return null;
     }
-    return true;
+    const currentAfterRecoveryEvent = recoveryPublication.publishChange();
+    return {
+      isCurrent: () => currentAfterRecoveryEvent && validate(),
+      restoreIfCurrent: publication.restoreIfCurrent,
+    };
   });
 }
 
@@ -299,14 +320,22 @@ function publishElizaCloudVoiceSnapshot(
     cloudVoiceProxyAvailable: boolean;
     hasPersistedApiKey: boolean;
   },
-): void {
-  setHasPersistedKey(snapshot.hasPersistedApiKey);
+  validateAuthority: () => boolean = () => true,
+): boolean {
+  // The status event is itself an externally observable publication. Fence it
+  // before dispatch (a different renderer may have advanced the durable login
+  // generation since the caller's last check), then fence the local state again
+  // in case a synchronous listener starts a newer login while handling it.
+  if (!validateAuthority()) return false;
   dispatchElizaCloudStatusUpdated({
     connected: snapshot.apiConnected,
     enabled: snapshot.enabled,
     hasPersistedApiKey: snapshot.hasPersistedApiKey,
     cloudVoiceProxyAvailable: snapshot.cloudVoiceProxyAvailable,
   });
+  if (!validateAuthority()) return false;
+  setHasPersistedKey(snapshot.hasPersistedApiKey);
+  return true;
 }
 
 function isSameOriginLocalHttpBackend(): boolean {
@@ -418,18 +447,27 @@ function openNamedCloudLoginPopup(url: string): Window | null {
   }
 }
 
-function closePopupWindow(popup: Window | null): void {
-  if (!popup || popup.closed) return;
+function closePopupWindow(
+  popup: Window | null,
+  validateClose: () => boolean = () => true,
+): void {
+  // A named browser window can be reused by a newer login. Validate before
+  // every mutation, not only inside the fallback timer, so a stale continuation
+  // cannot close or blank the popup now owned by that newer authority.
+  if (!validateClose() || !popup || popup.closed) return;
   try {
+    if (!validateClose()) return;
     popup.close();
   } catch (error) {
     void error;
     // error-policy:J6 best-effort popup teardown after auth return.
   }
   try {
+    if (!validateClose()) return;
     if (!popup.closed) {
       popup.location.href = "about:blank";
       globalThis.setTimeout(() => {
+        if (!validateClose()) return;
         try {
           popup.close();
         } catch (error) {
@@ -444,18 +482,36 @@ function closePopupWindow(popup: Window | null): void {
   }
 }
 
-function closeCloudLoginPopup(popup: Window | null): void {
-  const hadKnownPopup = Boolean(popup || activeCloudLoginPopup);
+function closeCloudLoginPopup(
+  popup: Window | null,
+  validateClose: () => boolean = () => true,
+): void {
+  if (!validateClose()) return;
+
+  const activePopupAtEntry = activeCloudLoginPopup;
+  const hadKnownPopup = Boolean(popup || activePopupAtEntry);
   const candidates: Window[] = [];
   const addCandidate = (candidate: Window | null) => {
     if (!candidate || candidates.includes(candidate)) return;
     candidates.push(candidate);
   };
   addCandidate(popup);
-  addCandidate(activeCloudLoginPopup);
-  activeCloudLoginPopup = null;
+  // An explicit handle owns only itself. Do not let an older caller collect a
+  // different active handle that a newer login installed in the meantime.
+  if (!popup || activePopupAtEntry === popup) {
+    addCandidate(activePopupAtEntry);
+  }
+  if (!validateClose()) return;
+  if (
+    activePopupAtEntry &&
+    activeCloudLoginPopup === activePopupAtEntry &&
+    candidates.includes(activePopupAtEntry)
+  ) {
+    activeCloudLoginPopup = null;
+  }
   if (
     hadKnownPopup &&
+    validateClose() &&
     typeof window !== "undefined" &&
     typeof window.open === "function"
   ) {
@@ -466,11 +522,15 @@ function closeCloudLoginPopup(popup: Window | null): void {
       // error-policy:J6 reclaiming a named popup is opportunistic cleanup.
     }
   }
-  candidates.forEach(closePopupWindow);
+  for (const candidate of candidates) {
+    closePopupWindow(candidate, validateClose);
+  }
 }
 
-function closeActiveCloudLoginPopup(): void {
-  closeCloudLoginPopup(activeCloudLoginPopup);
+function closeActiveCloudLoginPopup(
+  validateDelayedClose?: () => boolean,
+): void {
+  closeCloudLoginPopup(activeCloudLoginPopup, validateDelayedClose);
 }
 
 function closeReturnedAuthTabIfOpenerStillExists(): void {
@@ -753,11 +813,16 @@ export function useCloudState({
 
   async function runCloudPoll(
     intent: PollIntent = "ambient",
+    validateAuthority: () => boolean = () => true,
   ): Promise<boolean> {
+    if (!validateAuthority()) return lastElizaCloudPollConnectedRef.current;
     const pollToken = getCloudAuthToken(client);
-    const pollGeneration = readStewardSessionGeneration(
+    const pollRecovery = readStewardSessionRecovery(
       configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID),
     );
+    if (!pollRecovery.storageAvailable || pollRecovery.receipts.length > 0) {
+      return lastElizaCloudPollConnectedRef.current;
+    }
     const buildPinnedRemoteApiBase = getBuildConfiguredRemoteApiBaseUrl();
     if (intent === "ambient" && !canPollCloudStatus()) {
       if (elizaCloudPollInterval.current) {
@@ -766,7 +831,7 @@ export function useCloudState({
       }
       return lastElizaCloudPollConnectedRef.current;
     }
-    if (elizaCloudDisconnectInFlightRef.current) {
+    if (elizaCloudDisconnectInFlightRef.current || !validateAuthority()) {
       return lastElizaCloudPollConnectedRef.current;
     }
 
@@ -801,15 +866,24 @@ export function useCloudState({
     if (!cloudStatus) {
       return lastElizaCloudPollConnectedRef.current;
     }
-    const currentGeneration = readStewardSessionGeneration(
+    const currentRecovery = readStewardSessionRecovery(
       configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID),
     );
-    if (
-      getCloudAuthToken(client) !== pollToken ||
-      !pollGeneration.storageAvailable ||
-      !currentGeneration.storageAvailable ||
-      currentGeneration.generation !== pollGeneration.generation
-    ) {
+    const pollAuthorityIsCurrent = () => {
+      const latestRecovery = readStewardSessionRecovery(
+        configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID),
+      );
+      return (
+        getCloudAuthToken(client) === pollToken &&
+        validateAuthority() &&
+        pollRecovery.storageAvailable &&
+        pollRecovery.receipts.length === 0 &&
+        latestRecovery.storageAvailable &&
+        latestRecovery.generation === pollRecovery.generation &&
+        latestRecovery.receipts.length === 0
+      );
+    };
+    if (!currentRecovery.storageAvailable || !pollAuthorityIsCurrent()) {
       return lastElizaCloudPollConnectedRef.current;
     }
     const enabled = Boolean(cloudStatus.enabled ?? false);
@@ -819,53 +893,35 @@ export function useCloudState({
     const hasPersistedApiKey = Boolean(cloudStatus.hasApiKey);
     // Trust `connected` from the server snapshot (it already folds in API key + CLOUD_AUTH).
     const isConnected = Boolean(cloudStatus.connected);
-    if (isConnected && cloudStatus.userId && pollToken) {
-      verifiedCloudAccountAuthorityRef.current = {
-        sessionGeneration: pollGeneration.generation,
-        stewardToken: pollToken,
-        userId: cloudStatus.userId,
-      };
-    } else if (!isConnected) {
-      verifiedCloudAccountAuthorityRef.current = null;
-    }
     if (isConnected && elizaCloudPreferDisconnectedUntilLoginRef.current) {
-      publishElizaCloudVoiceSnapshot(setElizaCloudHasPersistedKey, {
-        apiConnected: isConnected,
-        enabled,
-        cloudVoiceProxyAvailable,
-        hasPersistedApiKey,
-      });
+      if (
+        !publishElizaCloudVoiceSnapshot(
+          setElizaCloudHasPersistedKey,
+          {
+            apiConnected: isConnected,
+            enabled,
+            cloudVoiceProxyAvailable,
+            hasPersistedApiKey,
+          },
+          pollAuthorityIsCurrent,
+        )
+      ) {
+        return lastElizaCloudPollConnectedRef.current;
+      }
       lastElizaCloudPollConnectedRef.current = false;
       return false;
     }
     if (!isConnected) {
       elizaCloudPreferDisconnectedUntilLoginRef.current = false;
     }
-    setElizaCloudEnabled(enabled);
-    setElizaCloudVoiceProxyAvailable(cloudVoiceProxyAvailable);
-    setElizaCloudConnected(isConnected);
-    publishElizaCloudVoiceSnapshot(setElizaCloudHasPersistedKey, {
-      apiConnected: isConnected,
-      enabled,
-      cloudVoiceProxyAvailable,
-      hasPersistedApiKey,
-    });
-    setElizaCloudUserId(cloudStatus.userId ?? null);
-    setElizaCloudStatusReason(
-      isConnected &&
-        typeof cloudStatus.reason === "string" &&
-        cloudStatus.reason.trim()
-        ? cloudStatus.reason.trim()
-        : null,
-    );
-    if (cloudStatus.topUpUrl) setElizaCloudTopUpUrl(cloudStatus.topUpUrl);
+    let creditsFetchError: string | null = null;
+    let credits: CloudCredits | null | undefined;
     if (isConnected) {
       // error-policy:J4 a transport failure fetching credits degrades to null
       // (no fabricated balance) but is carried into the visible credits-error
       // state below — the balance widget renders a real error, never
       // healthy-empty; the next poll interval retries.
-      let creditsFetchError: string | null = null;
-      const credits =
+      credits =
         prefetchedCloudCredits !== undefined
           ? prefetchedCloudCredits
           : await client.getCloudCredits().catch((err: unknown) => {
@@ -877,9 +933,52 @@ export function useCloudState({
               );
               return null;
             });
-      if (elizaCloudDisconnectInFlightRef.current) {
+      if (
+        elizaCloudDisconnectInFlightRef.current ||
+        !pollAuthorityIsCurrent()
+      ) {
         return lastElizaCloudPollConnectedRef.current;
       }
+    }
+    // Status and credits are collected before any account-A UI/event is
+    // exposed. A newer login that starts during the final network await can
+    // therefore discard the whole snapshot instead of leaving stale A state.
+    if (
+      !publishElizaCloudVoiceSnapshot(
+        setElizaCloudHasPersistedKey,
+        {
+          apiConnected: isConnected,
+          enabled,
+          cloudVoiceProxyAvailable,
+          hasPersistedApiKey,
+        },
+        pollAuthorityIsCurrent,
+      )
+    ) {
+      return lastElizaCloudPollConnectedRef.current;
+    }
+    if (isConnected && cloudStatus.userId && pollToken) {
+      verifiedCloudAccountAuthorityRef.current = {
+        sessionGeneration: pollRecovery.generation,
+        stewardToken: pollToken,
+        userId: cloudStatus.userId,
+      };
+    } else if (!isConnected) {
+      verifiedCloudAccountAuthorityRef.current = null;
+    }
+    setElizaCloudEnabled(enabled);
+    setElizaCloudVoiceProxyAvailable(cloudVoiceProxyAvailable);
+    setElizaCloudConnected(isConnected);
+    setElizaCloudUserId(cloudStatus.userId ?? null);
+    setElizaCloudStatusReason(
+      isConnected &&
+        typeof cloudStatus.reason === "string" &&
+        cloudStatus.reason.trim()
+        ? cloudStatus.reason.trim()
+        : null,
+    );
+    if (cloudStatus.topUpUrl) setElizaCloudTopUpUrl(cloudStatus.topUpUrl);
+    if (isConnected) {
       if (credits?.authRejected) {
         setElizaCloudAuthRejected(true);
         setElizaCloudCreditsError(null);
@@ -951,20 +1050,44 @@ export function useCloudState({
     async (cloudApiBase?: string): Promise<boolean> => {
       const token = readStoredStewardToken()?.trim();
       if (!token) return false;
+      const sessionAuthority = captureExactCloudSessionAuthority(token);
+      if (!sessionAuthority?.isCurrent()) return false;
       const authenticatedCloudApiBase = resolveDirectCloudAuthApiBase(
         cloudApiBase ??
           getBootConfig().cloudApiBase ??
           DEFAULT_DIRECT_CLOUD_BASE_URL,
       );
-      setBootConfig({
+      const previousBootConfig = getBootConfig();
+      const publishedBootConfig = {
         ...getBootConfig(),
         cloudApiBase: authenticatedCloudApiBase,
-      });
+      };
+      setBootConfig(publishedBootConfig);
+      let clientTargetAuthority: SessionTargetAuthority | null = null;
+      const restorePublishedTarget = () => {
+        clientTargetAuthority?.restoreIfCurrent();
+        if (getBootConfig() === publishedBootConfig) {
+          setBootConfig(previousBootConfig);
+        }
+      };
       if (!getBuildConfiguredRemoteApiBaseUrl()) {
-        client.setBaseUrl(authenticatedCloudApiBase, { persist: false });
-        client.setToken(token);
+        clientTargetAuthority = client.stageSessionTarget(
+          { baseUrl: authenticatedCloudApiBase, token },
+          { persist: false },
+        );
+        if (
+          !clientTargetAuthority ||
+          !sessionAuthority.isCurrent() ||
+          !clientTargetAuthority.publish()
+        ) {
+          restorePublishedTarget();
+          return false;
+        }
       }
-      const connected = await pollCloudCredits("session-verification");
+      if (!sessionAuthority.isCurrent()) {
+        restorePublishedTarget();
+        return false;
+      }
       try {
         await loadWalletConfig();
       } catch (err) {
@@ -975,6 +1098,18 @@ export function useCloudState({
           { err },
           "[useCloudState] wallet config unavailable after Cloud auth",
         );
+      }
+      if (!sessionAuthority.isCurrent()) {
+        restorePublishedTarget();
+        return false;
+      }
+      const connected = await pollCloudCredits(
+        "session-verification",
+        sessionAuthority.isCurrent,
+      );
+      if (!sessionAuthority.isCurrent()) {
+        restorePublishedTarget();
+        return false;
       }
       if (!connected) return false;
       setElizaCloudConnected(true);
@@ -989,9 +1124,13 @@ export function useCloudState({
     let cancelled = false;
 
     const reconcile = async (apiBase?: string) => {
+      const expectedToken = readStoredStewardToken()?.trim() || null;
+      const continuationAuthority = expectedToken
+        ? captureExactCloudSessionAuthority(expectedToken)
+        : null;
       try {
         const connected = await reconcileAndroidCloudSession(apiBase);
-        if (!cancelled && !connected && readStoredStewardToken()?.trim()) {
+        if (!cancelled && !connected && continuationAuthority?.isCurrent()) {
           setElizaCloudLoginError(
             "Could not verify your Eliza Cloud session. Please sign in again.",
           );
@@ -1003,7 +1142,7 @@ export function useCloudState({
           { err },
           "[useCloudState] Android Cloud session reconciliation failed",
         );
-        if (!cancelled) {
+        if (!cancelled && continuationAuthority?.isCurrent()) {
           setElizaCloudLoginError(
             err instanceof CloudSessionVerificationTransientError
               ? CLOUD_SESSION_VERIFICATION_TRANSIENT_MESSAGE
@@ -1037,8 +1176,8 @@ export function useCloudState({
       options: CloudLoginOptions = {},
     ) => {
       rememberCloudLoginPopup(prePoppedWindow);
-      const closePrePoppedWindow = () => {
-        closeCloudLoginPopup(prePoppedWindow);
+      const closePrePoppedWindow = (validateDelayedClose?: () => boolean) => {
+        closeCloudLoginPopup(prePoppedWindow, validateDelayedClose);
       };
       let cloudAuthMessageHandler: ((event: MessageEvent) => void) | null =
         null;
@@ -1102,6 +1241,17 @@ export function useCloudState({
         resolveLoginCompletion();
       };
       elizaCloudLoginCompletionRef.current = loginCompletion;
+      let deviceCodeRecoveryReceipt: StewardSessionRecoveryReceipt | null =
+        null;
+      let deviceCodeRecoveryIsCurrent: (() => boolean) | null = null;
+      const finishSupersededDeviceCodeAttempt = () => {
+        removeCloudAuthMessageListener();
+        if (elizaCloudLoginCompletionRef.current === loginCompletion) {
+          elizaCloudLoginBusyRef.current = false;
+          setElizaCloudLoginBusy(false);
+        }
+        completeLogin();
+      };
 
       // The Play build uses the same canonical first-run chat and full app as
       // every other platform. Only its hosted PKCE handoff is Android-specific:
@@ -1271,13 +1421,35 @@ export function useCloudState({
       ) {
         const siweBase = getBootConfig().cloudApiBase ?? "https://eliza.app";
         try {
-          const apiKey = await siweLoginWithInjectedWallet(siweBase);
-          if (apiKey) {
-            closePrePoppedWindow();
-            const connected = await pollCloudCredits("session-verification");
+          const committedSiwe =
+            await siweLoginWithInjectedWalletAuthority(siweBase);
+          if (committedSiwe) {
+            const finishSupersededSiweLogin = () => {
+              elizaCloudLoginBusyRef.current = false;
+              setElizaCloudLoginBusy(false);
+              completeLogin();
+              return loginCompletion;
+            };
+            if (!committedSiwe.authority.isCurrent()) {
+              return finishSupersededSiweLogin();
+            }
+            closePrePoppedWindow(committedSiwe.authority.isCurrent);
+            if (!committedSiwe.authority.isCurrent()) {
+              return finishSupersededSiweLogin();
+            }
+            const connected = await pollCloudCredits(
+              "session-verification",
+              committedSiwe.authority.isCurrent,
+            );
+            if (!committedSiwe.authority.isCurrent()) {
+              return finishSupersededSiweLogin();
+            }
             // error-policy:J4 wallet config is a secondary panel; a failed
             // load must not undo a verified login.
             await loadWalletConfig().catch(() => undefined);
+            if (!committedSiwe.authority.isCurrent()) {
+              return finishSupersededSiweLogin();
+            }
             if (connected) {
               setElizaCloudConnected(true);
               setElizaCloudLoginError(null);
@@ -1285,6 +1457,9 @@ export function useCloudState({
               setElizaCloudLoginError(
                 "Could not verify your Eliza Cloud session. Please sign in again.",
               );
+            }
+            if (!committedSiwe.authority.isCurrent()) {
+              return finishSupersededSiweLogin();
             }
             elizaCloudLoginBusyRef.current = false;
             setElizaCloudLoginBusy(false);
@@ -1324,14 +1499,33 @@ export function useCloudState({
         try {
           const reusedStoredCredential = hasUsableStoredStewardToken();
           if (!reusedStoredCredential) closePrePoppedWindow();
-          await launchStewardLogin();
+          let stewardLogin = await launchStewardLogin();
+          if (!stewardLogin.authority.isCurrent()) return loginCompletion;
+          let stewardLoginRecovery = readStewardSessionRecovery(
+            configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID),
+          );
+          const stewardRecoveryIsCurrent = () => {
+            const current = readStewardSessionRecovery(
+              configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID),
+            );
+            return (
+              stewardLoginRecovery.storageAvailable &&
+              stewardLoginRecovery.receipts.length === 0 &&
+              current.storageAvailable &&
+              current.generation === stewardLoginRecovery.generation &&
+              current.receipts.length === 0
+            );
+          };
           // Gate the connected state + success toast on an ACTUAL authed status
           // call. `launchStewardLogin` short-circuits on a stored token; if that
           // token is stale/revoked the status poll reports disconnected, so
           // declaring "connected" + toasting here would be a false success that
           // 401s the agent picker in a loop. Only celebrate a verified session;
           // otherwise surface the re-auth path the login UI already renders.
-          let connected = await pollCloudCredits("session-verification");
+          let connected = await pollCloudCredits(
+            "session-verification",
+            stewardLogin.authority.isCurrent,
+          );
           // A direct identity 401 clears only the exact rejected Steward
           // credential. When launchStewardLogin reused that credential, invoke
           // the mounted sign-in surface now and verify the replacement on this
@@ -1343,8 +1537,15 @@ export function useCloudState({
           ) {
             if (hasStewardLoginLauncher()) {
               closePrePoppedWindow();
-              await launchStewardLogin();
-              connected = await pollCloudCredits("session-verification");
+              stewardLogin = await launchStewardLogin();
+              if (!stewardLogin.authority.isCurrent()) return loginCompletion;
+              stewardLoginRecovery = readStewardSessionRecovery(
+                configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID),
+              );
+              connected = await pollCloudCredits(
+                "session-verification",
+                stewardLogin.authority.isCurrent,
+              );
             } else {
               // The opaque token was the only reason this branch was usable.
               // With it authoritatively rejected and no in-app provider,
@@ -1354,11 +1555,32 @@ export function useCloudState({
             }
           }
           if (!fallThroughToLegacyLogin) {
-            closePrePoppedWindow();
+            // A direct 401/403 clears the exact rejected token. That expected
+            // token loss makes the token-based authority false, but it is not
+            // a superseding login while the captured recovery generation is
+            // still clean. Finish the rejected-session UI in that narrow case;
+            // a concurrently planted receipt still suppresses every A effect.
+            if (
+              !connected &&
+              !readStoredStewardToken()?.trim() &&
+              stewardRecoveryIsCurrent()
+            ) {
+              closePrePoppedWindow(stewardRecoveryIsCurrent);
+              if (!stewardRecoveryIsCurrent()) return loginCompletion;
+              setElizaCloudConnected(false);
+              setElizaCloudLoginError(
+                "Could not verify your Eliza Cloud session. Please sign in again.",
+              );
+              return loginCompletion;
+            }
+            if (!stewardLogin.authority.isCurrent()) return loginCompletion;
+            closePrePoppedWindow(stewardLogin.authority.isCurrent);
+            if (!stewardLogin.authority.isCurrent()) return loginCompletion;
             // error-policy:J4 wallet config is a secondary panel; a failed
             // load must not undo a verified login. The wallet section renders
             // its own unavailable state from the empty config.
             await loadWalletConfig().catch(() => undefined);
+            if (!stewardLogin.authority.isCurrent()) return loginCompletion;
             if (connected) {
               setElizaCloudConnected(true);
               setElizaCloudLoginError(null);
@@ -1393,10 +1615,19 @@ export function useCloudState({
       }
 
       // A stored-but-stale Steward JWT with no launcher mounted: drain it so it
-      // cannot shadow the device-code credentials in subsequent authed calls
-      // (this mirrors what launchStewardLogin would have done before throwing).
+      // cannot shadow the device-code credentials in subsequent authed calls.
+      // `hasUsableStoredStewardToken` also returns false for a usable account-A
+      // token quarantined behind login B, however; only a provably clean
+      // recovery snapshot permits treating the value as stale and deleting it.
       const staleStewardToken = readStoredStewardToken()?.trim();
-      if (staleStewardToken) {
+      const recoveryBeforeLegacyLogin = readStewardSessionRecovery(
+        configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID),
+      );
+      if (
+        staleStewardToken &&
+        recoveryBeforeLegacyLogin.storageAvailable &&
+        recoveryBeforeLegacyLogin.receipts.length === 0
+      ) {
         await clearStoredStewardTokenIfUnchanged(staleStewardToken);
       }
 
@@ -1411,10 +1642,23 @@ export function useCloudState({
       let useDirectAuth = !hasBackend || usesHostedLoopbackStagingSession;
 
       if (hasBackend) {
+        const statusAuthority = captureExactCloudSessionAuthority();
+        if (!statusAuthority?.isCurrent()) {
+          elizaCloudLoginBusyRef.current = false;
+          setElizaCloudLoginBusy(false);
+          completeLogin();
+          return loginCompletion;
+        }
         // error-policy:J4 a null status here is a designed branch: a
         // browser/dev shell with no local agent proxy falls back to the direct
         // Cloud auth flow (below), not an error state.
         const cloudStatus = await client.getCloudStatus().catch(() => null);
+        if (!statusAuthority.isCurrent()) {
+          elizaCloudLoginBusyRef.current = false;
+          setElizaCloudLoginBusy(false);
+          completeLogin();
+          return loginCompletion;
+        }
         if (cloudStatus === null) {
           // Browser/dev shells can run on localhost without a local agent proxy.
           // In that case, keep first-run Cloud usable via the direct Cloud flow.
@@ -1427,10 +1671,16 @@ export function useCloudState({
         if (
           !options.forceReauth &&
           alreadyAuthenticated &&
-          hasRequiredClientAuth()
+          hasRequiredClientAuth() &&
+          statusAuthority.isCurrent()
         ) {
-          closePrePoppedWindow();
-          await pollCloudCredits("session-verification");
+          closePrePoppedWindow(statusAuthority.isCurrent);
+          if (!statusAuthority.isCurrent()) return loginCompletion;
+          await pollCloudCredits(
+            "session-verification",
+            statusAuthority.isCurrent,
+          );
+          if (!statusAuthority.isCurrent()) return loginCompletion;
           await loadWalletConfig().catch((err: unknown) => {
             // error-policy:J4 already-authenticated login has succeeded; a
             // wallet config refresh failure must not wedge the login button.
@@ -1439,7 +1689,9 @@ export function useCloudState({
               "[useCloudState] wallet config refresh failed after cloud login",
             );
           });
+          if (!statusAuthority.isCurrent()) return loginCompletion;
           setElizaCloudLoginError(null);
+          if (!statusAuthority.isCurrent()) return loginCompletion;
           setActionNotice("Already connected to Eliza Cloud.", "info", 4000);
           elizaCloudLoginBusyRef.current = false;
           setElizaCloudLoginBusy(false);
@@ -1484,6 +1736,10 @@ export function useCloudState({
         // retires it, so a delayed authenticated poll can no longer publish A
         // after B has become authoritative.
         const deviceCodeRecovery = beginCloudLoginAuthorityRecovery();
+        deviceCodeRecoveryReceipt = deviceCodeRecovery;
+        const validateDeviceCodeRecovery = () =>
+          isStewardSessionRecoveryReceiptLive(deviceCodeRecovery);
+        deviceCodeRecoveryIsCurrent = validateDeviceCodeRecovery;
         let resp: {
           ok: boolean;
           apiBase?: string;
@@ -1496,6 +1752,10 @@ export function useCloudState({
           resp = prepared
             ? await prepared
             : await client.cloudLoginDirect(cloudApiBase);
+          if (!deviceCodeRecoveryIsCurrent()) {
+            finishSupersededDeviceCodeAttempt();
+            return loginCompletion;
+          }
           // The warm-up is speculative. If it failed while the CTA was idle,
           // retry on the deliberate click instead of surfacing a stale result.
           if (prepared && !resp.ok) {
@@ -1504,15 +1764,23 @@ export function useCloudState({
         } else {
           resp = await client.cloudLogin();
         }
+        if (!deviceCodeRecoveryIsCurrent()) {
+          finishSupersededDeviceCodeAttempt();
+          return loginCompletion;
+        }
         if (!resp.ok) {
-          rejectCloudLoginAuthorityRecovery(deviceCodeRecovery);
-          closePrePoppedWindow();
+          closePrePoppedWindow(deviceCodeRecoveryIsCurrent);
+          if (!deviceCodeRecoveryIsCurrent()) {
+            finishSupersededDeviceCodeAttempt();
+            return loginCompletion;
+          }
           setElizaCloudLoginError(
             resp.error || "Failed to start Eliza Cloud login",
           );
           elizaCloudLoginBusyRef.current = false;
           setElizaCloudLoginBusy(false);
           completeLogin();
+          rejectCloudLoginAuthorityRecovery(deviceCodeRecovery);
           return loginCompletion;
         }
 
@@ -1521,6 +1789,7 @@ export function useCloudState({
           useDirectAuth && resp.apiBase ? resp.apiBase : cloudApiBase;
         if (sessionId && typeof window !== "undefined") {
           cloudAuthMessageHandler = (event: MessageEvent) => {
+            if (!deviceCodeRecoveryIsCurrent?.()) return;
             if (
               !isTrustedCloudAuthMessageOrigin(
                 event.origin,
@@ -1532,7 +1801,8 @@ export function useCloudState({
             if (!isMatchingCloudAuthCompleteMessage(event.data, sessionId)) {
               return;
             }
-            closePrePoppedWindow();
+            closePrePoppedWindow(deviceCodeRecoveryIsCurrent);
+            if (!deviceCodeRecoveryIsCurrent()) return;
             void closeExternalBrowser();
           };
           window.addEventListener("message", cloudAuthMessageHandler);
@@ -1549,6 +1819,10 @@ export function useCloudState({
         // bootstrapped, or any environment where xdg-open silently fails)
         // open without crashing but never surface a usable window.
         if (resp.browserUrl && isSafeNavigationUrl(resp.browserUrl)) {
+          if (!deviceCodeRecoveryIsCurrent()) {
+            finishSupersededDeviceCodeAttempt();
+            return loginCompletion;
+          }
           setElizaCloudLoginFallbackUrl(resp.browserUrl);
           // Popup-hostile localhost browsers carry this tab through hosted
           // staging auth. The opaque CLI session returns to localhost for the
@@ -1558,6 +1832,10 @@ export function useCloudState({
             usesHostedLoopbackStagingSession &&
             (!prePoppedWindow || prePoppedWindow.closed)
           ) {
+            if (!deviceCodeRecoveryIsCurrent()) {
+              finishSupersededDeviceCodeAttempt();
+              return loginCompletion;
+            }
             window.location.assign(resp.browserUrl);
             elizaCloudLoginBusyRef.current = false;
             setElizaCloudLoginBusy(false);
@@ -1570,21 +1848,41 @@ export function useCloudState({
           // Desktop owns external navigation through its native RPC instead.
           if (isElectrobunRuntime()) {
             const opened = await openExternalUrl(resp.browserUrl);
+            if (!deviceCodeRecoveryIsCurrent()) {
+              finishSupersededDeviceCodeAttempt();
+              return loginCompletion;
+            }
             if (!opened) {
               setElizaCloudLoginError(
                 `Couldn't open the sign-in browser. Open this link to log in: ${resp.browserUrl}`,
               );
             }
           } else if (prePoppedWindow) {
+            if (!deviceCodeRecoveryIsCurrent()) {
+              finishSupersededDeviceCodeAttempt();
+              return loginCompletion;
+            }
             navigatePreOpenedWindow(prePoppedWindow, resp.browserUrl, {
               preserveOpener: true,
             });
           } else {
+            if (!deviceCodeRecoveryIsCurrent()) {
+              finishSupersededDeviceCodeAttempt();
+              return loginCompletion;
+            }
             const popup = openNamedCloudLoginPopup(resp.browserUrl);
             if (!popup) {
               try {
                 await openExternalUrl(resp.browserUrl);
+                if (!deviceCodeRecoveryIsCurrent()) {
+                  finishSupersededDeviceCodeAttempt();
+                  return loginCompletion;
+                }
               } catch {
+                if (!deviceCodeRecoveryIsCurrent()) {
+                  finishSupersededDeviceCodeAttempt();
+                  return loginCompletion;
+                }
                 // error-policy:J4 browser launch failed — degrade to a visible
                 // copyable link so the user can complete login manually.
                 setElizaCloudLoginError(
@@ -1594,7 +1892,11 @@ export function useCloudState({
             }
           }
         } else {
-          closePrePoppedWindow();
+          closePrePoppedWindow(deviceCodeRecoveryIsCurrent);
+          if (!deviceCodeRecoveryIsCurrent()) {
+            finishSupersededDeviceCodeAttempt();
+            return loginCompletion;
+          }
           if (resp.browserUrl) {
             // The login URL is a wire value assigned to a same-origin
             // pre-opened popup / named window — a non-http(s) target fails
@@ -1603,11 +1905,11 @@ export function useCloudState({
             setElizaCloudLoginError(
               "The login link returned by the server is not a valid URL.",
             );
-            rejectCloudLoginAuthorityRecovery(deviceCodeRecovery);
             removeCloudAuthMessageListener();
             elizaCloudLoginBusyRef.current = false;
             setElizaCloudLoginBusy(false);
             completeLogin();
+            rejectCloudLoginAuthorityRecovery(deviceCodeRecovery);
             return loginCompletion;
           }
         }
@@ -1615,37 +1917,57 @@ export function useCloudState({
         let pollInFlight = false;
         let consecutivePollErrors = 0;
         const pollDeadline = Date.now() + ELIZA_CLOUD_LOGIN_TIMEOUT_MS;
+        let pollingTimer: number | null = null;
         const stopCloudLoginPolling = (
           error: string | null = null,
           disposition: "preserve" | "reject" = "preserve",
         ) => {
-          if (disposition === "reject") {
-            rejectCloudLoginAuthorityRecovery(deviceCodeRecovery);
-          }
-          if (elizaCloudLoginPollTimer.current !== null) {
-            clearInterval(elizaCloudLoginPollTimer.current);
-            elizaCloudLoginPollTimer.current = null;
+          const authorityCurrent = validateDeviceCodeRecovery();
+          if (pollingTimer !== null) {
+            const timer = pollingTimer;
+            pollingTimer = null;
+            clearInterval(timer);
+            if (elizaCloudLoginPollTimer.current === timer) {
+              elizaCloudLoginPollTimer.current = null;
+            }
           }
           removeCloudAuthMessageListener();
-          elizaCloudLoginBusyRef.current = false;
-          setElizaCloudLoginBusy(false);
-          // Clear the manual-link fallback once the device-code session is
-          // no longer active — the URL is single-use and showing a stale
-          // link after timeout / cancellation is misleading.
-          setElizaCloudLoginFallbackUrl(null);
-          if (error !== null) {
-            setElizaCloudLoginError(error);
+          if (elizaCloudLoginCompletionRef.current === loginCompletion) {
+            elizaCloudLoginBusyRef.current = false;
+            setElizaCloudLoginBusy(false);
+            // Clear the manual-link fallback once this exact device-code
+            // session is no longer active. A newer login owns its own state.
+            setElizaCloudLoginFallbackUrl(null);
+            if (error !== null && authorityCurrent) {
+              setElizaCloudLoginError(error);
+            }
           }
           completeLogin();
+          if (disposition === "reject" && authorityCurrent) {
+            rejectCloudLoginAuthorityRecovery(deviceCodeRecovery);
+          }
         };
 
         // Start polling
-        elizaCloudLoginPollTimer.current = window.setInterval(async () => {
-          if (!elizaCloudLoginPollTimer.current || pollInFlight) return;
+        pollingTimer = window.setInterval(async () => {
+          if (!validateDeviceCodeRecovery()) {
+            stopCloudLoginPolling();
+            return;
+          }
+          if (
+            pollingTimer === null ||
+            elizaCloudLoginPollTimer.current !== pollingTimer ||
+            pollInFlight
+          ) {
+            return;
+          }
 
           pollInFlight = true;
           try {
-            if (!elizaCloudLoginPollTimer.current) return;
+            if (elizaCloudLoginPollTimer.current !== pollingTimer) {
+              stopCloudLoginPolling();
+              return;
+            }
             let poll: {
               status: string;
               organizationId?: string;
@@ -1661,6 +1983,10 @@ export function useCloudState({
             } else {
               poll = await client.cloudLoginPoll(sessionId);
             }
+            if (!validateDeviceCodeRecovery()) {
+              stopCloudLoginPolling();
+              return;
+            }
             if (!elizaCloudLoginPollTimer.current) return;
 
             consecutivePollErrors = 0;
@@ -1669,6 +1995,7 @@ export function useCloudState({
                 if (!poll.token) {
                   stopCloudLoginPolling(
                     "Eliza Cloud login completed, but the cloud session did not return a session token.",
+                    "reject",
                   );
                   return;
                 }
@@ -1676,7 +2003,7 @@ export function useCloudState({
 
               const committed = await commitCloudLoginAuthority(
                 deviceCodeRecovery,
-                async (validate, commitReceipt) => {
+                async (validate, finalizeReceipt) => {
                   const bindsElectrobunPersonalAgent =
                     useDirectAuth &&
                     Boolean(poll.token) &&
@@ -1690,6 +2017,8 @@ export function useCloudState({
                   let publishedBootConfig: ReturnType<
                     typeof getBootConfig
                   > | null = null;
+                  let standaloneRecoveryRollback: StewardSessionRecoveryPublicationRollback | null =
+                    null;
                   let uiPublished = false;
                   const previousUiState = cloudLoginUiStateRef.current;
                   let publishedUiState: typeof previousUiState | null = null;
@@ -1721,17 +2050,21 @@ export function useCloudState({
                         publishedBootConfig,
                       });
                     } finally {
-                      if (
-                        uiPublished &&
-                        publishedUiState !== null &&
-                        cloudLoginUiStateRef.current === publishedUiState
-                      ) {
-                        cloudLoginUiStateRef.current = previousUiState;
-                        setElizaCloudConnected(previousUiState.connected);
-                        setElizaCloudLoginError(previousUiState.error);
-                        setElizaCloudUserId(previousUiState.userId);
+                      try {
+                        if (
+                          uiPublished &&
+                          publishedUiState !== null &&
+                          cloudLoginUiStateRef.current === publishedUiState
+                        ) {
+                          cloudLoginUiStateRef.current = previousUiState;
+                          setElizaCloudConnected(previousUiState.connected);
+                          setElizaCloudLoginError(previousUiState.error);
+                          setElizaCloudUserId(previousUiState.userId);
+                        }
+                        uiPublished = false;
+                      } finally {
+                        standaloneRecoveryRollback?.(false);
                       }
-                      uiPublished = false;
                     }
                   };
                   try {
@@ -1748,29 +2081,45 @@ export function useCloudState({
                         {
                           validate,
                           finalizeBeforePublish: () => {
-                            if (shouldBindClientToDirectCloud) {
-                              clientTargetAuthority = client.stageSessionTarget(
-                                {
-                                  baseUrl: authenticatedCloudApiBase,
-                                  token: sessionToken,
-                                },
-                                { persist: false },
-                              );
-                              if (!clientTargetAuthority) {
-                                throw new Error(
-                                  "The Cloud login token was rejected by the active client authority.",
-                                );
+                            const rollbackReceipt = finalizeReceipt();
+                            try {
+                              if (shouldBindClientToDirectCloud) {
+                                clientTargetAuthority =
+                                  client.stageSessionTarget(
+                                    {
+                                      baseUrl: authenticatedCloudApiBase,
+                                      token: sessionToken,
+                                    },
+                                    { persist: false },
+                                  );
+                                if (!clientTargetAuthority) {
+                                  throw new Error(
+                                    "The Cloud login token was rejected by the active client authority.",
+                                  );
+                                }
                               }
+                              publishedBootConfig = {
+                                ...getBootConfig(),
+                                cloudApiBase: authenticatedCloudApiBase,
+                              };
+                              setBootConfig(publishedBootConfig);
+                            } catch (error) {
+                              try {
+                                rollbackStagedPublication(false);
+                              } finally {
+                                rollbackReceipt(false);
+                              }
+                              throw error;
                             }
-                            publishedBootConfig = {
-                              ...getBootConfig(),
-                              cloudApiBase: authenticatedCloudApiBase,
+                            return (durableRestored) => {
+                              try {
+                                rollbackStagedPublication(durableRestored);
+                              } finally {
+                                rollbackReceipt(durableRestored);
+                              }
                             };
-                            setBootConfig(publishedBootConfig);
-                            return rollbackStagedPublication;
                           },
                           commitBeforePublish: () => {
-                            if (!commitReceipt()) return false;
                             if (
                               clientTargetAuthority &&
                               !clientTargetAuthority.publish()
@@ -1795,7 +2144,7 @@ export function useCloudState({
                             cloudApiBase: authenticatedCloudApiBase,
                             token: poll.token,
                             validate,
-                            commitBeforePublish: commitReceipt,
+                            finalizeRecoveryBeforePublish: finalizeReceipt,
                             finalize: () => {
                               publishedBootConfig = {
                                 ...getBootConfig(),
@@ -1815,7 +2164,14 @@ export function useCloudState({
                         }
                       }
                     }
-                    if (!commitReceipt() || !validate()) {
+                    if (!useDirectAuth && !poll.token) {
+                      // Agent-proxied device-code authentication legitimately
+                      // returns no browser token. Its durable completion fence
+                      // is therefore the UI/client publication itself rather
+                      // than a canonical token write.
+                      standaloneRecoveryRollback = finalizeReceipt();
+                    }
+                    if (!validate()) {
                       await rollback();
                       return false;
                     }
@@ -1847,25 +2203,54 @@ export function useCloudState({
                   }
                 },
               );
-              if (!committed) {
+              if (
+                !committed?.isCurrent() ||
+                (poll.token !== undefined &&
+                  readStoredStewardToken() !== poll.token)
+              ) {
+                await committed?.restoreIfCurrent();
                 // A newer login already owns the origin. Stop this stale poll
                 // without publishing its UI/account metadata.
                 stopCloudLoginPolling();
                 return;
               }
 
-              closePrePoppedWindow();
+              const committedSessionIsCurrent = () =>
+                committed.isCurrent() &&
+                (poll.token === undefined ||
+                  readStoredStewardToken() === poll.token);
+              closePrePoppedWindow(committedSessionIsCurrent);
+              if (!committedSessionIsCurrent()) {
+                await committed.restoreIfCurrent();
+                stopCloudLoginPolling();
+                return;
+              }
               void closeExternalBrowser();
+              if (!committedSessionIsCurrent()) {
+                await committed.restoreIfCurrent();
+                stopCloudLoginPolling();
+                return;
+              }
               // Same-origin Cloud auth tabs (orphaned /login) dismiss via BC.
               // Cross-origin openers already advanced via this poll.
               if (sessionId) {
                 publishCloudAuthComplete(sessionId);
+              }
+              if (!committedSessionIsCurrent()) {
+                await committed.restoreIfCurrent();
+                stopCloudLoginPolling();
+                return;
               }
               try {
                 window.focus();
               } catch (error) {
                 void error;
                 // error-policy:J6 focus is best-effort after auth return.
+              }
+              if (!committedSessionIsCurrent()) {
+                await committed.restoreIfCurrent();
+                stopCloudLoginPolling();
+                return;
               }
 
               stopCloudLoginPolling();
@@ -1881,10 +2266,18 @@ export function useCloudState({
             } else if (Date.now() >= pollDeadline) {
               stopCloudLoginPolling(
                 "Eliza Cloud login timed out. Please try again.",
+                "reject",
               );
             }
           } catch (pollErr) {
-            if (!elizaCloudLoginPollTimer.current) return;
+            if (elizaCloudLoginPollTimer.current !== pollingTimer) {
+              stopCloudLoginPolling();
+              return;
+            }
+            if (!validateDeviceCodeRecovery()) {
+              stopCloudLoginPolling();
+              return;
+            }
 
             consecutivePollErrors += 1;
             if (
@@ -1896,25 +2289,40 @@ export function useCloudState({
                   : "";
               stopCloudLoginPolling(
                 `Eliza Cloud login check failed after repeated errors.${detail}`,
+                "reject",
               );
             }
           } finally {
             pollInFlight = false;
           }
         }, ELIZA_CLOUD_LOGIN_POLL_INTERVAL_MS);
+        elizaCloudLoginPollTimer.current = pollingTimer;
       } catch (err) {
-        closePrePoppedWindow();
+        const validateFailureAuthority =
+          deviceCodeRecoveryIsCurrent ?? (() => true);
+        if (!validateFailureAuthority()) {
+          finishSupersededDeviceCodeAttempt();
+          return loginCompletion;
+        }
+        closePrePoppedWindow(validateFailureAuthority);
         removeCloudAuthMessageListener();
-        setElizaCloudLoginError(
-          err instanceof Error ? err.message : "Eliza Cloud login failed",
-        );
-        // Drop the manual-link fallback on the outer failure path so we
-        // don't show a stale verification URL after the session has been
-        // abandoned.
-        setElizaCloudLoginFallbackUrl(null);
-        elizaCloudLoginBusyRef.current = false;
-        setElizaCloudLoginBusy(false);
+        if (
+          validateFailureAuthority() &&
+          elizaCloudLoginCompletionRef.current === loginCompletion
+        ) {
+          setElizaCloudLoginError(
+            err instanceof Error ? err.message : "Eliza Cloud login failed",
+          );
+          // Drop the manual-link fallback on this attempt's failure path so we
+          // don't show its stale verification URL after abandonment.
+          setElizaCloudLoginFallbackUrl(null);
+          elizaCloudLoginBusyRef.current = false;
+          setElizaCloudLoginBusy(false);
+        }
         completeLogin();
+        if (deviceCodeRecoveryReceipt && validateFailureAuthority()) {
+          rejectCloudLoginAuthorityRecovery(deviceCodeRecoveryReceipt);
+        }
       }
       return loginCompletion;
     },
@@ -1953,12 +2361,13 @@ export function useCloudState({
         resolveDirectCloudAuthApiBase(cloudApiBase);
       const deadline = Date.now() + ELIZA_CLOUD_LOGIN_RETURN_POLL_TIMEOUT_MS;
       let lastError: string | null = null;
+      let returnRecovery: StewardSessionRecoveryReceipt | null = null;
 
       try {
         // This mount owns the opaque session before its first token-producing
         // poll. The receipt deliberately survives effect cleanup/tab-close;
         // an in-flight response may already have produced remote authority.
-        const returnRecovery = beginCloudLoginAuthorityRecovery();
+        returnRecovery = beginCloudLoginAuthorityRecovery();
         while (!cancelled && Date.now() < deadline) {
           const poll = await client.cloudLoginPollDirect(
             authenticatedCloudApiBase,
@@ -1968,6 +2377,7 @@ export function useCloudState({
 
           if (poll.status === "authenticated") {
             if (!poll.token) {
+              rejectCloudLoginAuthorityRecovery(returnRecovery);
               lastError =
                 "Eliza Cloud login completed, but the cloud session did not return a session token.";
               break;
@@ -1975,9 +2385,10 @@ export function useCloudState({
             const sessionToken = poll.token;
             const committed = await commitCloudLoginAuthority(
               returnRecovery,
-              async (validateReceipt, commitReceipt) => {
-                const validate = () => !cancelled && validateReceipt();
-                if (!validate()) return false;
+              async (validateReceipt, finalizeReceipt) => {
+                const validateBeforePublication = () =>
+                  !cancelled && validateReceipt();
+                if (!validateBeforePublication()) return false;
                 const previousBootConfig = getBootConfig();
                 const preservesLocalBackend =
                   isLoopbackStagingStewardDevelopment() &&
@@ -2033,57 +2444,77 @@ export function useCloudState({
                 };
                 try {
                   tokenAuthority = await writeStoredStewardToken(sessionToken, {
-                    validate,
+                    validate: validateBeforePublication,
                     finalizeBeforePublish: () => {
-                      if (!preservesLocalBackend) {
-                        clientTargetAuthority = client.stageSessionTarget(
-                          {
-                            baseUrl: authenticatedCloudApiBase,
-                            token: sessionToken,
-                          },
-                          { persist: false },
-                        );
-                        if (!clientTargetAuthority) {
-                          throw new Error(
-                            "The Cloud login token was rejected by the active client authority.",
+                      const rollbackReceipt = finalizeReceipt();
+                      try {
+                        if (!preservesLocalBackend) {
+                          clientTargetAuthority = client.stageSessionTarget(
+                            {
+                              baseUrl: authenticatedCloudApiBase,
+                              token: sessionToken,
+                            },
+                            { persist: false },
                           );
+                          if (!clientTargetAuthority) {
+                            throw new Error(
+                              "The Cloud login token was rejected by the active client authority.",
+                            );
+                          }
                         }
+                        publishedBootConfig = {
+                          ...getBootConfig(),
+                          cloudApiBase: authenticatedCloudApiBase,
+                        };
+                        setBootConfig(publishedBootConfig);
+                      } catch (error) {
+                        try {
+                          rollbackStagedPublication(false);
+                        } finally {
+                          rollbackReceipt(false);
+                        }
+                        throw error;
                       }
-                      publishedBootConfig = {
-                        ...getBootConfig(),
-                        cloudApiBase: authenticatedCloudApiBase,
+                      return (durableRestored) => {
+                        try {
+                          rollbackStagedPublication(durableRestored);
+                        } finally {
+                          rollbackReceipt(durableRestored);
+                        }
                       };
-                      setBootConfig(publishedBootConfig);
-                      return rollbackStagedPublication;
                     },
                     commitBeforePublish: () => {
-                      if (!commitReceipt()) return false;
                       if (
                         clientTargetAuthority &&
                         !clientTargetAuthority.publish()
                       ) {
                         return false;
                       }
-                      return validate();
+                      return validateBeforePublication();
                     },
                   });
-                  if (!tokenAuthority || !commitReceipt() || !validate()) {
+                  if (!tokenAuthority || !validateReceipt()) {
                     await rollback();
                     return false;
                   }
-                  uiPublished = true;
-                  publishedUiState = {
-                    connected: true,
-                    error: null,
-                    userId: poll.userId ?? previousUiState.userId,
-                  };
-                  cloudLoginUiStateRef.current = publishedUiState;
-                  setElizaCloudConnected(true);
-                  setElizaCloudLoginError(null);
-                  if (poll.userId) setElizaCloudUserId(poll.userId);
-                  if (!validate()) {
-                    await rollback();
-                    return false;
+                  // A cleanup which runs after canonical authority publication
+                  // suppresses this mount's UI only. It must not compensate a
+                  // durable token whose receipt has already finalized.
+                  if (!cancelled) {
+                    uiPublished = true;
+                    publishedUiState = {
+                      connected: true,
+                      error: null,
+                      userId: poll.userId ?? previousUiState.userId,
+                    };
+                    cloudLoginUiStateRef.current = publishedUiState;
+                    setElizaCloudConnected(true);
+                    setElizaCloudLoginError(null);
+                    if (poll.userId) setElizaCloudUserId(poll.userId);
+                    if (!validateReceipt()) {
+                      await rollback();
+                      return false;
+                    }
                   }
                   return { restoreIfCurrent: rollback };
                 } catch (error) {
@@ -2099,9 +2530,33 @@ export function useCloudState({
                 }
               },
             );
-            if (!committed || cancelled) return;
-            closeActiveCloudLoginPopup();
+            if (
+              !committed?.isCurrent() ||
+              readStoredStewardToken() !== sessionToken
+            ) {
+              await committed?.restoreIfCurrent();
+              return;
+            }
+            if (cancelled) return;
+            const committedSessionIsCurrent = () =>
+              committed.isCurrent() &&
+              readStoredStewardToken() === sessionToken;
+            if (!committedSessionIsCurrent()) {
+              await committed.restoreIfCurrent();
+              return;
+            }
+            closeActiveCloudLoginPopup(committedSessionIsCurrent);
+            if (cancelled) return;
+            if (!committedSessionIsCurrent()) {
+              await committed.restoreIfCurrent();
+              return;
+            }
             closeReturnedAuthTabIfOpenerStillExists();
+            if (cancelled) return;
+            if (!committedSessionIsCurrent()) {
+              await committed.restoreIfCurrent();
+              return;
+            }
             void closeExternalBrowser();
             return;
           }
@@ -2117,6 +2572,7 @@ export function useCloudState({
         }
 
         if (!cancelled) {
+          rejectCloudLoginAuthorityRecovery(returnRecovery);
           setElizaCloudLoginError(
             lastError ??
               "Eliza Cloud login did not finish. Please sign in again.",
@@ -2124,6 +2580,9 @@ export function useCloudState({
         }
       } catch (err) {
         if (!cancelled) {
+          if (returnRecovery) {
+            rejectCloudLoginAuthorityRecovery(returnRecovery);
+          }
           setElizaCloudLoginError(
             err instanceof Error
               ? err.message

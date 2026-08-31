@@ -20,8 +20,18 @@
 
 import { logger } from "@elizaos/logger";
 import { useEffect, useRef, useState } from "react";
+import type { SessionTargetAuthority } from "../api/client-base";
 import { getCloudAuthToken } from "../api/client-cloud";
 import { isAppModeHost } from "../cloud/app-mode/app-mode";
+import {
+  readStewardSessionRecovery,
+  STEWARD_SESSION_RECOVERY_CHANGE_EVENT,
+  type StewardSessionRecoverySnapshot,
+} from "../cloud/lib/steward-session-recovery-marker";
+import {
+  configuredStewardTenantId,
+  DEFAULT_STEWARD_TENANT_ID,
+} from "../cloud/shell/steward-config";
 import { persistCloudPairApiToken } from "../components/auth/CloudPairRelay";
 import { getBootConfig } from "../config/boot-config";
 import { persistActiveServerCredential } from "../state/active-server-credential";
@@ -34,8 +44,13 @@ import {
   resolveDedicatedAgentId,
 } from "../state/agent-session-recovery";
 import { runAgentSessionRecovery } from "../state/agent-session-recovery-runner";
-import { clearStalePairCredentialsForAgent } from "../state/cloud-pair-token";
+import { clearStalePairCredentialsForAgentDurably } from "../state/cloud-pair-token";
 import { ensureCloudSessionForRepair } from "../state/cloud-session-refresh-for-repair";
+import {
+  captureStoredStewardLoginAuthority,
+  isStoredStewardTokenUsable,
+  type StoredStewardLoginAuthority,
+} from "../state/cloud-steward-login";
 import {
   loadPersistedActiveServer,
   type PersistedActiveServer,
@@ -112,8 +127,7 @@ function normalizedOptionalBase(value: string | undefined): string {
   return normalizedOptionalValue(value).replace(/\/+$/, "");
 }
 
-/** A late recovery may commit only to the exact server record that started it. */
-function recoveryTargetMatches(
+function recoveryTargetIdentityMatches(
   expected: PersistedActiveServer,
   current: PersistedActiveServer | null,
 ): boolean {
@@ -122,10 +136,60 @@ function recoveryTargetMatches(
       current.kind === expected.kind &&
       current.id === expected.id &&
       normalizedOptionalBase(current.apiBase) ===
-        normalizedOptionalBase(expected.apiBase) &&
-      normalizedOptionalValue(current.accessToken) ===
-        normalizedOptionalValue(expected.accessToken),
+        normalizedOptionalBase(expected.apiBase),
   );
+}
+
+/** A late recovery may commit only to the exact server record that started it. */
+function recoveryTargetMatches(
+  expected: PersistedActiveServer,
+  current: PersistedActiveServer | null,
+  acceptedReplacementToken: string | null = null,
+): boolean {
+  const currentAccessToken = normalizedOptionalValue(current?.accessToken);
+  const expectedAccessToken = normalizedOptionalValue(expected.accessToken);
+  const credentialMatches =
+    currentAccessToken === expectedAccessToken ||
+    (acceptedReplacementToken !== null &&
+      currentAccessToken === normalizedOptionalValue(acceptedReplacementToken));
+  return Boolean(
+    recoveryTargetIdentityMatches(expected, current) && credentialMatches,
+  );
+}
+
+function readStewardRecoverySnapshot(): StewardSessionRecoverySnapshot {
+  return readStewardSessionRecovery(
+    configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID),
+  );
+}
+
+function recoveryAdmissionIsClean(
+  snapshot: StewardSessionRecoverySnapshot,
+): boolean {
+  return snapshot.storageAvailable && snapshot.receipts.length === 0;
+}
+
+/** A clean admission remains live only within its exact monotonic generation. */
+function recoveryAdmissionIsCurrent(
+  expected: StewardSessionRecoverySnapshot,
+): boolean {
+  const current = readStewardRecoverySnapshot();
+  return (
+    recoveryAdmissionIsClean(expected) &&
+    recoveryAdmissionIsClean(current) &&
+    current.generation === expected.generation
+  );
+}
+
+interface ActiveAgentSessionRecovery {
+  authority: StoredStewardLoginAuthority;
+  controller: AbortController;
+}
+
+interface PendingAgentSessionRecovery {
+  authority: StoredStewardLoginAuthority | null;
+  controller: AbortController;
+  recoveryGeneration: string | null;
 }
 
 export function useAgentSessionRecovery(
@@ -141,15 +205,43 @@ export function useAgentSessionRecovery(
   const attemptedFallbackRef = useRef<ManagedCloudAgentRecoveryStatus>(
     "cloud-retry-required",
   );
+  const activeRecoveryRef = useRef<ActiveAgentSessionRecovery | null>(null);
+  const pendingRecoveryRef = useRef<PendingAgentSessionRecovery | null>(null);
   const [cloudTokenSnapshot, setCloudTokenSnapshot] = useState(() =>
     getCloudAuthToken(),
   );
+  const [recoveryRevision, setRecoveryRevision] = useState(0);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
 
+    const abortOwnedRecovery = () => {
+      const activeRecovery = activeRecoveryRef.current;
+      if (activeRecovery) {
+        activeRecovery.controller.abort();
+        if (activeRecoveryRef.current === activeRecovery) {
+          activeRecoveryRef.current = null;
+        }
+      }
+      const pendingRecovery = pendingRecoveryRef.current;
+      if (pendingRecovery) {
+        pendingRecovery.controller.abort();
+        if (pendingRecoveryRef.current === pendingRecovery) {
+          pendingRecoveryRef.current = null;
+        }
+      }
+    };
+
     const rearmAfterCloudReauth = () => {
       const cloudToken = getCloudAuthToken();
+      const activeRecovery = activeRecoveryRef.current;
+      if (activeRecovery && !activeRecovery.authority.isCurrent()) {
+        abortOwnedRecovery();
+        attemptedRef.current = false;
+        awaitingCloudTokenRef.current = false;
+        setCloudTokenSnapshot(cloudToken);
+        return;
+      }
       // The cookie-recovery attempt writes its canonical token before its
       // promise can hand that token to this effect. Do not let that same sync
       // event tear down/abort the in-flight attempt; explicit reauth is armed
@@ -165,15 +257,66 @@ export function useAgentSessionRecovery(
       attemptedRef.current = false;
     };
 
+    const retireSupersededRecovery = () => {
+      // A durable login receipt changes the origin-wide account authority even
+      // if it begins and retires before React commits this state update. Abort
+      // synchronously; the captured generation fence stays false forever.
+      abortOwnedRecovery();
+      attemptedRef.current = false;
+      awaitingCloudTokenRef.current = false;
+      setStatus("idle");
+      setCloudTokenSnapshot(getCloudAuthToken());
+      setRecoveryRevision((revision) => revision + 1);
+    };
+
+    const retireCrossTabRecoveryIfSuperseded = () => {
+      const activeRecovery = activeRecoveryRef.current;
+      const pendingRecovery = pendingRecoveryRef.current;
+      if (!activeRecovery && !pendingRecovery) return;
+      const expectedGeneration =
+        activeRecovery?.authority.recoveryGeneration ??
+        pendingRecovery?.recoveryGeneration ??
+        null;
+      const current = readStewardRecoverySnapshot();
+      const generationIsCurrent =
+        recoveryAdmissionIsClean(current) &&
+        current.generation === expectedGeneration;
+      const tokenAuthorityIsCurrent =
+        activeRecovery?.authority.isCurrent() ??
+        pendingRecovery?.authority?.isCurrent() ??
+        true;
+      // StorageEvent is cross-document only. Re-read the exact generation and
+      // token authority instead of aborting account A for an unrelated key.
+      if (generationIsCurrent && tokenAuthorityIsCurrent) return;
+      abortOwnedRecovery();
+      attemptedRef.current = false;
+      awaitingCloudTokenRef.current = false;
+      setStatus("idle");
+      setCloudTokenSnapshot(getCloudAuthToken());
+      setRecoveryRevision((revision) => revision + 1);
+    };
+
     window.addEventListener("steward-token-sync", rearmAfterCloudReauth);
+    window.addEventListener(
+      STEWARD_SESSION_RECOVERY_CHANGE_EVENT,
+      retireSupersededRecovery,
+    );
+    window.addEventListener("storage", retireCrossTabRecoveryIfSuperseded);
     return () => {
       window.removeEventListener("steward-token-sync", rearmAfterCloudReauth);
+      window.removeEventListener(
+        STEWARD_SESSION_RECOVERY_CHANGE_EVENT,
+        retireSupersededRecovery,
+      );
+      window.removeEventListener("storage", retireCrossTabRecoveryIfSuperseded);
     };
   }, []);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: token/recovery event snapshots deliberately retrigger fresh authoritative storage reads.
   useEffect(() => {
     const consumeRedirectInProcess = shouldConsumePairRedirectInProcess();
     const activeServer = active ? loadPersistedActiveServer() : null;
+    const recoveryAtAdmission = readStewardRecoverySnapshot();
     // Deliberately keyed to the native runtime, not to in-process redemption:
     // the app hosts now redeem in-process too, and this flag drives the
     // native-only managed-recovery status UI.
@@ -184,7 +327,10 @@ export function useAgentSessionRecovery(
     ): AgentSessionRecoveryStatus => (isManagedNative ? managedStatus : "idle");
     const showFallback = (
       managedStatus: ManagedCloudAgentRecoveryStatus = "cloud-retry-required",
+      validatePublication: () => boolean = () =>
+        recoveryAdmissionIsCurrent(recoveryAtAdmission),
     ) => {
+      if (!validatePublication()) return;
       attemptedFallbackRef.current = managedStatus;
       awaitingCloudTokenRef.current =
         isManagedNative && managedStatus === "cloud-reauth-required";
@@ -201,6 +347,16 @@ export function useAgentSessionRecovery(
       return;
     }
 
+    if (!recoveryAdmissionIsClean(recoveryAtAdmission)) {
+      // A durable login B owns the origin, or storage cannot prove otherwise.
+      // Keep every account-A repair side effect quarantined until that
+      // generation publishes or is explicitly recovered.
+      attemptedRef.current = false;
+      awaitingCloudTokenRef.current = false;
+      setStatus("idle");
+      return;
+    }
+
     if (attemptedRef.current) {
       // One attempt per cycle: a prior failed attempt must fall through to the
       // wall/notice, never loop.
@@ -210,6 +366,24 @@ export function useAgentSessionRecovery(
 
     let cancelled = false;
     const recoveryAbortController = new AbortController();
+    const liveCloudToken = getCloudAuthToken()?.trim() || null;
+    const capturedStoredAuthority = captureStoredStewardLoginAuthority();
+    const storedAuthority =
+      liveCloudToken &&
+      capturedStoredAuthority?.token === liveCloudToken &&
+      capturedStoredAuthority.recoveryGeneration ===
+        recoveryAtAdmission.generation &&
+      capturedStoredAuthority.isCurrent()
+        ? capturedStoredAuthority
+        : null;
+
+    // A token whose clean generation cannot be captured is never passive
+    // repair authority. In particular this blocks raw account A while login B
+    // has made recovery storage unreadable or changed between the two reads.
+    if (liveCloudToken && !storedAuthority) {
+      setStatus("idle");
+      return;
+    }
 
     const resolveInput = (
       cloudToken: string | null,
@@ -228,25 +402,83 @@ export function useAgentSessionRecovery(
 
     const startRepair = (
       decision: ReturnType<typeof resolveAgentSessionRecovery>,
-      cloudToken: string,
+      authority: StoredStewardLoginAuthority,
     ) => {
+      const cloudToken = authority.token;
       awaitingCloudTokenRef.current = false;
+      if (
+        cancelled ||
+        !recoveryAdmissionIsCurrent(recoveryAtAdmission) ||
+        !authority.isCurrent()
+      ) {
+        return;
+      }
       if (decision.action !== "re-pair") {
         showFallback(
           cloudToken.trim() ? "cloud-manage-required" : "cloud-reauth-required",
+          () =>
+            recoveryAdmissionIsCurrent(recoveryAtAdmission) &&
+            authority.isCurrent(),
         );
         return;
       }
       if (!activeServer) {
-        showFallback("cloud-manage-required");
+        showFallback(
+          "cloud-manage-required",
+          () =>
+            recoveryAdmissionIsCurrent(recoveryAtAdmission) &&
+            authority.isCurrent(),
+        );
         return;
       }
       attemptedFallbackRef.current = "cloud-retry-required";
-      setStatus("recovering");
+      let acceptedReplacementToken: string | null = null;
+      const activeRecovery = {
+        authority,
+        controller: recoveryAbortController,
+      };
+      if (pendingRecoveryRef.current?.controller === recoveryAbortController) {
+        pendingRecoveryRef.current = null;
+      }
+      activeRecoveryRef.current = activeRecovery;
+      const isRecoveryOwnershipCurrent = () => {
+        const currentServer = loadPersistedActiveServer();
+        return (
+          activeRecoveryRef.current === activeRecovery &&
+          !cancelled &&
+          !recoveryAbortController.signal.aborted &&
+          authority.token === cloudToken &&
+          authority.recoveryGeneration === recoveryAtAdmission.generation &&
+          authority.isCurrent() &&
+          recoveryAdmissionIsCurrent(recoveryAtAdmission) &&
+          resolveDedicatedAgentId(activeServer) === decision.agentId &&
+          currentServer !== null &&
+          resolveDedicatedAgentId(currentServer) === decision.agentId &&
+          recoveryTargetIdentityMatches(activeServer, currentServer)
+        );
+      };
       const isRecoveryTargetCurrent = () =>
-        !recoveryAbortController.signal.aborted &&
-        resolveDedicatedAgentId(activeServer) === decision.agentId &&
-        recoveryTargetMatches(activeServer, loadPersistedActiveServer());
+        isRecoveryOwnershipCurrent() &&
+        recoveryTargetMatches(
+          activeServer,
+          loadPersistedActiveServer(),
+          acceptedReplacementToken,
+        );
+      const assertRecoveryTargetCurrent = () => {
+        if (isRecoveryTargetCurrent()) return;
+        recoveryAbortController.abort();
+        throw new Error(
+          "Agent session recovery target changed or authority was superseded before local publication",
+        );
+      };
+      if (!isRecoveryTargetCurrent()) {
+        recoveryAbortController.abort();
+        if (activeRecoveryRef.current === activeRecovery) {
+          activeRecoveryRef.current = null;
+        }
+        return;
+      }
+      setStatus("recovering");
       void runAgentSessionRecovery({
         cloudApiBase: decision.cloudApiBase,
         agentId: decision.agentId,
@@ -254,37 +486,158 @@ export function useAgentSessionRecovery(
         consumeRedirectInProcess,
         signal: recoveryAbortController.signal,
         isRecoveryTargetCurrent,
-        clearStalePairCredentials: () =>
-          clearStalePairCredentialsForAgent(decision.agentId),
         commitPairedInProcess: async (apiToken) => {
-          const { client } = await import("../api");
-          if (!isRecoveryTargetCurrent()) {
-            recoveryAbortController.abort();
-            throw new Error(
-              "Agent session recovery target changed before credential commit",
-            );
+          let compensatePair: (() => Promise<void>) | null = null;
+          let compensateRuntime: (() => Promise<void>) | null = null;
+          let stagedClientTarget: SessionTargetAuthority | null = null;
+          let previousLegacyBootConfig: unknown;
+          let publishedLegacyBootConfig: unknown;
+          const globals = globalThis as Record<string, unknown>;
+          const restoreStagedClientTarget = async () => {
+            if (
+              publishedLegacyBootConfig !== undefined &&
+              globals.__ELIZA_APP_BOOT_CONFIG__ === publishedLegacyBootConfig
+            ) {
+              if (previousLegacyBootConfig === undefined) {
+                Reflect.deleteProperty(globals, "__ELIZA_APP_BOOT_CONFIG__");
+              } else {
+                globals.__ELIZA_APP_BOOT_CONFIG__ = previousLegacyBootConfig;
+              }
+            }
+            stagedClientTarget?.restoreIfCurrent();
+          };
+          const compensate = async () => {
+            const failures: unknown[] = [];
+            for (const rollback of [compensateRuntime, compensatePair]) {
+              if (!rollback) continue;
+              try {
+                await rollback();
+              } catch (error) {
+                failures.push(error);
+              }
+            }
+            if (failures.length > 0) {
+              throw new AggregateError(
+                failures,
+                "Agent session recovery compensation failed",
+              );
+            }
+          };
+
+          try {
+            assertRecoveryTargetCurrent();
+            const { client } = await import("../api");
+            assertRecoveryTargetCurrent();
+            await persistCloudPairApiToken(apiToken, decision.agentId, {
+              validate: isRecoveryTargetCurrent,
+              publishSession: false,
+              captureCompensation: (rollback) => {
+                compensatePair = rollback;
+              },
+            });
+            assertRecoveryTargetCurrent();
+            if (!compensatePair) {
+              throw new Error(
+                "Cloud pair credential rollback authority is unavailable.",
+              );
+            }
+
+            // This transaction may now observe only its own replacement token.
+            // Every other target/token still supersedes the recovery.
+            acceptedReplacementToken = apiToken;
+            assertRecoveryTargetCurrent();
+            await persistActiveServerCredential(apiToken, undefined, {
+              validate: isRecoveryTargetCurrent,
+              finalize: async () => {
+                assertRecoveryTargetCurrent();
+                const apiBase = activeServer.apiBase?.trim();
+                if (!apiBase) return false;
+                stagedClientTarget = client.stageSessionTarget(
+                  { baseUrl: apiBase, token: apiToken },
+                  { persist: false },
+                );
+                if (!stagedClientTarget || !isRecoveryTargetCurrent()) {
+                  stagedClientTarget?.restoreIfCurrent();
+                  stagedClientTarget = null;
+                  return false;
+                }
+                previousLegacyBootConfig = globals.__ELIZA_APP_BOOT_CONFIG__;
+                publishedLegacyBootConfig = getBootConfig();
+                globals.__ELIZA_APP_BOOT_CONFIG__ = publishedLegacyBootConfig;
+                if (!isRecoveryTargetCurrent()) {
+                  await restoreStagedClientTarget();
+                  return false;
+                }
+                return true;
+              },
+              compensateFinalization: restoreStagedClientTarget,
+              captureCompensation: (rollback) => {
+                compensateRuntime = rollback;
+              },
+            });
+            assertRecoveryTargetCurrent();
+            const committedClientTarget =
+              stagedClientTarget as SessionTargetAuthority | null;
+            if (!compensateRuntime || !committedClientTarget) {
+              throw new Error(
+                "Runtime credential rollback authority is unavailable.",
+              );
+            }
+            assertRecoveryTargetCurrent();
+            if (
+              !committedClientTarget.isCurrent() ||
+              !committedClientTarget.publish()
+            ) {
+              throw new Error(
+                "The recovered runtime credential could not be published.",
+              );
+            }
+            assertRecoveryTargetCurrent();
+            if (!committedClientTarget.isCurrent()) {
+              throw new Error(
+                "The recovered runtime credential was superseded during publication.",
+              );
+            }
+            if (onRecovered) {
+              onRecovered();
+            }
+          } catch (error) {
+            try {
+              await compensate();
+            } catch (rollbackError) {
+              throw new AggregateError(
+                [error, rollbackError],
+                "Agent session recovery and compensation failed",
+              );
+            }
+            throw error;
           }
-          // One synchronous commit owns every credential mirror. A later boot
-          // must not re-adopt the stale active-server/profile token after the
-          // live client has already accepted the fresh paired bearer.
-          await persistCloudPairApiToken(apiToken, decision.agentId);
-          await persistActiveServerCredential(apiToken);
-          client.setToken(apiToken);
-          onRecovered?.();
         },
-        navigate,
+        navigate: (url) => {
+          if (isRecoveryTargetCurrent()) navigate(url);
+        },
       })
-        .then((result) => {
-          if (cancelled) return;
+        .then(async (result) => {
+          const retireOwnedRecoveryToIdle = () => {
+            if (activeRecoveryRef.current !== activeRecovery) return;
+            activeRecoveryRef.current = null;
+            recoveryAbortController.abort();
+            attemptedRef.current = false;
+            awaitingCloudTokenRef.current = false;
+            setStatus("idle");
+          };
+          if (!result.ok && result.reason === "cancelled") {
+            retireOwnedRecoveryToIdle();
+            return;
+          }
+          if (!isRecoveryTargetCurrent()) {
+            retireOwnedRecoveryToIdle();
+            return;
+          }
           // Browser success navigates through `/pair`; native success installs
           // the bearer in-process and triggers `onRecovered`. Failures retain
           // enough classification for reauth versus non-destructive retry.
           if (!result.ok) {
-            if (result.reason === "cancelled") {
-              attemptedRef.current = false;
-              setStatus("idle");
-              return;
-            }
             logger.warn(
               {
                 agentId: decision.agentId,
@@ -293,12 +646,66 @@ export function useAgentSessionRecovery(
               },
               "[AgentSessionRecovery] managed-agent re-pair failed",
             );
-            showFallback(
+            const fallback =
               result.reason === "unauthorized"
                 ? "cloud-reauth-required"
                 : result.reason === "manage-required"
                   ? "cloud-manage-required"
-                  : "cloud-retry-required",
+                  : "cloud-retry-required";
+            const purgeRejectedAgentBearer =
+              result.reason === "unauthorized" ||
+              result.reason === "manage-required";
+            if (purgeRejectedAgentBearer) {
+              // `/api/auth/me` already proved this adopted agent bearer stale.
+              // Purge only after result classification and while account,
+              // generation and same-agent ownership are all still current.
+              if (!isRecoveryTargetCurrent()) {
+                retireOwnedRecoveryToIdle();
+                return;
+              }
+              const rejectedToken = activeServer.accessToken?.trim() ?? "";
+              const purgeAuthorityIsCurrent = () => {
+                if (!isRecoveryOwnershipCurrent()) return false;
+                const currentServer = loadPersistedActiveServer();
+                if (
+                  !recoveryTargetIdentityMatches(activeServer, currentServer)
+                ) {
+                  return false;
+                }
+                const currentToken = currentServer?.accessToken?.trim() ?? "";
+                return !currentToken || currentToken === rejectedToken;
+              };
+              const purgeProvedRejectedBearerAbsent =
+                rejectedToken.length > 0 &&
+                (await clearStalePairCredentialsForAgentDurably({
+                  agentId: decision.agentId,
+                  rejectedToken,
+                  validate: purgeAuthorityIsCurrent,
+                }));
+              if (!purgeProvedRejectedBearerAbsent) {
+                if (isRecoveryOwnershipCurrent()) {
+                  showFallback(
+                    "cloud-retry-required",
+                    isRecoveryOwnershipCurrent,
+                  );
+                  if (activeRecoveryRef.current === activeRecovery) {
+                    activeRecoveryRef.current = null;
+                  }
+                } else {
+                  retireOwnedRecoveryToIdle();
+                }
+                return;
+              }
+              if (!isRecoveryOwnershipCurrent()) {
+                retireOwnedRecoveryToIdle();
+                return;
+              }
+            }
+            showFallback(
+              fallback,
+              purgeRejectedAgentBearer
+                ? isRecoveryOwnershipCurrent
+                : isRecoveryTargetCurrent,
             );
           } else {
             logger.info(
@@ -309,11 +716,16 @@ export function useAgentSessionRecovery(
               "[AgentSessionRecovery] managed-agent re-pair succeeded",
             );
           }
+          if (activeRecoveryRef.current === activeRecovery) {
+            activeRecoveryRef.current = null;
+          }
         })
         .catch((error: unknown) => {
           // error-policy:J4 an unclassified repair failure keeps the existing
           // Cloud token and degrades to a non-destructive retry surface.
-          if (!cancelled) {
+          const stillOwnsRecovery =
+            activeRecoveryRef.current === activeRecovery;
+          if (isRecoveryTargetCurrent()) {
             logger.warn(
               {
                 agentId: decision.agentId,
@@ -324,27 +736,57 @@ export function useAgentSessionRecovery(
               },
               "[AgentSessionRecovery] managed-agent re-pair threw",
             );
-            showFallback("cloud-retry-required");
+            showFallback("cloud-retry-required", isRecoveryTargetCurrent);
+          } else if (stillOwnsRecovery) {
+            // Target/account cancellation is not a retryable account-A error.
+            // Clear ownership first; a B event which already did so wins and is
+            // never overwritten by this late catch.
+            activeRecoveryRef.current = null;
+            attemptedRef.current = false;
+            awaitingCloudTokenRef.current = false;
+            setStatus("idle");
+          }
+          if (activeRecoveryRef.current === activeRecovery) {
+            activeRecoveryRef.current = null;
           }
         });
     };
 
-    const initialInput = resolveInput(cloudTokenSnapshot);
+    const initialInput = resolveInput(storedAuthority?.token ?? null);
     const initialDecision = resolveAgentSessionRecovery(initialInput);
     const initialCloudToken = initialInput.cloudToken?.trim();
+    const storedTokenNeedsRefresh = Boolean(
+      storedAuthority && !isStoredStewardTokenUsable(storedAuthority.token),
+    );
 
-    if (initialDecision.action === "re-pair" && initialCloudToken) {
+    if (
+      initialDecision.action === "re-pair" &&
+      initialCloudToken &&
+      storedAuthority &&
+      !storedTokenNeedsRefresh
+    ) {
       // Fast path: app-origin cloud token already present, re-pair immediately
       // (the classic post-upgrade stale-credential case).
       attemptedRef.current = true;
-      startRepair(initialDecision, initialCloudToken);
+      startRepair(initialDecision, storedAuthority);
       return () => {
         cancelled = true;
         recoveryAbortController.abort();
+        if (
+          pendingRecoveryRef.current?.controller === recoveryAbortController
+        ) {
+          pendingRecoveryRef.current = null;
+        }
+        if (activeRecoveryRef.current?.controller === recoveryAbortController) {
+          activeRecoveryRef.current = null;
+        }
       };
     }
 
-    if (!agentSessionRepairNeedsCloudToken(initialInput)) {
+    if (
+      !storedTokenNeedsRefresh &&
+      !agentSessionRepairNeedsCloudToken(initialInput)
+    ) {
       // Not a cookie-recoverable state (self-hosted, wrong 401 reason, no agent
       // id, or genuinely nothing to re-pair). The wall/notice is honest.
       showFallback(
@@ -362,12 +804,55 @@ export function useAgentSessionRecovery(
     // same-origin refresh bridge and re-pair instead of dropping to the notice.
     attemptedRef.current = true;
     setStatus("recovering");
+    const pendingRecovery = {
+      authority: storedAuthority,
+      controller: recoveryAbortController,
+      recoveryGeneration: recoveryAtAdmission.generation,
+    };
+    pendingRecoveryRef.current = pendingRecovery;
+    const releasePendingRecovery = () => {
+      if (pendingRecoveryRef.current === pendingRecovery) {
+        pendingRecoveryRef.current = null;
+      }
+    };
+    const retirePendingRecoveryToIdle = () => {
+      if (pendingRecoveryRef.current !== pendingRecovery) return;
+      pendingRecoveryRef.current = null;
+      recoveryAbortController.abort();
+      attemptedRef.current = false;
+      awaitingCloudTokenRef.current = false;
+      setStatus("idle");
+    };
+    const validateRefreshPublication = () =>
+      pendingRecoveryRef.current === pendingRecovery &&
+      !cancelled &&
+      !recoveryAbortController.signal.aborted &&
+      recoveryAdmissionIsCurrent(recoveryAtAdmission) &&
+      Boolean(
+        activeServer &&
+          recoveryTargetMatches(activeServer, loadPersistedActiveServer()),
+      );
 
-    void ensureCloudSessionForRepair()
+    void ensureCloudSessionForRepair(
+      storedTokenNeedsRefresh
+        ? {
+            forceRefresh: true,
+            validate: validateRefreshPublication,
+          }
+        : { validate: validateRefreshPublication },
+    )
       .then((token) => {
-        if (cancelled) return;
+        if (
+          cancelled ||
+          !validateRefreshPublication() ||
+          !recoveryAdmissionIsCurrent(recoveryAtAdmission)
+        ) {
+          retirePendingRecoveryToIdle();
+          return;
+        }
         if (!token) {
           // No cookie / refresh failed / timed out: the notice is honest now.
+          releasePendingRecovery();
           showFallback("cloud-reauth-required");
           // Native SIWE can finish in the narrow window between the cookie
           // refresh resolving and the fallback being armed. Its sync event has
@@ -381,20 +866,41 @@ export function useAgentSessionRecovery(
           }
           return;
         }
+        const refreshedAuthority = captureStoredStewardLoginAuthority();
+        if (
+          !refreshedAuthority ||
+          refreshedAuthority.token !== token.trim() ||
+          refreshedAuthority.recoveryGeneration !==
+            recoveryAtAdmission.generation ||
+          !refreshedAuthority.isCurrent()
+        ) {
+          retirePendingRecoveryToIdle();
+          return;
+        }
         const decision = resolveAgentSessionRecovery(
           resolveInput(token, false),
         );
-        startRepair(decision, token);
+        releasePendingRecovery();
+        startRepair(decision, refreshedAuthority);
       })
       .catch(() => {
         // error-policy:J4 cookie recovery is opportunistic; the explicit Cloud
         // reauthentication notice remains the safe user-driven fallback.
-        if (!cancelled) showFallback("cloud-reauth-required");
+        if (!cancelled && recoveryAdmissionIsCurrent(recoveryAtAdmission)) {
+          releasePendingRecovery();
+          showFallback("cloud-reauth-required");
+        }
       });
 
     return () => {
       cancelled = true;
       recoveryAbortController.abort();
+      if (pendingRecoveryRef.current?.controller === recoveryAbortController) {
+        pendingRecoveryRef.current = null;
+      }
+      if (activeRecoveryRef.current?.controller === recoveryAbortController) {
+        activeRecoveryRef.current = null;
+      }
     };
     // setStatus and attemptedRef are stable; all third-party inputs are listed.
   }, [
@@ -404,6 +910,7 @@ export function useAgentSessionRecovery(
     onRecovered,
     isAuthenticated,
     cloudTokenSnapshot,
+    recoveryRevision,
   ]);
 
   return status;

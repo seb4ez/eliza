@@ -70,6 +70,7 @@ function connectedResult() {
 
 describe("JoinPage sign-out cleanup ownership", () => {
   beforeEach(() => {
+    localStorage.setItem("steward_session_token", "steward-token");
     runJoinFlowMock.mockReset();
     signOutMock.mockReset();
     signOutMock.mockResolvedValue(undefined);
@@ -78,6 +79,7 @@ describe("JoinPage sign-out cleanup ownership", () => {
 
   afterEach(() => {
     cleanup();
+    localStorage.clear();
   });
 
   it("waits for the active join to settle before destroying the SSO session", async () => {

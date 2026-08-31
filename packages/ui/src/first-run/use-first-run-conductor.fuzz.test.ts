@@ -45,7 +45,7 @@ const mocks = vi.hoisted(() => ({
         created: false,
       }),
     ),
-    ensurePersonalDedicatedEliza: vi.fn(
+    getPersonalSharedEliza: vi.fn(
       async (_options: Record<string, unknown>) => ({
         personalElizaId: "personal:00000000-0000-5000-8000-000000000001",
         agentId: "personal:00000000-0000-5000-8000-000000000001",
@@ -60,6 +60,11 @@ const mocks = vi.hoisted(() => ({
     getBaseUrl: vi.fn(() => ""),
     setBaseUrl: vi.fn(),
     setToken: vi.fn(),
+    stageSessionTarget: vi.fn(() => ({
+      publish: () => true,
+      restoreIfCurrent: () => true,
+      clearIfCurrent: () => true,
+    })),
     getRestAuthToken: vi.fn(() => null),
     fetch: vi.fn(async () => {
       throw new Error("no network in test");

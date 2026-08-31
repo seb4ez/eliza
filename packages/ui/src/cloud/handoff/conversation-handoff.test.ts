@@ -63,6 +63,27 @@ describe("runConversationHandoff", () => {
     expect(deps.switchToPersonal).toHaveBeenCalledTimes(1);
   });
 
+  it("stops before import and switch when a newer login wins during the shared read", async () => {
+    let authorityCurrent = true;
+    const deps = baseDeps({
+      validateAuthority: () => authorityCurrent,
+      readSharedMessages: vi.fn(async () => {
+        authorityCurrent = false;
+        return SAMPLE;
+      }),
+    });
+
+    const result = await runConversationHandoff(deps);
+
+    expect(result).toMatchObject({
+      status: "failed",
+      imported: 0,
+      error: expect.stringContaining("superseded"),
+    });
+    expect(deps.importToPersonal).not.toHaveBeenCalled();
+    expect(deps.switchToPersonal).not.toHaveBeenCalled();
+  });
+
   it("never switches and reports timeout if the personal container never readies", async () => {
     const deps = baseDeps({
       checkPersonalReady: vi.fn(async () => ({ ready: false })),

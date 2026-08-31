@@ -13,12 +13,16 @@
  * options again, so a real failure is never hidden behind the spinner.
  */
 
-import { StewardSessionError } from "@elizaos/shared/steward-session-client";
+import {
+  STEWARD_SESSION_CHANGE_EVENT,
+  StewardSessionError,
+} from "@elizaos/shared/steward-session-client";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   beginStewardSessionRecovery,
+  markStewardSessionRecoveryCookiePending,
   readStewardSessionRecovery,
 } from "../../../lib/steward-session-recovery-marker";
 
@@ -168,6 +172,36 @@ function pendingExchange(signal?: AbortSignal): Promise<{ token?: string }> {
   });
 }
 
+function makeJwt(userId: string, rotation = 1): string {
+  const payload = btoa(
+    JSON.stringify({ sub: userId, tenantId: "elizacloud", rotation }),
+  )
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+  return `header.${payload}.signature`;
+}
+
+function armCurrentRecovery(expectedToken: string): void {
+  const snapshot = readStewardSessionRecovery("elizacloud");
+  const receipt = snapshot.generation;
+  const kind = snapshot.currentReceiptKind;
+  if (!receipt || !kind || !snapshot.receipts.includes(receipt)) {
+    throw new Error("Expected a current recovery reservation");
+  }
+  markStewardSessionRecoveryCookiePending(
+    {
+      tenantId: "elizacloud",
+      receipt,
+      kind,
+      preexistingReceipts: snapshot.receipts.filter(
+        (candidate) => candidate !== receipt,
+      ),
+    },
+    expectedToken,
+  );
+}
+
 describe("StewardLoginSection — OAuth callback completion state (#13519)", () => {
   beforeEach(() => {
     storage = createMemoryStorage();
@@ -218,13 +252,68 @@ describe("StewardLoginSection — OAuth callback completion state (#13519)", () 
     expect(screen.queryByRole("button", { name: /Discord/i })).toBeNull();
   });
 
+  it("retires callback A before its authority event and preserves reentrant login B", async () => {
+    callbackState.exchange = () =>
+      Promise.resolve({ token: "oauth-callback-account-a" });
+    let recoveryB: ReturnType<typeof beginStewardSessionRecovery> | undefined;
+    let receiptsAtPublication: readonly string[] | undefined;
+    const onAuthority = () => {
+      receiptsAtPublication = readStewardSessionRecovery("elizacloud").receipts;
+      recoveryB = beginStewardSessionRecovery("elizacloud", "provider");
+    };
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, onAuthority, {
+      once: true,
+    });
+
+    try {
+      renderSection();
+      await waitFor(() => expect(recoveryB).toBeDefined());
+    } finally {
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, onAuthority);
+    }
+
+    expect(receiptsAtPublication).toEqual([]);
+    expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([
+      recoveryB?.receipt,
+    ]);
+    expect(window.localStorage.getItem("steward_session_token")).toBe(
+      "oauth-callback-account-a",
+    );
+    expect(callbackState.resolveReturnTo).not.toHaveBeenCalled();
+  });
+
+  it("does not redirect callback A when token-sync queues login B", async () => {
+    callbackState.exchange = () =>
+      Promise.resolve({ token: "oauth-callback-account-a" });
+    let recoveryB: ReturnType<typeof beginStewardSessionRecovery> | undefined;
+    const onSync = () => {
+      queueMicrotask(() => {
+        recoveryB = beginStewardSessionRecovery("elizacloud", "provider");
+      });
+    };
+    window.addEventListener("steward-token-sync", onSync, { once: true });
+
+    try {
+      renderSection();
+      await waitFor(() => expect(recoveryB).toBeDefined());
+    } finally {
+      window.removeEventListener("steward-token-sync", onSync);
+    }
+
+    expect(callbackState.resolveReturnTo).not.toHaveBeenCalled();
+    expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([
+      recoveryB?.receipt,
+    ]);
+  });
+
   it("recovers a server-committed callback and its /chat intent after BFCache restore", async () => {
+    const restoredToken = makeJwt("callback-account-b");
     callbackState.hasAuthedCookie = true;
     callbackState.pendingReturnTo = "/chat";
     callbackState.resolveReturnTo.mockReturnValue("/chat");
     callbackState.recover.mockResolvedValue({
       ok: true,
-      token: "restored-callback-token",
+      token: restoredToken,
     });
     window.localStorage.setItem(
       "steward_session_token",
@@ -234,6 +323,9 @@ describe("StewardLoginSection — OAuth callback completion state (#13519)", () 
     renderSection("/login?code=callback-code&state=state-1&returnTo=%2Fchat");
     await waitFor(() => expect(callbackState.exchangeCalls).toBe(1));
     expect(callbackState.exchangeSignals[0]?.aborted).toBe(false);
+    // Model a freeze after nonce exchange returned B and durably bound the
+    // cookie-pending receipt, but before local token publication.
+    armCurrentRecovery(restoredToken);
 
     const historyRestore = new Event("pageshow");
     Object.defineProperty(historyRestore, "persisted", { value: true });
@@ -246,7 +338,7 @@ describe("StewardLoginSection — OAuth callback completion state (#13519)", () 
     expect(callbackState.sync).not.toHaveBeenCalled();
     await waitFor(() =>
       expect(window.localStorage.getItem("steward_session_token")).toBe(
-        "restored-callback-token",
+        restoredToken,
       ),
     );
     expect(callbackState.exchangeSignals[0]?.aborted).toBe(true);
@@ -261,11 +353,12 @@ describe("StewardLoginSection — OAuth callback completion state (#13519)", () 
   });
 
   it("keeps cookie authority across an ordinary unmount and remount", async () => {
+    const recoveredToken = makeJwt("new-server-account");
     callbackState.pendingReturnTo = "/chat";
     callbackState.resolveReturnTo.mockReturnValue("/chat");
     callbackState.recover.mockResolvedValue({
       ok: true,
-      token: "new-server-account-token",
+      token: recoveredToken,
     });
     window.localStorage.setItem(
       "steward_session_token",
@@ -280,6 +373,7 @@ describe("StewardLoginSection — OAuth callback completion state (#13519)", () 
       hasOAuth: true,
       receipts: [expect.any(String)],
     });
+    armCurrentRecovery(recoveredToken);
 
     firstMount.unmount();
     // A real tab close drops sessionStorage. The v2 receipt is intentionally
@@ -297,7 +391,7 @@ describe("StewardLoginSection — OAuth callback completion state (#13519)", () 
     expect(callbackState.sync).not.toHaveBeenCalled();
     await waitFor(() =>
       expect(window.localStorage.getItem("steward_session_token")).toBe(
-        "new-server-account-token",
+        recoveredToken,
       ),
     );
     await waitFor(() =>
@@ -309,6 +403,76 @@ describe("StewardLoginSection — OAuth callback completion state (#13519)", () 
         "/chat",
       ),
     );
+  });
+
+  it("keeps a pre-response OAuth reservation block-only after tab close instead of adopting stale cookie A", async () => {
+    callbackState.hasAuthedCookie = true;
+    callbackState.recover.mockResolvedValue({
+      ok: true,
+      token: makeJwt("stale-cookie-account-a"),
+    });
+    window.localStorage.setItem(
+      "steward_session_token",
+      "previous-account-token-a",
+    );
+
+    const firstMount = renderSection();
+    await waitFor(() => expect(callbackState.exchangeCalls).toBe(1));
+    expect(readStewardSessionRecovery("elizacloud")).toMatchObject({
+      currentReceiptPhase: "cookie_pending",
+      expectedIdentity: null,
+    });
+
+    firstMount.unmount();
+    window.sessionStorage.clear();
+    callbackState.hasCallback = false;
+    callbackState.codeAvailable = false;
+    renderSection("/login");
+
+    await waitFor(() =>
+      expect(screen.getByPlaceholderText("you@example.com")).toBeTruthy(),
+    );
+    expect(callbackState.recover).not.toHaveBeenCalled();
+    expect(callbackState.sync).not.toHaveBeenCalled();
+    expect(window.localStorage.getItem("steward_session_token")).toBe(
+      "previous-account-token-a",
+    );
+  });
+
+  it("publishes token sync after cookie recovery even when authority unmounts the provider", async () => {
+    callbackState.hasCallback = false;
+    callbackState.codeAvailable = false;
+    callbackState.hasAuthedCookie = true;
+    callbackState.recover.mockResolvedValue({
+      ok: true,
+      token: "cookie-recovery-account-a",
+    });
+    const tokenSync = vi.fn();
+    window.addEventListener("steward-token-sync", tokenSync);
+    let unmountCurrent = () => {};
+    const unmountOnAuthority = () => unmountCurrent();
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, unmountOnAuthority, {
+      once: true,
+    });
+
+    try {
+      const view = renderSection("/login?returnTo=%2Fchat");
+      unmountCurrent = view.unmount;
+
+      await waitFor(() =>
+        expect(window.localStorage.getItem("steward_session_token")).toBe(
+          "cookie-recovery-account-a",
+        ),
+      );
+      await waitFor(() => expect(tokenSync).toHaveBeenCalledOnce());
+      expect(callbackState.resolveReturnTo).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener("steward-token-sync", tokenSync);
+      window.removeEventListener(
+        STEWARD_SESSION_CHANGE_EVENT,
+        unmountOnAuthority,
+      );
+    }
   });
 
   it("does not treat a bearer-only steward-authed cookie as mutation ambiguity", async () => {
@@ -336,6 +500,36 @@ describe("StewardLoginSection — OAuth callback completion state (#13519)", () 
     expect(callbackState.recover).not.toHaveBeenCalled();
   });
 
+  it("keeps stale cookie account A unpublished when cookie-pending recovery is bound to account B", async () => {
+    const attemptedB = makeJwt("attempted-account-b");
+    const staleA = makeJwt("stale-cookie-account-a");
+    callbackState.hasCallback = false;
+    callbackState.codeAvailable = false;
+    callbackState.hasAuthedCookie = true;
+    callbackState.recover.mockResolvedValue({ ok: true, token: staleA });
+    const receipt = beginStewardSessionRecovery("elizacloud", "provider");
+    markStewardSessionRecoveryCookiePending(receipt, attemptedB);
+
+    renderSection("/login");
+
+    expect(
+      await screen.findByText(
+        "The server recovered a different account than this sign-in expected. Continue with a new sign-in instead.",
+      ),
+    ).toBeTruthy();
+    expect(callbackState.recover).toHaveBeenCalledOnce();
+    expect(callbackState.sync).not.toHaveBeenCalled();
+    expect(window.localStorage.getItem("steward_session_token")).toBeNull();
+    expect(readStewardSessionRecovery("elizacloud")).toMatchObject({
+      receipts: [receipt.receipt],
+      currentReceiptPhase: "cookie_pending",
+      expectedIdentity: {
+        userId: "attempted-account-b",
+        tenantId: "elizacloud",
+      },
+    });
+  });
+
   it("keeps an ambiguity receipt and never replays the old account on a 200 response without a token", async () => {
     callbackState.hasCallback = false;
     callbackState.codeAvailable = false;
@@ -345,6 +539,10 @@ describe("StewardLoginSection — OAuth callback completion state (#13519)", () 
       "previous-account-token",
     );
     const receipt = beginStewardSessionRecovery("elizacloud", "provider");
+    markStewardSessionRecoveryCookiePending(
+      receipt,
+      makeJwt("expected-account-b"),
+    );
 
     renderSection("/login");
 
@@ -373,6 +571,10 @@ describe("StewardLoginSection — OAuth callback completion state (#13519)", () 
       "previous-account-token-A",
     );
     const receipt = beginStewardSessionRecovery("elizacloud", "provider");
+    markStewardSessionRecoveryCookiePending(
+      receipt,
+      makeJwt("expected-account-b"),
+    );
 
     renderSection("/login");
 
@@ -410,6 +612,36 @@ describe("StewardLoginSection — OAuth callback completion state (#13519)", () 
     expect(callbackState.exchangeCalls).toBe(0);
   });
 
+  it("retires callback recovery when the origin lock rejects before dispatch", async () => {
+    const previousLocks = Object.getOwnPropertyDescriptor(navigator, "locks");
+    const request = vi
+      .fn()
+      .mockRejectedValue(new Error("Origin session lock unavailable"));
+    Object.defineProperty(navigator, "locks", {
+      configurable: true,
+      value: { request },
+    });
+
+    try {
+      renderSection();
+      expect(
+        await screen.findByText("Origin session lock unavailable"),
+      ).toBeTruthy();
+    } finally {
+      if (previousLocks) {
+        Object.defineProperty(navigator, "locks", previousLocks);
+      } else {
+        Reflect.deleteProperty(navigator, "locks");
+      }
+    }
+
+    expect(request).toHaveBeenCalledOnce();
+    expect(callbackState.exchangeCalls).toBe(0);
+    expect(callbackState.recover).not.toHaveBeenCalled();
+    expect(callbackState.sync).not.toHaveBeenCalled();
+    expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([]);
+  });
+
   it("blocks local replay when durable marker enumeration is unavailable", async () => {
     callbackState.hasCallback = false;
     callbackState.codeAvailable = false;
@@ -442,6 +674,8 @@ describe("StewardLoginSection — OAuth callback completion state (#13519)", () 
   });
 
   it("keeps callback account authority across repeated BFCache restores", async () => {
+    const firstRecoveredToken = makeJwt("callback-account-b", 1);
+    const secondRecoveredToken = makeJwt("callback-account-b", 2);
     callbackState.hasAuthedCookie = true;
     callbackState.pendingReturnTo = "/chat";
     callbackState.resolveReturnTo.mockReturnValue("/chat");
@@ -460,7 +694,7 @@ describe("StewardLoginSection — OAuth callback completion state (#13519)", () 
       )
       .mockResolvedValueOnce({
         ok: true,
-        token: "second-restored-callback-token",
+        token: secondRecoveredToken,
       });
     window.localStorage.setItem(
       "steward_session_token",
@@ -469,6 +703,7 @@ describe("StewardLoginSection — OAuth callback completion state (#13519)", () 
 
     renderSection("/login?code=callback-code&state=state-1&returnTo=%2Fchat");
     await waitFor(() => expect(callbackState.exchangeCalls).toBe(1));
+    armCurrentRecovery(firstRecoveredToken);
 
     const firstRestore = new Event("pageshow");
     Object.defineProperty(firstRestore, "persisted", { value: true });
@@ -506,6 +741,7 @@ describe("StewardLoginSection — OAuth callback completion state (#13519)", () 
   });
 
   it("clears the completing state and surfaces the error when the callback exchange fails", async () => {
+    callbackState.hasAuthedCookie = true;
     callbackState.exchange = () =>
       Promise.reject(new Error("Could not complete Eliza Cloud sign-in."));
 
@@ -524,6 +760,29 @@ describe("StewardLoginSection — OAuth callback completion state (#13519)", () 
       hasOAuth: true,
       receipts: [expect.any(String)],
     });
+    expect(callbackState.recover).not.toHaveBeenCalled();
+    expect(window.localStorage.getItem("steward_session_token")).toBeNull();
+  });
+
+  it("retires callback recovery when nonce exchange returns HTTP 502", async () => {
+    callbackState.hasAuthedCookie = true;
+    callbackState.exchange = () =>
+      Promise.reject(
+        new StewardSessionError(
+          "Nonce exchange unavailable",
+          502,
+          "upstream_unavailable",
+        ),
+      );
+
+    renderSection();
+
+    expect(await screen.findByText("Nonce exchange unavailable")).toBeTruthy();
+    expect(callbackState.exchangeCalls).toBe(1);
+    expect(callbackState.recover).not.toHaveBeenCalled();
+    expect(callbackState.sync).not.toHaveBeenCalled();
+    expect(window.localStorage.getItem("steward_session_token")).toBeNull();
+    expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([]);
   });
 
   it("shows a friendly 'expired / try again' message (not the raw 401) when a stale or cross-tenant one-time code is rejected", async () => {

@@ -109,8 +109,10 @@ describe("renderer web composition", () => {
       "https://cloud-staging.eliza.app",
     );
     expect(getBootConfig()).toMatchObject({
-      preferSharedCloudTier: true,
-      autoUpgradeSharedToDedicated: true,
+      preferSharedCloudTier: false,
+      // The real connected web composition must not silently create/cut over
+      // to billed Dedicated compute after Shared-first onboarding.
+      autoUpgradeSharedToDedicated: false,
     });
     expect(window.localStorage.getItem(STEWARD_ACTIVE_SCOPE_KEY)).toBe(
       "eliza-cloud:staging",

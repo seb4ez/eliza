@@ -73,6 +73,7 @@ interface SetJournalEntry {
 interface CommitJournalEntry {
   compensation: { predecessor: string | null; value: string } | null;
   compensationResult?: RendererSecureStoreCompensateCommittedReceiptResult;
+  compensationResultRevision?: number;
   compensationRevision?: number;
   expiresAt: number;
   owner: RendererSecureStoreOwner;
@@ -85,6 +86,7 @@ interface DeleteJournalEntry {
   expectedRevision: number;
   expiresAt: number;
   owner: RendererSecureStoreOwner;
+  resultRevision: number;
   result: RendererSecureStoreCompareAndDeleteResult;
   slot: string;
   valueFingerprint: string;
@@ -95,6 +97,7 @@ interface CompareSetJournalEntry {
   expectedValueFingerprint: string;
   expiresAt: number;
   owner: RendererSecureStoreOwner;
+  resultRevision: number;
   result: RendererSecureStoreCompareAndSetResult;
   slot: string;
   valueFingerprint: string;
@@ -516,8 +519,9 @@ export class RendererSecureStoreAuthority {
         }
         const finish = (
           result: RendererSecureStoreSetResult,
+          changed: boolean,
         ): RendererSecureStoreSetResult => {
-          const changedResult = { ...result, changed: true };
+          const changedResult = { ...result, changed };
           this.rememberSet(journalKey, {
             owner,
             result: changedResult,
@@ -531,11 +535,14 @@ export class RendererSecureStoreAuthority {
         try {
           predecessorResult = await this.store.get(vaultId, kind);
         } catch {
-          return finish({
-            ok: false,
-            reason: "error",
-            message: "Secure credential predecessor could not be read.",
-          });
+          return finish(
+            {
+              ok: false,
+              reason: "error",
+              message: "Secure credential predecessor could not be read.",
+            },
+            false,
+          );
         }
         let predecessor: string | null;
         if (predecessorResult.ok) {
@@ -543,9 +550,11 @@ export class RendererSecureStoreAuthority {
         } else if (predecessorResult.reason === "not_found") {
           predecessor = null;
         } else {
-          return finish(predecessorResult);
+          return finish(predecessorResult, false);
         }
-        if (this.releasedOwners.has(owner)) return finish(releasedOwnerFailure);
+        if (this.releasedOwners.has(owner)) {
+          return finish(releasedOwnerFailure, false);
+        }
 
         const state = this.stateFor(slot, vaultId, kind);
         const currentRollback = state.currentReceipt
@@ -561,7 +570,7 @@ export class RendererSecureStoreAuthority {
             reason: "unavailable",
             message: "Too many pending secure credential mutations.",
           } as const;
-          return finish(result);
+          return finish(result, false);
         }
 
         // Register before awaiting the backend: it may mutate and then throw.
@@ -599,6 +608,7 @@ export class RendererSecureStoreAuthority {
           };
         }
         let result: RendererSecureStoreSetResult;
+        let changed = true;
         if (verified.ok && verified.value === value) {
           // Readback is authoritative: mutate-then-error is a successful write.
           result = { ok: true, rollbackReceipt };
@@ -606,6 +616,7 @@ export class RendererSecureStoreAuthority {
           const verifiedValue = verified.ok ? verified.value : null;
           if (verifiedValue === predecessor) {
             this.discardCurrentRollback(state, rollback);
+            changed = false;
           } else {
             // Never overwrite a value placed by an authority outside this chain.
             state.currentReceipt = null;
@@ -621,7 +632,7 @@ export class RendererSecureStoreAuthority {
           };
         }
 
-        return finish(result);
+        return finish(result, changed);
       },
     ).finally(() => this.endOwnerOperation(owner));
   }
@@ -631,6 +642,7 @@ export class RendererSecureStoreAuthority {
     kind: SecureStoreSecretKind,
     rollbackReceipt: string,
     owner: RendererSecureStoreOwner = defaultOwner,
+    revisionMatches = true,
   ): Promise<RendererSecureStoreCommitReceiptResult> {
     const slot = this.slotKey(vaultId, kind);
     return this.serializeSlot(slot, async () => {
@@ -639,9 +651,10 @@ export class RendererSecureStoreAuthority {
       const journalKey = this.journalKey("commit", owner, rollbackReceipt);
       const replay = this.commitJournal.get(journalKey);
       if (replay) {
-        return replay.slot === slot
-          ? replay.result
-          : { ok: true, committed: false };
+        if (replay.slot !== slot) return { ok: true, committed: false };
+        return "changed" in replay.result
+          ? { ...replay.result, changed: false }
+          : replay.result;
       }
 
       let result: RendererSecureStoreCommitReceiptResult;
@@ -653,10 +666,46 @@ export class RendererSecureStoreAuthority {
         // mutate authority and therefore need no response-loss journal entry.
         return { ok: true, committed: false };
       } else if (state.currentReceipt === rollbackReceipt) {
+        if (!revisionMatches) {
+          const rollbackResult = await this.compareAndRestoreUnlocked(
+            state,
+            rollbackReceipt,
+            owner,
+          );
+          if (!rollbackResult.ok) return rollbackResult;
+          result = {
+            ok: true,
+            committed: false,
+            changed: rollbackResult.restored,
+          };
+          this.rememberCommit(journalKey, {
+            compensation: null,
+            owner,
+            receipt: rollbackReceipt,
+            result,
+            slot,
+          });
+          return result;
+        }
+        const current = await this.store.get(vaultId, kind);
+        if (!current.ok) return current;
+        if (current.value !== committed.value) {
+          state.currentReceipt = null;
+          this.clearRollbacks(state);
+          result = { ok: true, committed: false };
+          this.rememberCommit(journalKey, {
+            compensation: null,
+            owner,
+            receipt: rollbackReceipt,
+            result,
+            slot,
+          });
+          return result;
+        }
         const effective = this.effectivePredecessor(state, committed);
         state.currentReceipt = null;
         this.clearRollbacks(state);
-        result = { ok: true, committed: true };
+        result = { ok: true, committed: true, value: current.value };
         this.rememberCommit(journalKey, {
           compensation: {
             predecessor: effective.predecessor,
@@ -686,6 +735,24 @@ export class RendererSecureStoreAuthority {
     });
   }
 
+  /** True only for an immutable successful COMMIT tombstone owned by caller. */
+  hasCommittedReceiptReplay(
+    vaultId: string,
+    kind: SecureStoreSecretKind,
+    rollbackReceipt: string,
+    owner: RendererSecureStoreOwner = defaultOwner,
+  ): boolean {
+    this.pruneJournal();
+    const replay = this.commitJournal.get(
+      this.journalKey("commit", owner, rollbackReceipt),
+    );
+    return Boolean(
+      replay?.slot === this.slotKey(vaultId, kind) &&
+        replay.result.ok &&
+        replay.result.committed,
+    );
+  }
+
   /**
    * Compensate a receipt that already committed only at the exact SET revision.
    * The revision lock is owned by RendererSecureStoreRevisions; accepting both
@@ -699,6 +766,7 @@ export class RendererSecureStoreAuthority {
     expectedRevision: number,
     currentRevision: number,
     owner: RendererSecureStoreOwner = defaultOwner,
+    allowUnpublishedReplay = false,
   ): Promise<RendererSecureStoreCompensateCommittedReceiptResult> {
     const slot = this.slotKey(vaultId, kind);
     return this.serializeSlot(
@@ -723,12 +791,22 @@ export class RendererSecureStoreAuthority {
             : current;
         }
         if (commit.compensationResult) {
-          if (commit.compensationRevision === expectedRevision) {
-            return commit.compensationResult.ok
-              ? { ...commit.compensationResult, changed: false }
-              : commit.compensationResult;
-          }
           const current = await this.store.get(vaultId, kind);
+          const currentValue = current.ok
+            ? current.value
+            : current.reason === "not_found"
+              ? null
+              : undefined;
+          if (
+            commit.compensationRevision === expectedRevision &&
+            commit.compensationResult.ok &&
+            currentValue === commit.compensationResult.value &&
+            (currentRevision === commit.compensationResultRevision ||
+              (allowUnpublishedReplay &&
+                currentRevision === commit.compensationRevision))
+          ) {
+            return { ...commit.compensationResult, changed: false };
+          }
           if (!current.ok && current.reason === "not_found") {
             return { ok: true, restored: false, changed: false, value: null };
           }
@@ -814,6 +892,12 @@ export class RendererSecureStoreAuthority {
         }
         commit.compensationResult = result;
         commit.compensationRevision = expectedRevision;
+        // The revision wrapper publishes exactly once for a successful
+        // restoration (immediately for a generic compensation, collectively
+        // for a reverse WAL). Replays may publish the old snapshot only at
+        // that post-mutation revision; same-byte ABA at any later revision is
+        // a superseding write.
+        commit.compensationResultRevision = currentRevision + 1;
         return result;
       },
     );
@@ -871,7 +955,30 @@ export class RendererSecureStoreAuthority {
               message: "Secure credential mutation id was reused.",
             };
           }
-          return { ...replay.result, changed: false };
+          if (!replay.result.ok) return replay.result;
+          const current = await this.store.get(vaultId, kind);
+          const currentValue = current.ok
+            ? current.value
+            : current.reason === "not_found"
+              ? null
+              : undefined;
+          if (
+            currentRevision === replay.resultRevision &&
+            currentValue === replay.result.value
+          ) {
+            return { ...replay.result, changed: false };
+          }
+          if (!current.ok && current.reason === "not_found") {
+            return { ok: true, deleted: false, changed: false, value: null };
+          }
+          return current.ok
+            ? {
+                ok: true,
+                deleted: false,
+                changed: false,
+                value: current.value,
+              }
+            : current;
         }
         if (!this.reserveJournalEntry()) {
           return {
@@ -889,6 +996,8 @@ export class RendererSecureStoreAuthority {
           this.rememberDelete(journalKey, {
             expectedRevision,
             owner,
+            resultRevision:
+              currentRevision + (changedResult.changed === false ? 0 : 1),
             result: changedResult,
             slot,
             valueFingerprint,
@@ -980,7 +1089,30 @@ export class RendererSecureStoreAuthority {
               message: "Secure credential mutation id was reused.",
             };
           }
-          return { ...replay.result, changed: false };
+          if (!replay.result.ok) return replay.result;
+          const current = await this.store.get(vaultId, kind);
+          const currentValue = current.ok
+            ? current.value
+            : current.reason === "not_found"
+              ? null
+              : undefined;
+          if (
+            currentRevision === replay.resultRevision &&
+            currentValue === replay.result.value
+          ) {
+            return { ...replay.result, changed: false };
+          }
+          if (!current.ok && current.reason === "not_found") {
+            return { ok: true, applied: false, changed: false, value: null };
+          }
+          return current.ok
+            ? {
+                ok: true,
+                applied: false,
+                changed: false,
+                value: current.value,
+              }
+            : current;
         }
         if (!this.reserveJournalEntry()) {
           return {
@@ -999,6 +1131,8 @@ export class RendererSecureStoreAuthority {
             expectedRevision,
             expectedValueFingerprint,
             owner,
+            resultRevision:
+              currentRevision + (changedResult.changed === false ? 0 : 1),
             result: changedResult,
             slot,
             valueFingerprint,
@@ -1183,6 +1317,22 @@ export class RendererSecureStoreAuthority {
   /** Prevents a closing endpoint from starting or finalizing new mutations. */
   markOwnerReleased(owner: RendererSecureStoreOwner): void {
     this.releasedOwners.add(owner);
+  }
+
+  /**
+   * A runtime-connection transaction must not capture a value whose renderer
+   * SET receipt is still undecided. Call this while holding the connection
+   * transaction authority's host-global lock so SET -> receipt settlement
+   * cannot race the check with WAL creation.
+   */
+  assertNoPendingReceipts(vaultId: string): void {
+    for (const state of this.slotStates.values()) {
+      if (state.vaultId === vaultId && state.rollbacks.size > 0) {
+        throw new Error(
+          "Runtime connection transaction cannot begin while secure-store receipts are pending.",
+        );
+      }
+    }
   }
 
   ownerSlots(

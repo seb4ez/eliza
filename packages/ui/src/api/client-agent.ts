@@ -326,6 +326,15 @@ export type BootstrapExchangeResult =
   | BootstrapExchangeSuccess
   | BootstrapExchangeFailure;
 
+export interface GetAuthStatusOptions {
+  /**
+   * Exact caller-owned authority fence. Returning false permanently retires
+   * this probe before it can issue another transport attempt or publish a
+   * response for a superseded runtime target.
+   */
+  validate?: () => boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Connector account routes — UI-facing connector multi-account management.
 // Connector config still uses `/api/connectors`; account inventory lives under
@@ -377,7 +386,7 @@ declare module "./client-base" {
       failed?: string[];
       error?: string;
     }>;
-    getAuthStatus(): Promise<{
+    getAuthStatus(options?: GetAuthStatusOptions): Promise<{
       required: boolean;
       authenticated?: boolean;
       loginRequired?: boolean;
@@ -1376,13 +1385,24 @@ ElizaClient.prototype.postWalletOsStoreAction = async function (
   });
 };
 
-ElizaClient.prototype.getAuthStatus = async function (this: ElizaClient) {
+function assertAuthStatusProbeCurrent(options?: GetAuthStatusOptions): void {
+  if (options?.validate?.() !== false) return;
+  const error = new Error("Auth-status probe authority was superseded.");
+  error.name = "AuthStatusProbeSupersededError";
+  throw error;
+}
+
+ElizaClient.prototype.getAuthStatus = async function (
+  this: ElizaClient,
+  options?: GetAuthStatusOptions,
+) {
   // Prefer typed Electrobun RPC. Throws AgentNotReadyError when the
   // agent has no port yet — we catch and fall through to HTTP so the
   // existing retry/backoff loop handles the "not ready" semantic
   // exactly as it did before RPC was in the picture. NEVER fabricates
   // a 401-shaped fallback response (see the auth-client.ts authMe wrapper
   // history if you need the bug story).
+  assertAuthStatusProbeCurrent(options);
   try {
     const viaRpc = await invokeLocalDesktopAgentRpc<{
       required: boolean;
@@ -1394,8 +1414,14 @@ ElizaClient.prototype.getAuthStatus = async function (this: ElizaClient) {
       localAccess?: boolean;
       passwordConfigured?: boolean;
     }>(this.getBaseUrl(), { rpcMethod: "getAuthStatus", ipcChannel: "agent" });
-    if (viaRpc) return viaRpc;
+    assertAuthStatusProbeCurrent(options);
+    if (viaRpc) {
+      assertAuthStatusProbeCurrent(options);
+      return viaRpc;
+    }
   } catch {
+    // Do not let the RPC fallback turn a retired A probe into an HTTP request.
+    assertAuthStatusProbeCurrent(options);
     /* AgentNotReadyError or any RPC failure → fall through to HTTP */
   }
 
@@ -1403,19 +1429,37 @@ ElizaClient.prototype.getAuthStatus = async function (this: ElizaClient) {
   const baseBackoffMs = 1000;
   let lastErr: unknown;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    assertAuthStatusProbeCurrent(options);
     try {
-      return await this.fetch("/api/auth/status");
+      const authStatus = await this.fetch<{
+        required: boolean;
+        pairingEnabled: boolean;
+        expiresAt: number | null;
+        authenticated?: boolean;
+        loginRequired?: boolean;
+        bootstrapRequired?: boolean;
+        localAccess?: boolean;
+        passwordConfigured?: boolean;
+      }>("/api/auth/status", undefined, { validate: options?.validate });
+      assertAuthStatusProbeCurrent(options);
+      return authStatus;
     } catch (err: unknown) {
+      // Includes a validation failure raised immediately after the fetch: a
+      // superseded response is never reclassified into an ordinary retry.
+      assertAuthStatusProbeCurrent(options);
       const status = (err as Error & { status?: number })?.status;
       if (status === 401) {
+        assertAuthStatusProbeCurrent(options);
         return { required: true, pairingEnabled: false, expiresAt: null };
       }
       if (status === 404) {
+        assertAuthStatusProbeCurrent(options);
         return { required: false, pairingEnabled: false, expiresAt: null };
       }
       lastErr = err;
       if (attempt < maxRetries) {
         await new Promise((r) => setTimeout(r, baseBackoffMs * 2 ** attempt));
+        assertAuthStatusProbeCurrent(options);
       }
     }
   }

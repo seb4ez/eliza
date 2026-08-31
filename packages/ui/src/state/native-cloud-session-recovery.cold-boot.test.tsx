@@ -7,8 +7,16 @@
  */
 // @vitest-environment jsdom
 
+import { writeStoredStewardToken } from "@elizaos/shared/steward-session-client";
 import { cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const sessionTargetAuthorityMock = vi.hoisted(() => ({
+  isCurrent: vi.fn(() => true),
+  publish: vi.fn(() => true),
+  restoreIfCurrent: vi.fn(() => true),
+  clearIfCurrent: vi.fn(() => true),
+}));
 
 const clientMock = vi.hoisted(() => ({
   getAuthStatus: vi.fn(),
@@ -21,6 +29,7 @@ const clientMock = vi.hoisted(() => ({
   getBaseUrl: vi.fn(() => "https://agent-123.elizacloud.ai"),
   setBaseUrl: vi.fn(),
   setToken: vi.fn(),
+  stageSessionTarget: vi.fn(() => sessionTargetAuthorityMock),
 }));
 
 const cloudTokenMock = vi.hoisted(() =>
@@ -108,7 +117,7 @@ function RecoveryProbe(props: {
 }
 
 describe("managed-native stale-session cold boot", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     localStorage.clear();
     sessionStorage.clear();
     vi.clearAllMocks();
@@ -129,6 +138,7 @@ describe("managed-native stale-session cold boot", () => {
       }),
     );
     cloudTokenMock.mockReturnValue("steward.jwt.native-session");
+    await writeStoredStewardToken("steward.jwt.native-session");
   });
 
   afterEach(() => {
@@ -248,7 +258,11 @@ describe("managed-native stale-session cold boot", () => {
 
     expect(statuses).toContain("recovering");
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(clientMock.setToken).toHaveBeenCalledWith("fresh-agent-bearer");
+    expect(clientMock.stageSessionTarget).toHaveBeenCalledWith(
+      { baseUrl: AGENT_BASE, token: "fresh-agent-bearer" },
+      { persist: false },
+    );
+    expect(sessionTargetAuthorityMock.publish).toHaveBeenCalledTimes(1);
     // The durable pair token is persisted under the per-agent key (#17579);
     // the legacy global key must stay empty so another agent's boot can never
     // adopt this credential.

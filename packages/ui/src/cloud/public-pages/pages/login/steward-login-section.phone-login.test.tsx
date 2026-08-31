@@ -22,6 +22,20 @@ import {
   it,
   vi,
 } from "vitest";
+import {
+  beginStewardSessionRecovery,
+  completeStewardSessionRecovery,
+  readStewardSessionRecovery,
+  STEWARD_SESSION_RECOVERY_CHANGE_EVENT,
+} from "../../../lib/steward-session-recovery-marker";
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
 
 beforeAll(() => {
   Element.prototype.hasPointerCapture = () => false;
@@ -197,7 +211,19 @@ describe("StewardLoginSection phone login", () => {
     });
     window.localStorage.clear();
     sessionSpies.storedToken = null;
-    sessionSpies.sync.mockResolvedValue(undefined);
+    sessionSpies.sync.mockImplementation(
+      async (
+        token: string,
+        _refreshToken?: string | null,
+        options?: {
+          finalizeBeforePublish?: () => (durableRestored: boolean) => void;
+        },
+      ) => {
+        sessionSpies.storedToken = token;
+        sessionSpies.write(token);
+        options?.finalizeBeforePublish?.();
+      },
+    );
     returnToSpies.resolve.mockReturnValue("/dashboard/agents");
   });
 
@@ -441,12 +467,14 @@ describe("StewardLoginSection phone login", () => {
         "sms-session-token",
         "sms-refresh-token",
         expect.objectContaining({
+          finalizeBeforePublish: expect.any(Function),
           signal: expect.any(AbortSignal),
           verifiedPhone: "+14155552671",
         }),
       ),
     );
     expect(sessionSpies.write).toHaveBeenCalledWith("sms-session-token");
+    expect(sessionSpies.write).toHaveBeenCalledOnce();
     expect(returnToSpies.resolve).toHaveBeenCalled();
   });
 
@@ -454,10 +482,22 @@ describe("StewardLoginSection phone login", () => {
     let completeSync: (() => void) | undefined;
     const storageEvent = vi.fn();
     window.addEventListener("storage", storageEvent);
-    sessionSpies.sync.mockReturnValueOnce(
-      new Promise<void>((resolve) => {
-        completeSync = resolve;
-      }),
+    sessionSpies.sync.mockImplementationOnce(
+      (
+        token: string,
+        _refreshToken?: string | null,
+        options?: {
+          finalizeBeforePublish?: () => (durableRestored: boolean) => void;
+        },
+      ) =>
+        new Promise<void>((resolve) => {
+          completeSync = () => {
+            sessionSpies.storedToken = token;
+            sessionSpies.write(token);
+            options?.finalizeBeforePublish?.();
+            resolve();
+          };
+        }),
     );
     renderSection();
     await sendPhoneCode();
@@ -496,5 +536,65 @@ describe("StewardLoginSection phone login", () => {
     expect(screen.getByLabelText("Six-digit code")).toBeTruthy();
     expect(sessionSpies.sync).not.toHaveBeenCalled();
     expect(sessionSpies.write).not.toHaveBeenCalled();
+  });
+
+  it("plants SMS intent A before verification so completed login B remains authoritative", async () => {
+    const verification = deferred<{
+      token: string;
+      refreshToken: string;
+      expiresIn: number;
+      user: { id: string; email: null };
+    }>();
+    authSpies.verifySmsOtp.mockReturnValue(verification.promise);
+    renderSection();
+    await sendPhoneCode();
+
+    fireEvent.change(screen.getByLabelText("Six-digit code"), {
+      target: { value: "123456" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Verify phone" }));
+    await waitFor(() => expect(authSpies.verifySmsOtp).toHaveBeenCalledOnce());
+    expect(readStewardSessionRecovery("elizacloud").receipts).toHaveLength(1);
+
+    const loginB = beginStewardSessionRecovery("elizacloud", "provider");
+    sessionSpies.storedToken = "account-b-token";
+    completeStewardSessionRecovery(loginB);
+    verification.resolve({
+      token: "account-a-token",
+      refreshToken: "account-a-refresh",
+      expiresIn: 900,
+      user: { id: "account-a", email: null },
+    });
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(sessionSpies.sync).not.toHaveBeenCalled();
+    expect(sessionSpies.storedToken).toBe("account-b-token");
+    expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([]);
+  });
+
+  it("retires a provider receipt when recovery publication unmounts before SMS dispatch", async () => {
+    const section = renderSection();
+    await sendPhoneCode();
+    const unmountOnRecovery = () => section.unmount();
+    window.addEventListener(
+      STEWARD_SESSION_RECOVERY_CHANGE_EVENT,
+      unmountOnRecovery,
+      { once: true },
+    );
+
+    fireEvent.change(screen.getByLabelText("Six-digit code"), {
+      target: { value: "123456" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Verify phone" }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(authSpies.verifySmsOtp).not.toHaveBeenCalled();
+    expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([]);
   });
 });

@@ -22,6 +22,7 @@ import {
   completeStewardSessionRecovery,
   readStewardSessionRecovery,
   rejectStewardSessionRecovery,
+  STEWARD_SESSION_RECOVERY_CHANGE_EVENT,
 } from "../cloud/lib/steward-session-recovery-marker";
 import {
   configuredStewardTenantId,
@@ -67,6 +68,28 @@ function makeJwt(exp: number | null): string {
     .replace(/\//g, "_")
     .replace(/=+$/, "");
   return `${header}.${payload}.sig`;
+}
+
+function sharedCloudAgent() {
+  return {
+    agent_id: "shared-agent",
+    agent_name: "Eliza",
+    node_id: null,
+    container_id: null,
+    headscale_ip: null,
+    bridge_url: null,
+    web_ui_url: null,
+    status: "running",
+    agent_config: {},
+    created_at: "2026-01-01T00:00:00.000Z",
+    updated_at: "2026-01-01T00:00:00.000Z",
+    containerUrl: "",
+    webUiUrl: null,
+    database_status: "ready",
+    error_message: null,
+    last_heartbeat_at: null,
+    execution_tier: "shared" as const,
+  };
 }
 
 describe("getCloudAuthToken (Cloud = Steward everywhere)", () => {
@@ -263,6 +286,674 @@ describe("getCloudAuthToken (Cloud = Steward everywhere)", () => {
 });
 
 describe("selectOrProvisionCloudAgent Steward authority publication", () => {
+  it("retains Steward authority when an already-Dedicated client selects with the exact canonical token", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, "account-a-token");
+    const tenantId = configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID);
+    const client = new ElizaClient(
+      "https://00000000-0000-4000-8000-000000000020.cloud.eliza.app",
+      "agent-local-bearer",
+    );
+    let loginB: ReturnType<typeof beginStewardSessionRecovery> | null = null;
+
+    try {
+      const selected = await client.selectOrProvisionCloudAgent({
+        cloudApiBase: "https://api.eliza.app",
+        authToken: "account-a-token",
+        name: "Eliza",
+        knownAgents: [sharedCloudAgent()],
+        preferSharedTier: true,
+      });
+
+      expect(selected.authority?.isCurrent()).toBe(true);
+      loginB = beginStewardSessionRecovery(tenantId, "provider");
+      expect(selected.authority?.isCurrent()).toBe(false);
+    } finally {
+      if (loginB) rejectStewardSessionRecovery(loginB);
+      localStorage.removeItem(STEWARD_TOKEN_KEY);
+    }
+  });
+
+  it("refuses an agent-local bearer for account-level selection on an already-Dedicated client", async () => {
+    localStorage.removeItem(STEWARD_TOKEN_KEY);
+    const client = new ElizaClient(
+      "https://00000000-0000-4000-8000-000000000020.cloud.eliza.app",
+      "agent-local-bearer",
+    );
+    const createSpy = vi.spyOn(client, "createCloudCompatAgent");
+
+    await expect(
+      client.selectOrProvisionCloudAgent({
+        cloudApiBase: "https://api.eliza.app",
+        authToken: "agent-local-bearer",
+        name: "Eliza",
+        knownAgents: [],
+        forceCreate: true,
+      }),
+    ).rejects.toMatchObject({ code: "STEWARD_SESSION_SUPERSEDED" });
+
+    expect(createSpy).not.toHaveBeenCalled();
+  });
+
+  it("never adopts a pending login receipt as passive selection authority", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, "account-a-token");
+    const tenantId = configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID);
+    const loginB = beginStewardSessionRecovery(tenantId, "provider");
+    const client = new ElizaClient("https://api.eliza.app");
+
+    try {
+      await expect(
+        client.selectOrProvisionCloudAgent({
+          cloudApiBase: "https://api.eliza.app",
+          authToken: "account-a-token",
+          name: "Eliza",
+          knownAgents: [],
+        }),
+      ).rejects.toMatchObject({ code: "STEWARD_SESSION_SUPERSEDED" });
+
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("account-a-token");
+      expect(readStewardSessionRecovery(tenantId).receipts).toEqual([
+        loginB.receipt,
+      ]);
+    } finally {
+      rejectStewardSessionRecovery(loginB);
+      localStorage.removeItem(STEWARD_TOKEN_KEY);
+    }
+  });
+
+  it("finishes recovery when the canonical authority event aborts the caller", async () => {
+    localStorage.removeItem(STEWARD_TOKEN_KEY);
+    const controller = new AbortController();
+    const abortOnAuthority = () => {
+      controller.abort(new DOMException("cancelled", "AbortError"));
+    };
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, abortOnAuthority, {
+      once: true,
+    });
+
+    try {
+      const client = new ElizaClient("https://api.eliza.app");
+      const selected = await client.selectOrProvisionCloudAgent({
+        cloudApiBase: "https://api.eliza.app",
+        authToken: "account-a-token",
+        name: "Eliza",
+        knownAgents: [sharedCloudAgent()],
+        preferSharedTier: true,
+        signal: controller.signal,
+      });
+
+      expect(controller.signal.aborted).toBe(true);
+      expect(selected.agentId).toBe("shared-agent");
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("account-a-token");
+      expect(
+        readStewardSessionRecovery(
+          configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID),
+        ).receipts,
+      ).toEqual([]);
+    } finally {
+      window.removeEventListener(
+        STEWARD_SESSION_CHANGE_EVENT,
+        abortOnAuthority,
+      );
+      localStorage.removeItem(STEWARD_TOKEN_KEY);
+    }
+  });
+
+  it("rejects selection A when recovery publication queues login B", async () => {
+    localStorage.removeItem(STEWARD_TOKEN_KEY);
+    const tenantId = configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID);
+    let recoveryEvents = 0;
+    let newerLogin: ReturnType<typeof beginStewardSessionRecovery> | null =
+      null;
+    const readNewerLogin = () => newerLogin;
+    const beginNewerLoginAfterPublication = () => {
+      recoveryEvents += 1;
+      if (recoveryEvents !== 1) return;
+      queueMicrotask(() => {
+        newerLogin = beginStewardSessionRecovery(tenantId, "provider");
+      });
+    };
+    window.addEventListener(
+      STEWARD_SESSION_RECOVERY_CHANGE_EVENT,
+      beginNewerLoginAfterPublication,
+    );
+
+    try {
+      const client = new ElizaClient("https://api.eliza.app");
+      await expect(
+        client.selectOrProvisionCloudAgent({
+          cloudApiBase: "https://api.eliza.app",
+          authToken: "account-a-token",
+          name: "Eliza",
+          knownAgents: [],
+        }),
+      ).rejects.toMatchObject({ code: "STEWARD_SESSION_SUPERSEDED" });
+
+      const recordedNewerLogin = readNewerLogin();
+      expect(recordedNewerLogin).not.toBeNull();
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+      expect(readStewardSessionRecovery(tenantId).receipts).toEqual([
+        recordedNewerLogin?.receipt,
+      ]);
+    } finally {
+      window.removeEventListener(
+        STEWARD_SESSION_RECOVERY_CHANGE_EVENT,
+        beginNewerLoginAfterPublication,
+      );
+      const recordedNewerLogin = readNewerLogin();
+      if (recordedNewerLogin) {
+        rejectStewardSessionRecovery(recordedNewerLogin);
+      }
+      localStorage.removeItem(STEWARD_TOKEN_KEY);
+    }
+  });
+
+  it("does not list or create under login B when listing progress supersedes A", async () => {
+    localStorage.removeItem(STEWARD_TOKEN_KEY);
+    const tenantId = configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID);
+    let newerLogin: ReturnType<typeof beginStewardSessionRecovery> | null =
+      null;
+    const readNewerLogin = () => newerLogin;
+    const client = new ElizaClient("https://api.eliza.app");
+    const listSpy = vi.spyOn(client, "getCloudCompatAgents");
+    const createSpy = vi.spyOn(client, "createCloudCompatAgent");
+
+    try {
+      await expect(
+        client.selectOrProvisionCloudAgent({
+          cloudApiBase: "https://api.eliza.app",
+          authToken: "account-a-token",
+          name: "Eliza",
+          onProgress: (status) => {
+            if (status === "listing" && !newerLogin) {
+              newerLogin = beginStewardSessionRecovery(tenantId, "provider");
+            }
+          },
+        }),
+      ).rejects.toMatchObject({ code: "STEWARD_SESSION_SUPERSEDED" });
+
+      expect(readNewerLogin()).not.toBeNull();
+      expect(listSpy).not.toHaveBeenCalled();
+      expect(createSpy).not.toHaveBeenCalled();
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+      expect(readStewardSessionRecovery(tenantId).receipts).toEqual([
+        readNewerLogin()?.receipt,
+      ]);
+    } finally {
+      const recordedNewerLogin = readNewerLogin();
+      if (recordedNewerLogin) {
+        rejectStewardSessionRecovery(recordedNewerLogin);
+      }
+      localStorage.removeItem(STEWARD_TOKEN_KEY);
+    }
+  });
+
+  it("does not dispatch the proxy create when login B starts in the direct-fallback microtask", async () => {
+    localStorage.removeItem(STEWARD_TOKEN_KEY);
+    const tenantId = configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID);
+    let newerLogin: ReturnType<typeof beginStewardSessionRecovery> | null =
+      null;
+    const readNewerLogin = () => newerLogin;
+    const client = new ElizaClient("https://self-hosted.example");
+    const fetchSpy = vi.spyOn(client, "fetch");
+
+    try {
+      await expect(
+        client.selectOrProvisionCloudAgent({
+          cloudApiBase: "https://api.eliza.app",
+          authToken: "account-a-token",
+          name: "Eliza",
+          knownAgents: [],
+          onProgress: (status) => {
+            if (status !== "creating" || newerLogin) return;
+            queueMicrotask(() => {
+              newerLogin = beginStewardSessionRecovery(tenantId, "provider");
+            });
+          },
+        }),
+      ).rejects.toMatchObject({ code: "STEWARD_SESSION_SUPERSEDED" });
+
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+      expect(readStewardSessionRecovery(tenantId).receipts).toEqual([
+        readNewerLogin()?.receipt,
+      ]);
+    } finally {
+      const recordedNewerLogin = readNewerLogin();
+      if (recordedNewerLogin) {
+        rejectStewardSessionRecovery(recordedNewerLogin);
+      }
+      localStorage.removeItem(STEWARD_TOKEN_KEY);
+    }
+  });
+
+  it("conditionally removes a fresh create whose response arrives after login B", async () => {
+    localStorage.removeItem(STEWARD_TOKEN_KEY);
+    const tenantId = configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID);
+    const createResponse = deferred<Response>();
+    let newerLogin: ReturnType<typeof beginStewardSessionRecovery> | null =
+      null;
+    const fetchSpy = vi.fn(
+      (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        if (init?.method === "DELETE") {
+          return Promise.resolve(
+            new Response(JSON.stringify({ success: true }), {
+              status: 202,
+              headers: { "Content-Type": "application/json" },
+            }),
+          );
+        }
+        return createResponse.promise;
+      },
+    );
+    vi.stubGlobal("fetch", fetchSpy);
+    const client = new ElizaClient("https://api.eliza.app");
+
+    try {
+      const selection = client.selectOrProvisionCloudAgent({
+        cloudApiBase: "https://api.eliza.app",
+        authToken: "account-a-token",
+        name: "Eliza",
+        knownAgents: [],
+      });
+      await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalledOnce());
+      newerLogin = beginStewardSessionRecovery(tenantId, "provider");
+      createResponse.resolve(
+        new Response(
+          JSON.stringify({
+            success: true,
+            created: true,
+            data: {
+              id: "late-created-by-account-a",
+              agentName: "Eliza",
+              status: "pending",
+              createdAt: "2026-08-30T02:00:00.000Z",
+              executionTier: "dedicated-always",
+            },
+          }),
+          { status: 201, headers: { "Content-Type": "application/json" } },
+        ),
+      );
+
+      await expect(selection).rejects.toMatchObject({
+        code: "STEWARD_SESSION_SUPERSEDED",
+      });
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+      expect(fetchSpy.mock.calls[1]?.[1]).toMatchObject({
+        method: "DELETE",
+        body: JSON.stringify({
+          expectedAgentName: "Eliza",
+          expectedCreatedAt: "2026-08-30T02:00:00.000Z",
+          expectedExecutionTier: "dedicated-always",
+        }),
+      });
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+      expect(readStewardSessionRecovery(tenantId).receipts).toEqual([
+        newerLogin.receipt,
+      ]);
+    } finally {
+      if (newerLogin) rejectStewardSessionRecovery(newerLogin);
+      localStorage.removeItem(STEWARD_TOKEN_KEY);
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("restores local authority even when superseded fresh-create cleanup fails", async () => {
+    localStorage.removeItem(STEWARD_TOKEN_KEY);
+    const tenantId = configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID);
+    let newerLogin: ReturnType<typeof beginStewardSessionRecovery> | null =
+      null;
+    const readNewerLogin = () => newerLogin;
+    const client = new ElizaClient("https://api.eliza.app");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("cleanup unavailable");
+      }),
+    );
+    vi.spyOn(client, "createCloudCompatAgent").mockImplementation(async () => {
+      newerLogin = beginStewardSessionRecovery(tenantId, "provider");
+      return {
+        success: true,
+        created: true,
+        data: {
+          agentId: "created-by-account-a",
+          agentName: "Eliza",
+          jobId: "",
+          status: "pending",
+          nodeId: null,
+          message: "accepted",
+          createdAt: "2026-08-30T03:00:00.000Z",
+          executionTier: "dedicated-always",
+        },
+      };
+    });
+
+    try {
+      await expect(
+        client.selectOrProvisionCloudAgent({
+          cloudApiBase: "https://api.eliza.app",
+          authToken: "account-a-token",
+          name: "Eliza",
+          knownAgents: [],
+        }),
+      ).rejects.toBeInstanceOf(AggregateError);
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+      expect(readStewardSessionRecovery(tenantId).receipts).toEqual([
+        readNewerLogin()?.receipt,
+      ]);
+    } finally {
+      const recordedNewerLogin = readNewerLogin();
+      if (recordedNewerLogin) {
+        rejectStewardSessionRecovery(recordedNewerLogin);
+      }
+      localStorage.removeItem(STEWARD_TOKEN_KEY);
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("conditionally removes a fresh create when login B starts after acceptance", async () => {
+    localStorage.removeItem(STEWARD_TOKEN_KEY);
+    const tenantId = configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID);
+    let newerLogin: ReturnType<typeof beginStewardSessionRecovery> | null =
+      null;
+    const readNewerLogin = () => newerLogin;
+    const client = new ElizaClient("https://api.eliza.app");
+    const detailSpy = vi.spyOn(client, "getCloudCompatAgent");
+    const fetchSpy = vi.fn(
+      async (_input: RequestInfo | URL, init?: RequestInit) =>
+        init?.method === "DELETE"
+          ? new Response(
+              JSON.stringify({
+                success: true,
+                data: { status: "deleting", jobId: "cleanup-job" },
+              }),
+              {
+                status: 202,
+                headers: { "Content-Type": "application/json" },
+              },
+            )
+          : new Response(
+              JSON.stringify({
+                success: true,
+                data: { id: "cleanup-job", status: "completed" },
+              }),
+              {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+              },
+            ),
+    );
+    vi.stubGlobal("fetch", fetchSpy);
+    vi.spyOn(client, "createCloudCompatAgent").mockImplementation(async () => {
+      newerLogin = beginStewardSessionRecovery(tenantId, "provider");
+      return {
+        success: true,
+        created: true,
+        data: {
+          agentId: "created-by-account-a",
+          agentName: "Eliza",
+          jobId: "",
+          status: "pending",
+          nodeId: null,
+          message: "accepted",
+          createdAt: "2026-08-30T00:00:00.000Z",
+          executionTier: "dedicated-always",
+        },
+      };
+    });
+
+    try {
+      await expect(
+        client.selectOrProvisionCloudAgent({
+          cloudApiBase: "https://api.eliza.app",
+          authToken: "account-a-token",
+          name: "Eliza",
+          knownAgents: [],
+        }),
+      ).rejects.toMatchObject({ code: "STEWARD_SESSION_SUPERSEDED" });
+
+      expect(readNewerLogin()).not.toBeNull();
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+      const [cleanupUrl, cleanupInit] = fetchSpy.mock.calls[0] ?? [];
+      expect(String(cleanupUrl)).toBe(
+        "https://api.eliza.app/api/v1/eliza/agents/created-by-account-a",
+      );
+      expect(cleanupInit).toMatchObject({
+        method: "DELETE",
+        body: JSON.stringify({
+          expectedAgentName: "Eliza",
+          expectedCreatedAt: "2026-08-30T00:00:00.000Z",
+          expectedExecutionTier: "dedicated-always",
+        }),
+      });
+      expect(
+        new Headers((cleanupInit as RequestInit | undefined)?.headers).get(
+          "Authorization",
+        ),
+      ).toBe("Bearer account-a-token");
+      const [jobUrl, jobInit] = fetchSpy.mock.calls[1] ?? [];
+      expect(String(jobUrl)).toBe(
+        "https://api.eliza.app/api/v1/jobs/cleanup-job",
+      );
+      expect(
+        new Headers((jobInit as RequestInit | undefined)?.headers).get(
+          "Authorization",
+        ),
+      ).toBe("Bearer account-a-token");
+      expect(detailSpy).not.toHaveBeenCalled();
+    } finally {
+      const recordedNewerLogin = readNewerLogin();
+      if (recordedNewerLogin) {
+        rejectStewardSessionRecovery(recordedNewerLogin);
+      }
+      localStorage.removeItem(STEWARD_TOKEN_KEY);
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it.each(["provision-job", "agent-detail"] as const)(
+    "conditionally removes a fresh create when cancellation lands during the %s await",
+    async (phase) => {
+      localStorage.removeItem(STEWARD_TOKEN_KEY);
+      const controller = new AbortController();
+      const client = new ElizaClient("https://api.eliza.app");
+      const jobResponse =
+        deferred<Awaited<ReturnType<typeof client.getCloudCompatJobStatus>>>();
+      const detailResponse =
+        deferred<Awaited<ReturnType<typeof client.getCloudCompatAgent>>>();
+      const jobSpy = vi
+        .spyOn(client, "getCloudCompatJobStatus")
+        .mockReturnValue(jobResponse.promise);
+      const detailSpy = vi
+        .spyOn(client, "getCloudCompatAgent")
+        .mockReturnValue(detailResponse.promise);
+      vi.spyOn(client, "createCloudCompatAgent").mockResolvedValue({
+        success: true,
+        created: true,
+        data: {
+          agentId: "cancelled-account-a-create",
+          agentName: "Eliza",
+          jobId: phase === "provision-job" ? "job-account-a" : "",
+          status: "pending",
+          nodeId: null,
+          message: "accepted",
+          createdAt: "2026-08-30T04:00:00.000Z",
+          executionTier: "dedicated-always",
+        },
+      });
+      const cleanupSpy = vi.fn(
+        async (_input: RequestInfo | URL, _init?: RequestInit) =>
+          new Response(
+            JSON.stringify({ success: true, data: { status: "deleting" } }),
+            { status: 202, headers: { "Content-Type": "application/json" } },
+          ),
+      );
+      vi.stubGlobal("fetch", cleanupSpy);
+
+      try {
+        const selection = client.selectOrProvisionCloudAgent({
+          cloudApiBase: "https://api.eliza.app",
+          authToken: "account-a-token",
+          name: "Eliza",
+          knownAgents: [],
+          signal: controller.signal,
+        });
+        if (phase === "provision-job") {
+          await vi.waitFor(() => expect(jobSpy).toHaveBeenCalledOnce());
+        } else {
+          await vi.waitFor(() => expect(detailSpy).toHaveBeenCalledOnce());
+        }
+        controller.abort();
+        if (phase === "provision-job") {
+          jobResponse.resolve({
+            success: true,
+            data: {
+              id: "job-account-a",
+              jobId: "job-account-a",
+              type: "provision",
+              status: "completed",
+              state: "completed",
+              data: {},
+              result: {},
+              error: null,
+              createdAt: "2026-08-30T04:00:00.000Z",
+              startedAt: "2026-08-30T04:00:01.000Z",
+              completedAt: "2026-08-30T04:00:02.000Z",
+              retryCount: 0,
+              name: "provision",
+              created_on: "2026-08-30T04:00:00.000Z",
+              completed_on: "2026-08-30T04:00:02.000Z",
+            },
+          });
+        } else {
+          detailResponse.resolve({
+            success: true,
+            data: {
+              agent_id: "cancelled-account-a-create",
+              agent_name: "Eliza",
+              status: "running",
+            },
+          } as Awaited<ReturnType<typeof client.getCloudCompatAgent>>);
+        }
+
+        await expect(selection).rejects.toMatchObject({ name: "AbortError" });
+        expect(cleanupSpy).toHaveBeenCalledOnce();
+        expect(cleanupSpy.mock.calls[0]?.[1]).toMatchObject({
+          method: "DELETE",
+          body: JSON.stringify({
+            expectedAgentName: "Eliza",
+            expectedCreatedAt: "2026-08-30T04:00:00.000Z",
+            expectedExecutionTier: "dedicated-always",
+          }),
+        });
+      } finally {
+        localStorage.removeItem(STEWARD_TOKEN_KEY);
+        vi.unstubAllGlobals();
+      }
+    },
+  );
+
+  it("never deletes an idempotently reused agent when login B starts", async () => {
+    localStorage.removeItem(STEWARD_TOKEN_KEY);
+    const tenantId = configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID);
+    let newerLogin: ReturnType<typeof beginStewardSessionRecovery> | null =
+      null;
+    const client = new ElizaClient("https://api.eliza.app");
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+    vi.spyOn(client, "createCloudCompatAgent").mockImplementation(async () => {
+      newerLogin = beginStewardSessionRecovery(tenantId, "provider");
+      return {
+        success: true,
+        created: false,
+        data: {
+          agentId: "existing-account-a-agent",
+          agentName: "Eliza",
+          jobId: "",
+          status: "running",
+          nodeId: null,
+          message: "reused",
+          createdAt: "2026-08-30T00:00:00.000Z",
+          executionTier: "dedicated-always",
+        },
+      };
+    });
+
+    try {
+      await expect(
+        client.selectOrProvisionCloudAgent({
+          cloudApiBase: "https://api.eliza.app",
+          authToken: "account-a-token",
+          name: "Eliza",
+          knownAgents: [],
+        }),
+      ).rejects.toMatchObject({ code: "STEWARD_SESSION_SUPERSEDED" });
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      if (newerLogin) rejectStewardSessionRecovery(newerLogin);
+      localStorage.removeItem(STEWARD_TOKEN_KEY);
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("conditionally removes a fresh warm-pool create superseded by login B", async () => {
+    localStorage.removeItem(STEWARD_TOKEN_KEY);
+    const tenantId = configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID);
+    let newerLogin: ReturnType<typeof beginStewardSessionRecovery> | null =
+      null;
+    const client = new ElizaClient("https://api.eliza.app");
+    const fetchSpy = vi.fn(
+      async (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method === "DELETE") {
+          return new Response(
+            JSON.stringify({ success: true, data: { status: "deleting" } }),
+            { status: 202, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        newerLogin = beginStewardSessionRecovery(tenantId, "provider");
+        return new Response(
+          JSON.stringify({
+            success: true,
+            source: "warm_pool",
+            data: {
+              id: "warm-pool-account-a",
+              agentName: "Eliza",
+              status: "running",
+              createdAt: "2026-08-30T01:00:00.000Z",
+              executionTier: "dedicated-always",
+            },
+          }),
+          { status: 201, headers: { "Content-Type": "application/json" } },
+        );
+      },
+    );
+    vi.stubGlobal("fetch", fetchSpy);
+
+    try {
+      await expect(
+        client.selectOrProvisionCloudAgent({
+          cloudApiBase: "https://api.eliza.app",
+          authToken: "account-a-token",
+          name: "Eliza",
+          knownAgents: [],
+        }),
+      ).rejects.toMatchObject({ code: "STEWARD_SESSION_SUPERSEDED" });
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+      expect(fetchSpy.mock.calls[1]?.[1]).toMatchObject({
+        method: "DELETE",
+        body: JSON.stringify({
+          expectedAgentName: "Eliza",
+          expectedCreatedAt: "2026-08-30T01:00:00.000Z",
+          expectedExecutionTier: "dedicated-always",
+        }),
+      });
+    } finally {
+      if (newerLogin) rejectStewardSessionRecovery(newerLogin);
+      localStorage.removeItem(STEWARD_TOKEN_KEY);
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("does not let a delayed selection for A overwrite completed login B", async () => {
     localStorage.removeItem(STEWARD_TOKEN_KEY);
     const originalLocks = Object.getOwnPropertyDescriptor(navigator, "locks");
@@ -296,7 +987,7 @@ describe("selectOrProvisionCloudAgent Steward authority publication", () => {
       await lockRequested.promise;
 
       const tenantId = configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID);
-      expect(readStewardSessionRecovery(tenantId).receipts).toHaveLength(1);
+      expect(readStewardSessionRecovery(tenantId).receipts).toEqual([]);
       const newerLogin = beginStewardSessionRecovery(tenantId, "provider");
       localStorage.setItem(STEWARD_TOKEN_KEY, "account-b-token");
       completeStewardSessionRecovery(newerLogin);

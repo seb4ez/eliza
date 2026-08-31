@@ -13,6 +13,7 @@ import { enqueueStewardSessionMutation } from "../../lib/steward-session-mutatio
 import {
   completeStewardSessionRecoverySnapshot,
   readStewardSessionRecovery,
+  STEWARD_SESSION_RECOVERY_CHANGE_EVENT,
 } from "../../lib/steward-session-recovery-marker";
 import {
   confirmTelegramAccountClaim,
@@ -84,6 +85,33 @@ describe("Steward Telegram account claim handoff", () => {
       telegramClaimConfirmation: "explicit",
     });
     expect(peekPendingOnboardingSession()).toBeNull();
+  });
+
+  it("clears the consumed claim before publishing recovery completion", async () => {
+    storePendingOnboardingSession(TOKEN, TELEGRAM_ACCOUNT_CLAIM_PURPOSE);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(Response.json({ ok: true })),
+    );
+    const continuationAtCompletion: Array<string | null> = [];
+    const onRecovery = () => {
+      if (readStewardSessionRecovery("elizacloud").receipts.length > 0) return;
+      continuationAtCompletion.push(
+        peekPendingOnboardingSession(TELEGRAM_ACCOUNT_CLAIM_PURPOSE),
+      );
+    };
+    window.addEventListener(STEWARD_SESSION_RECOVERY_CHANGE_EVENT, onRecovery);
+
+    try {
+      await confirmTelegramAccountClaim("steward-token", TOKEN);
+    } finally {
+      window.removeEventListener(
+        STEWARD_SESSION_RECOVERY_CHANGE_EVENT,
+        onRecovery,
+      );
+    }
+
+    expect(continuationAtCompletion).toEqual([null]);
   });
 
   it("rejects a guessable explicit claim before making a request", async () => {
@@ -239,6 +267,37 @@ describe("Steward Telegram account claim handoff", () => {
     await confirmation;
     expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([]);
     expect(peekPendingOnboardingSession()).toBeNull();
+  });
+
+  it("retires its receipt when the origin lock rejects before dispatch", async () => {
+    storePendingOnboardingSession(TOKEN, TELEGRAM_ACCOUNT_CLAIM_PURPOSE);
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const previousLocks = Object.getOwnPropertyDescriptor(navigator, "locks");
+    const request = vi
+      .fn()
+      .mockRejectedValue(new Error("Origin session lock unavailable"));
+    Object.defineProperty(navigator, "locks", {
+      configurable: true,
+      value: { request },
+    });
+
+    try {
+      await expect(
+        confirmTelegramAccountClaim("steward-token", TOKEN),
+      ).rejects.toThrow("Origin session lock unavailable");
+    } finally {
+      if (previousLocks) {
+        Object.defineProperty(navigator, "locks", previousLocks);
+      } else {
+        Reflect.deleteProperty(navigator, "locks");
+      }
+    }
+
+    expect(request).toHaveBeenCalledOnce();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([]);
+    expect(peekPendingOnboardingSession()).toBe(TOKEN);
   });
 
   it("preserves receipt and claim after an ambiguous response loss", async () => {

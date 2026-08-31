@@ -11,7 +11,10 @@ import { ElizaError } from "@elizaos/core";
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("@capacitor/core", () => ({
-  Capacitor: { isNativePlatform: () => false },
+  Capacitor: {
+    isNativePlatform: () => false,
+    registerPlugin: vi.fn(() => ({})),
+  },
   CapacitorHttp: { get: vi.fn(), post: vi.fn(), request: vi.fn() },
 }));
 

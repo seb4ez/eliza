@@ -9,7 +9,8 @@
  * (API key / Bearer) and safe methods are exempt.
  *
  * Mocked seams: `getCurrentUser` / `requireUserOrApiKeyWithOrg` (session cookie
- * `steward-token=session-owner` or `X-API-Key: test-api-key` → org owner) and
+ * `__Host-steward-token-v2=session-owner` or `X-API-Key: test-api-key` →
+ * org owner) and
  * `invitesService` (capture mocks — no DB).
  */
 
@@ -36,7 +37,9 @@ const OWNER = {
 function hasSessionCookie(c: {
   req: { header: (n: string) => string | undefined };
 }): boolean {
-  return (c.req.header("cookie") ?? "").includes("steward-token=session-owner");
+  return (c.req.header("cookie") ?? "").includes(
+    "__Host-steward-token-v2=session-owner",
+  );
 }
 
 mock.module("@/lib/auth/workers-hono-auth", () => ({
@@ -75,7 +78,7 @@ const invitesRoute = (await import("../organizations/invites/route")).default;
 
 const ENV = { NODE_ENV: "test" } as unknown as AppEnv["Bindings"];
 const INVITES_URL = "http://localhost/api/organizations/invites";
-const SESSION_COOKIE = "steward-token=session-owner";
+const SESSION_COOKIE = "__Host-steward-token-v2=session-owner";
 const VALID_BODY = JSON.stringify({
   email: "person@example.test",
   role: "member",

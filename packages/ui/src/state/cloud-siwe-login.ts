@@ -27,13 +27,18 @@
  * API cannot stall app SIWE login.
  */
 import { logger } from "@elizaos/logger";
-import { writeStoredStewardToken } from "@elizaos/shared/steward-session-client";
+import {
+  readStoredStewardToken,
+  writeStoredStewardToken,
+} from "@elizaos/shared/steward-session-client";
 import { enqueueStewardSessionMutation } from "../cloud/lib/steward-session-mutation-queue";
 import {
   beginStewardSessionRecovery,
-  commitStewardSessionRecoveryForPublication,
+  createStewardSessionRecoveryCommittedAuthority,
+  createStewardSessionRecoveryPublicationFence,
   isStewardSessionRecoveryReceiptLive,
   rejectStewardSessionRecovery,
+  type StewardSessionRecoveryCommittedAuthority,
   type StewardSessionRecoveryReceipt,
 } from "../cloud/lib/steward-session-recovery-marker";
 import {
@@ -183,11 +188,6 @@ const NONCE_MAX_ATTEMPTS = 3;
 /** Backoff between nonce attempts: 500ms then 1000ms (1.5s total worst case). */
 const NONCE_RETRY_BASE_DELAY_MS = 500;
 
-interface SiweAuthorityDispatchState {
-  dispatched: boolean;
-  definiteRejection: boolean;
-}
-
 /**
  * Fetch the SIWE nonce with bounded retry on *transient* failures.
  *
@@ -271,7 +271,6 @@ async function siweLoginWithInjectedWalletAttempt(
   cloudApiBase: string,
   chainSwitchRetriesLeft: number,
   recovery: StewardSessionRecoveryReceipt,
-  authority: SiweAuthorityDispatchState,
 ): Promise<string | null> {
   const provider = getInjectedEthereumProvider();
   if (!provider) return null;
@@ -362,7 +361,6 @@ async function siweLoginWithInjectedWalletAttempt(
       cloudApiBase,
       chainSwitchRetriesLeft - 1,
       recovery,
-      authority,
     );
   }
 
@@ -379,7 +377,6 @@ async function siweLoginWithInjectedWalletAttempt(
     // retires this older receipt, so never even consume the SIWE verification
     // authority after that point.
     if (!isStewardSessionRecoveryReceiptLive(recovery)) return null;
-    authority.dispatched = true;
     const verifyRes = await fetch(`${base}/api/auth/siwe/verify`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -387,10 +384,6 @@ async function siweLoginWithInjectedWalletAttempt(
       signal: AbortSignal.timeout(SIWE_FETCH_TIMEOUT_MS),
     });
     if (!verifyRes.ok) {
-      authority.definiteRejection =
-        verifyRes.status >= 400 &&
-        verifyRes.status < 500 &&
-        verifyRes.status !== 408;
       throw new Error(
         `Eliza Cloud SIWE verify failed: ${verifyRes.status} ${await readBody(verifyRes)}`,
       );
@@ -401,58 +394,96 @@ async function siweLoginWithInjectedWalletAttempt(
     }
     if (!isStewardSessionRecoveryReceiptLive(recovery)) return null;
 
+    const publication = createStewardSessionRecoveryPublicationFence(recovery);
     const tokenAuthority = await writeStoredStewardToken(verified.apiKey, {
-      validate: () => isStewardSessionRecoveryReceiptLive(recovery),
-      commitBeforePublish: () =>
-        commitStewardSessionRecoveryForPublication(recovery),
+      validate: publication.validate,
+      finalizeBeforePublish: publication.finalizeBeforePublish,
     });
-    if (!tokenAuthority) return null;
+    if (
+      !tokenAuthority ||
+      !publication.isFinalized() ||
+      !publication.validate() ||
+      readStoredStewardToken() !== verified.apiKey ||
+      !publication.publishChange() ||
+      !publication.validate()
+    ) {
+      return null;
+    }
     window.dispatchEvent(new CustomEvent("steward-token-sync"));
-    return verified.apiKey;
+    return publication.validate() &&
+      readStoredStewardToken() === verified.apiKey
+      ? verified.apiKey
+      : null;
   });
-  if (!apiKey) return null;
+  if (
+    !apiKey ||
+    !createStewardSessionRecoveryCommittedAuthority(
+      recovery,
+      apiKey,
+    ).isCurrent()
+  ) {
+    return null;
+  }
   logger.info(
     `[CloudSiweLogin] SIWE login verified for ${address.slice(0, 6)}…${address.slice(-4)} on chain ${walletChainId}`,
   );
   return apiKey;
 }
 
-export async function siweLoginWithInjectedWallet(
+export interface CommittedCloudSiweLogin {
+  token: string;
+  authority: StewardSessionRecoveryCommittedAuthority;
+}
+
+export async function siweLoginWithInjectedWalletAuthority(
   cloudApiBase: string,
   chainSwitchRetriesLeft = 1,
-): Promise<string | null> {
+): Promise<CommittedCloudSiweLogin | null> {
   if (!getInjectedEthereumProvider()) return null;
   const recovery = beginStewardSessionRecovery(
     configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID),
     "provider",
   );
-  const authority: SiweAuthorityDispatchState = {
-    dispatched: false,
-    definiteRejection: false,
-  };
   try {
     const token = await siweLoginWithInjectedWalletAttempt(
       cloudApiBase,
       chainSwitchRetriesLeft,
       recovery,
-      authority,
     );
+    if (token) {
+      const committedAuthority = createStewardSessionRecoveryCommittedAuthority(
+        recovery,
+        token,
+      );
+      if (!committedAuthority.isCurrent()) return null;
+      return { token, authority: committedAuthority };
+    }
     if (!token && isStewardSessionRecoveryReceiptLive(recovery)) {
       // No account/provider or a pre-dispatch cancellation produced no remote
       // authority, so only this intent's receipt may be retired.
       rejectStewardSessionRecovery(recovery);
     }
-    return token;
+    return null;
   } catch (error) {
-    // Before verify dispatch, or after a definitive non-408 4xx, the server
-    // cannot have produced a usable API key. Transport/5xx/response-loss and
-    // protected-storage failures retain the receipt for conservative recovery.
-    if (
-      (!authority.dispatched || authority.definiteRejection) &&
-      isStewardSessionRecoveryReceiptLive(recovery)
-    ) {
+    // SIWE verification returns a one-time API key and never commits Steward
+    // cookies. If its response is lost, generic cookie recovery cannot recover
+    // that key; retaining this receipt would instead adopt any stale cookie
+    // from a previous account. Retire every failed SIWE intent and let a retry
+    // deactivate earlier named SIWE keys server-side.
+    if (isStewardSessionRecoveryReceiptLive(recovery)) {
       rejectStewardSessionRecovery(recovery);
     }
     throw error;
   }
+}
+
+export async function siweLoginWithInjectedWallet(
+  cloudApiBase: string,
+  chainSwitchRetriesLeft = 1,
+): Promise<string | null> {
+  const committed = await siweLoginWithInjectedWalletAuthority(
+    cloudApiBase,
+    chainSwitchRetriesLeft,
+  );
+  return committed?.authority.isCurrent() ? committed.token : null;
 }

@@ -78,7 +78,7 @@ describe("POST /api/v1/app-auth/connect malformed JSON", () => {
 });
 
 describe("POST /api/v1/app-auth/connect cookie-mutation guard", () => {
-  const COOKIE = "steward-token=session-1";
+  const COOKIE = "__Host-steward-token-v2=session-1";
 
   beforeEach(() => {
     connectUser.mockClear();

@@ -10,6 +10,7 @@ import {
   hasStewardAuthedCookie,
   STEWARD_REFRESH_ENDPOINT,
   STEWARD_TOKEN_KEY,
+  stewardAuthedCookieName,
 } from "@elizaos/shared/steward-session-client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -29,7 +30,7 @@ vi.mock("../api/client-cloud", () => ({
 
 import { ensureCloudSessionForRepair } from "./cloud-session-refresh-for-repair";
 
-const STAGING_AUTHED_COOKIE = "steward-authed-staging";
+const STAGING_AUTHED_COOKIE = stewardAuthedCookieName("staging");
 
 function writeTestCookie(value: string): void {
   // biome-ignore lint/suspicious/noDocumentCookie: jsdom must drive the browser marker read by production.
@@ -39,11 +40,13 @@ function writeTestCookie(value: string): void {
 describe("app-origin Cloud session repair", () => {
   beforeEach(() => {
     localStorage.clear();
-    writeTestCookie(`${STAGING_AUTHED_COOKIE}=1; Path=/`);
+    writeTestCookie(`${STAGING_AUTHED_COOKIE}=1; Path=/; Secure; SameSite=Lax`);
   });
 
   afterEach(() => {
-    writeTestCookie(`${STAGING_AUTHED_COOKIE}=; Max-Age=0; Path=/`);
+    writeTestCookie(
+      `${STAGING_AUTHED_COOKIE}=; Max-Age=0; Path=/; Secure; SameSite=Lax`,
+    );
     localStorage.clear();
     vi.unstubAllGlobals();
   });

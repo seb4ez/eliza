@@ -64,14 +64,19 @@ import {
   beginStewardSessionLogout,
   beginStewardSessionRecovery,
   completeStewardSessionLogout,
-  completeStewardSessionRecovery,
+  createStewardSessionRecoveryCommittedAuthority,
+  createStewardSessionRecoveryPublicationFence,
   isStewardSessionLogoutIntentLive,
-  isStewardSessionRecoveryReceiptLive,
+  isStewardSessionRecoverySnapshotLive,
+  markStewardSessionRecoveryCookiePending,
   readStewardSessionGeneration,
   readStewardSessionLogoutIntents,
+  readStewardSessionRecovery,
   rejectStewardSessionLogout,
   rejectStewardSessionRecovery,
   type StewardSessionLogoutIntent,
+  type StewardSessionRecoveryCommittedAuthority,
+  StewardSessionRecoveryStorageError,
 } from "../lib/steward-session-recovery-marker";
 import {
   clearStaleStewardSession,
@@ -452,8 +457,26 @@ export function isWellFormedSsoCode(
 }
 
 export type SsoMintResult =
-  | { ok: true; code: string }
+  | {
+      ok: true;
+      code: string;
+      authority: StewardSessionRecoveryCommittedAuthority;
+    }
   | { ok: false; error: string };
+
+function successfulSsoMint(
+  code: string,
+  authority: StewardSessionRecoveryCommittedAuthority,
+): Extract<SsoMintResult, { ok: true }> {
+  const result = { ok: true, code } as Extract<SsoMintResult, { ok: true }>;
+  Object.defineProperty(result, "authority", {
+    configurable: false,
+    enumerable: false,
+    value: authority,
+    writable: false,
+  });
+  return result;
+}
 
 /**
  * Dashboard side: trade the local session for a one-time code bound to the
@@ -475,6 +498,19 @@ export async function mintSsoCode(
   }
   const token = readStoredStewardToken();
   if (!token) return { ok: false, error: "No local session" };
+  const recoverySnapshot = readStewardSessionRecovery(STEWARD_TENANT_ID);
+  if (
+    !recoverySnapshot.storageAvailable ||
+    recoverySnapshot.receipts.length > 0
+  ) {
+    return { ok: false, error: "A newer sign-in is still pending" };
+  }
+  const authority: StewardSessionRecoveryCommittedAuthority = {
+    isCurrent: () =>
+      recoverySnapshot.receipts.length === 0 &&
+      isStewardSessionRecoverySnapshotLive(recoverySnapshot) &&
+      readStoredStewardToken() === token,
+  };
   try {
     const res = await fetchFn(`${base}/api/auth/sso-bridge/mint`, {
       method: "POST",
@@ -494,7 +530,11 @@ export async function mintSsoCode(
     if (!code || !isWellFormedSsoCode(code)) {
       return { ok: false, error: "Mint returned no usable code" };
     }
-    return { ok: true, code };
+    if (!authority.isCurrent()) {
+      burnSsoBridgeCode(code, hostname, fetchFn);
+      return { ok: false, error: "SSO mint was superseded" };
+    }
+    return successfulSsoMint(code, authority);
   } catch (err) {
     // error-policy:J1 transport failure becomes the typed failure result the
     // bridge route turns into its fall-back-to-login redirect.
@@ -505,7 +545,22 @@ export async function mintSsoCode(
   }
 }
 
-export type SsoExchangeResult = { ok: true } | { ok: false; error: string };
+export type SsoExchangeResult =
+  | { ok: true; authority: StewardSessionRecoveryCommittedAuthority }
+  | { ok: false; error: string };
+
+function successfulSsoExchange(
+  authority: StewardSessionRecoveryCommittedAuthority,
+): Extract<SsoExchangeResult, { ok: true }> {
+  const result = { ok: true } as Extract<SsoExchangeResult, { ok: true }>;
+  Object.defineProperty(result, "authority", {
+    configurable: false,
+    enumerable: false,
+    value: authority,
+    writable: false,
+  });
+  return result;
+}
 
 function tokenLooksHydratable(token: string): boolean {
   const claims = decodeJwtPayload(token);
@@ -536,26 +591,30 @@ export async function performSsoExchange(
     return { ok: false, error: "Malformed code verifier" };
   }
 
-  let recoveryReceipt: ReturnType<typeof beginStewardSessionRecovery>;
-  try {
-    // The exchange code is one-shot and its response can plant account-B
-    // cookies before this document publishes B locally. Persist ambiguity
-    // synchronously so tab-close/reload can never fall back to stale A.
-    recoveryReceipt = beginStewardSessionRecovery(
-      STEWARD_TENANT_ID,
-      "provider",
-    );
-  } catch (error) {
+  // The one-shot code exchange itself cannot mutate the browser session. Keep
+  // its result quarantined, but capture the exact local authority before it is
+  // dispatched so a newer login/logout cannot be overwritten when it settles.
+  const admittedGeneration = readStewardSessionGeneration(STEWARD_TENANT_ID);
+  const admittedRecovery = readStewardSessionRecovery(STEWARD_TENANT_ID);
+  if (
+    !admittedGeneration.storageAvailable ||
+    !admittedRecovery.storageAvailable
+  ) {
     return {
       ok: false,
-      error: error instanceof Error ? error.message : String(error),
+      error: "Secure sign-in recovery storage is unavailable",
     };
   }
 
   const exchange = async (
     _mutationLease: StewardSessionMutationLease,
   ): Promise<SsoExchangeResult> => {
-    if (!isStewardSessionRecoveryReceiptLive(recoveryReceipt)) {
+    const generationBeforeExchange =
+      readStewardSessionGeneration(STEWARD_TENANT_ID);
+    if (
+      !generationBeforeExchange.storageAvailable ||
+      generationBeforeExchange.generation !== admittedGeneration.generation
+    ) {
       return { ok: false, error: "SSO exchange was superseded" };
     }
     try {
@@ -566,9 +625,6 @@ export async function performSsoExchange(
         body: JSON.stringify({ code, codeVerifier: verifier }),
       });
       if (!res.ok) {
-        if (res.status >= 400 && res.status < 500 && res.status !== 408) {
-          rejectStewardSessionRecovery(recoveryReceipt);
-        }
         return { ok: false, error: `Exchange failed (HTTP ${res.status})` };
       }
       const body = (await res.json().catch(() => null)) as {
@@ -579,31 +635,73 @@ export async function performSsoExchange(
         return { ok: false, error: "Exchange returned no usable session" };
       }
 
-      if (!isStewardSessionRecoveryReceiptLive(recoveryReceipt)) {
+      const generationAfterExchange =
+        readStewardSessionGeneration(STEWARD_TENANT_ID);
+      if (
+        !generationAfterExchange.storageAvailable ||
+        generationAfterExchange.generation !== admittedGeneration.generation
+      ) {
+        return { ok: false, error: "SSO exchange was superseded" };
+      }
+
+      // This is the first request in the exchange flow which can mutate
+      // cookies. Arm durable recovery immediately before dispatch, then use
+      // the receipt's publication fence across every remaining boundary.
+      const recoveryReceipt = beginStewardSessionRecovery(
+        STEWARD_TENANT_ID,
+        "provider",
+      );
+      const publication =
+        createStewardSessionRecoveryPublicationFence(recoveryReceipt);
+      const exchangeOwnsPublication = publication.validate;
+      if (!exchangeOwnsPublication()) {
         return { ok: false, error: "SSO exchange was superseded" };
       }
 
       // Same call the login flow makes: sets the HttpOnly steward cookies + the
-      // authed marker for this environment. It stays best-effort for an ordinary
-      // bridge because AuthTokenSync retries. Account-link authority is never
-      // discovered here: a pending Telegram claim remains inert until the user
-      // returns to /get-started and confirms the preview explicitly.
-      try {
-        await fetchFn(configuredSessionEndpoint(), {
-          method: "POST",
-          credentials: "include",
-          headers: {
-            "Content-Type": "application/json",
-            [STEWARD_CSRF_HEADER]: STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
-          },
-          body: JSON.stringify({ token }),
-        });
-      } catch {
-        // error-policy:J6 best-effort cookie sync; the localStorage session is
-        // established and AuthTokenSync re-syncs on its own cadence.
+      // authed marker for this environment. A bridge-issued bearer MUST NOT be
+      // published unless this second server boundary accepts it: a logout on
+      // the paired origin can land after the one-shot exchange and before this
+      // POST, and only the server-side logout barrier can observe that race.
+      // Account-link authority is never discovered here: a pending Telegram
+      // claim remains inert until /get-started renders its preview and receives
+      // explicit confirmation.
+      markStewardSessionRecoveryCookiePending(recoveryReceipt, token);
+      const sessionResponse = await fetchFn(configuredSessionEndpoint(), {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json",
+          [STEWARD_CSRF_HEADER]: STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+        },
+        body: JSON.stringify({ token }),
+      });
+      if (!exchangeOwnsPublication()) {
+        return { ok: false, error: "SSO exchange was superseded" };
+      }
+      if (!sessionResponse.ok) {
+        // The steward-session route commits cookies only on 2xx. Any explicit
+        // HTTP rejection therefore proves this attempt did not mutate the
+        // server session. Retire its receipt before reading the optional body
+        // so a tab close cannot turn a deterministic 4xx/5xx into false
+        // cookie-first recovery ambiguity.
+        rejectStewardSessionRecovery(recoveryReceipt);
+        const sessionFailure = (await sessionResponse
+          .json()
+          .catch(() => null)) as { code?: unknown } | null;
+        if (
+          sessionResponse.status === 401 &&
+          sessionFailure?.code === "session_ended"
+        ) {
+          return { ok: false, error: "SSO session was signed out" };
+        }
+        return {
+          ok: false,
+          error: `SSO session sync failed (HTTP ${sessionResponse.status})`,
+        };
       }
 
-      if (!isStewardSessionRecoveryReceiptLive(recoveryReceipt)) {
+      if (!exchangeOwnsPublication()) {
         return { ok: false, error: "SSO exchange was superseded" };
       }
 
@@ -611,24 +709,39 @@ export async function performSsoExchange(
       // cookie POST above has settled. If login B plants a durable receipt
       // while that POST is in flight, A exits without ever becoming readable;
       // B then acquires the same origin lease and is the final server commit.
-      await writeStoredStewardToken(token, {
-        validate: () => isStewardSessionRecoveryReceiptLive(recoveryReceipt),
+      const writeAuthority = await writeStoredStewardToken(token, {
+        validate: exchangeOwnsPublication,
+        finalizeBeforePublish: publication.finalizeBeforePublish,
       });
-      if (!isStewardSessionRecoveryReceiptLive(recoveryReceipt)) {
+      if (
+        !writeAuthority ||
+        !publication.isFinalized() ||
+        !exchangeOwnsPublication() ||
+        readStoredStewardToken() !== token
+      ) {
         return { ok: false, error: "SSO exchange was superseded" };
       }
-
       clearSsoBridgeAttempt();
       clearSsoLoggedOut();
+      if (!publication.publishChange() || !exchangeOwnsPublication()) {
+        return { ok: false, error: "SSO exchange was superseded" };
+      }
       try {
         window.dispatchEvent(new CustomEvent("steward-token-sync"));
       } catch {
         // error-policy:J6 best-effort notification; storage listeners re-read
         // on their own triggers.
       }
-      completeStewardSessionRecovery(recoveryReceipt);
-      return { ok: true };
+      if (!exchangeOwnsPublication()) {
+        return { ok: false, error: "SSO exchange was superseded" };
+      }
+      return successfulSsoExchange(
+        createStewardSessionRecoveryCommittedAuthority(recoveryReceipt, token),
+      );
     } catch (err) {
+      if (err instanceof StewardSessionRecoveryStorageError) {
+        return { ok: false, error: "SSO exchange was superseded" };
+      }
       // error-policy:J1 transport failure becomes the typed failure result the
       // bridge route turns into its fall-back-to-login redirect.
       return {
@@ -638,9 +751,13 @@ export async function performSsoExchange(
     }
   };
 
-  return mutationLease
+  const result = await (mutationLease
     ? exchange(mutationLease)
-    : enqueueStewardSessionMutation(exchange);
+    : enqueueStewardSessionMutation(exchange));
+  if (result.ok && !result.authority.isCurrent()) {
+    return { ok: false, error: "SSO exchange was superseded" };
+  }
+  return result;
 }
 
 /**
@@ -818,11 +935,11 @@ async function executeSsoLogoutIntentWithLease(
   if (base) {
     const response = await fetchFn(`${base}/api/auth/logout`, {
       method: "POST",
-      // An exact bearer owns only its own server session. Omitting ambient
-      // cookies also makes the browser ignore Set-Cookie deletion headers,
-      // so a paired-origin account B cannot be signed out by account A's
-      // acknowledged response.
-      credentials: options.expectedToken ? "omit" : "include",
+      // The origin-wide mutation lease prevents a same-origin login B from
+      // publishing cookies while this exact-token logout is in flight. Include
+      // the current host's cookies so its v2 tombstones are actually accepted;
+      // host-bound cookies on the paired origin remain out of scope.
+      credentials: "include",
       keepalive: true,
       headers: {
         "Content-Type": "application/json",
@@ -859,7 +976,6 @@ async function executeSsoLogoutIntentWithLease(
       ? undefined
       : {
           expectedToken: options.expectedToken,
-          preserveAmbientCookies: true,
           validate: () => isStewardSessionLogoutIntentLive(intent),
         },
   );

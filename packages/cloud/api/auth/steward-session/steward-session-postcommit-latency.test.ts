@@ -90,6 +90,7 @@ mock.module("@/lib/auth/session-user-cache", () => ({
   primeVerifiedUserSessionCache,
 }));
 mock.module("@/lib/auth/steward-client", () => ({
+  STEWARD_VERIFY_CLOCK_SKEW_SECONDS: 300,
   isStagingSessionTokenCandidate: () => false,
   verifyStewardTokenCached,
 }));
@@ -98,6 +99,7 @@ mock.module("@/lib/services/steward-client", () => ({
   verifyStewardBearerPhone: async () => ({ status: "not_linked" }),
 }));
 mock.module("@/lib/services/sso-bridge-codes", () => ({
+  classifySsoBridgeLogout: async () => ({ status: "allowed" as const }),
   isBlockedBySsoBridgeLogout: async () => false,
 }));
 mock.module("@/lib/services/account-lifecycle-authority", () => ({
@@ -158,7 +160,8 @@ function sessionRequest(): Request {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        origin: "https://staging.elizacloud.ai",
+        origin: "https://staging.eliza.app",
+        "sec-fetch-site": "same-origin",
         "x-eliza-csrf": STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
       },
       body: JSON.stringify({ token: "valid-steward-token" }),
@@ -229,8 +232,10 @@ describe("POST /api/auth/steward-session post-commit tail", () => {
 
     expect(response.status).toBe(200);
     const setCookie = response.headers.get("set-cookie") ?? "";
-    expect(setCookie).toContain("steward-token-staging=valid-steward-token");
-    expect(setCookie).toContain("steward-authed-staging=1");
+    expect(setCookie).toContain(
+      "__Host-steward-token-v2-staging=valid-steward-token",
+    );
+    expect(setCookie).toContain("__Host-steward-authed-v2-staging=1");
     expect(background[0]).toBe(postCommitTail.promise);
     expect(background).toHaveLength(2);
     expect(primeVerifiedUserSessionCache).toHaveBeenCalledWith(
@@ -248,7 +253,8 @@ describe("POST /api/auth/steward-session post-commit tail", () => {
     const personalResponse = await app.fetch(
       new Request("https://api-staging.elizacloud.ai/api/v1/eliza/personal", {
         headers: {
-          cookie: "steward-token-staging=valid-steward-token",
+          cookie:
+            "__Host-steward-authed-v2-staging=1; __Host-steward-token-v2-staging=valid-steward-token",
         },
       }),
       ENV,
@@ -269,7 +275,8 @@ describe("POST /api/auth/steward-session post-commit tail", () => {
         `https://api-staging.elizacloud.ai/api/v1/eliza/agents/${encodeURIComponent(personalId)}/api/conversations`,
         {
           headers: {
-            cookie: "steward-token-staging=valid-steward-token",
+            cookie:
+              "__Host-steward-authed-v2-staging=1; __Host-steward-token-v2-staging=valid-steward-token",
           },
         },
       ),
@@ -329,7 +336,7 @@ describe("POST /api/auth/steward-session post-commit tail", () => {
 
     expect(response.status).toBe(200);
     expect(response.headers.get("set-cookie")).toContain(
-      "steward-token-staging=valid-steward-token",
+      "__Host-steward-token-v2-staging=valid-steward-token",
     );
     expect(background).toHaveLength(2);
 
@@ -353,7 +360,7 @@ describe("POST /api/auth/steward-session post-commit tail", () => {
 
     expect(response.status).toBe(200);
     expect(response.headers.get("set-cookie")).toContain(
-      "steward-token-staging=valid-steward-token",
+      "__Host-steward-token-v2-staging=valid-steward-token",
     );
     expect(background).toHaveLength(2);
 
@@ -399,7 +406,7 @@ describe("POST /api/auth/steward-session post-commit tail", () => {
     const response = await responsePromise;
     expect(response.status).toBe(200);
     expect(response.headers.get("set-cookie")).toContain(
-      "steward-token-staging=valid-steward-token",
+      "__Host-steward-token-v2-staging=valid-steward-token",
     );
   });
 

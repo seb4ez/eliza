@@ -5,6 +5,10 @@ import { STEWARD_TOKEN_KEY } from "@elizaos/shared/steward-session-client";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
+  abortTransaction: vi.fn(),
+  beginTransaction: vi.fn(),
+  decideTransaction: vi.fn(),
+  finishTransaction: vi.fn(),
   pinnedRemoteApiBase: null as string | null,
   getStorageValue: vi.fn(),
   removeStorageValueIfCurrent: vi.fn(),
@@ -14,6 +18,10 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("../bridge/storage-bridge", () => ({
+  abortRuntimeConnectionStorageTransaction: mocks.abortTransaction,
+  beginRuntimeConnectionStorageTransaction: mocks.beginTransaction,
+  decideRuntimeConnectionStorageTransaction: mocks.decideTransaction,
+  finishRuntimeConnectionStorageTransaction: mocks.finishTransaction,
   getStorageValue: mocks.getStorageValue,
   removeStorageValueIfCurrent: mocks.removeStorageValueIfCurrent,
   setStorageValue: mocks.setStorageValue,
@@ -92,6 +100,14 @@ describe("durable agent-profile compensation", () => {
   beforeEach(() => {
     localStorage.clear();
     mocks.pinnedRemoteApiBase = null;
+    mocks.abortTransaction.mockReset();
+    mocks.abortTransaction.mockResolvedValue(true);
+    mocks.beginTransaction.mockReset();
+    mocks.beginTransaction.mockResolvedValue(null);
+    mocks.decideTransaction.mockReset();
+    mocks.decideTransaction.mockResolvedValue(undefined);
+    mocks.finishTransaction.mockReset();
+    mocks.finishTransaction.mockResolvedValue(undefined);
     mocks.getStorageValue.mockReset();
     mocks.getStorageValue.mockImplementation(async (key: string) =>
       localStorage.getItem(key),
@@ -308,6 +324,130 @@ describe("durable agent-profile compensation", () => {
         Reflect.deleteProperty(navigator, "locks");
       }
     }
+  });
+
+  it("prepares before either record and finishes only after finalization and the global decision", async () => {
+    const events: string[] = [];
+    const transaction = { transactionId: "transaction-a" };
+    mocks.beginTransaction.mockImplementation(async () => {
+      events.push("begin");
+      return transaction;
+    });
+    mocks.setWithCompensation.mockImplementation(
+      async (key: string, value: string) => {
+        events.push(`set:${key}`);
+        const predecessor = localStorage.getItem(key);
+        localStorage.setItem(key, value);
+        return {
+          compensate: async () => {
+            if (predecessor === null) localStorage.removeItem(key);
+            else localStorage.setItem(key, predecessor);
+            return true;
+          },
+        };
+      },
+    );
+    mocks.decideTransaction.mockImplementation(async () => {
+      events.push("decide");
+    });
+    mocks.finishTransaction.mockImplementation(async () => {
+      events.push("finish");
+    });
+    const server = createPersistedActiveServer({
+      kind: "remote",
+      label: "Runtime WAL",
+      apiBase: "http://100.64.0.10:3000",
+    });
+
+    await expect(
+      persistAgentProfileConnectionDurably(
+        {
+          kind: "remote",
+          label: server.label,
+          apiBase: server.apiBase,
+        },
+        server,
+        {
+          finalize: async () => {
+            events.push("finalize");
+            return true;
+          },
+        },
+      ),
+    ).resolves.toMatchObject({ label: server.label });
+
+    expect(events).toEqual([
+      "begin",
+      "set:elizaos:agent-profiles",
+      "set:elizaos:active-server",
+      "finalize",
+      "decide",
+      "finish",
+    ]);
+    expect(mocks.beginTransaction).toHaveBeenCalledWith([
+      expect.objectContaining({ key: "elizaos:agent-profiles" }),
+      expect.objectContaining({ key: "elizaos:active-server" }),
+    ]);
+  });
+
+  it("aborts the whole transaction before participant compensation when a post-decision finalizer fails", async () => {
+    const events: string[] = [];
+    const transaction = { transactionId: "transaction-token-finalizer" };
+    mocks.beginTransaction.mockResolvedValue(transaction);
+    mocks.setWithCompensation.mockImplementation(async (key: string) => ({
+      compensate: async () => {
+        events.push(`compensate:${key}`);
+        return true;
+      },
+    }));
+    mocks.decideTransaction.mockImplementation(async () => {
+      events.push("decide");
+    });
+    mocks.abortTransaction.mockImplementation(async () => {
+      events.push("abort");
+      return true;
+    });
+    const compensateFinalization = vi.fn(async () => {
+      events.push("compensate-finalizer");
+    });
+    const server = createPersistedActiveServer({
+      kind: "cloud",
+      id: "cloud:transaction-finalizer",
+      label: "Cloud WAL",
+      apiBase: "https://transaction-finalizer.example.test",
+      accessToken: "token-b",
+    });
+
+    await expect(
+      persistAgentProfileConnectionDurably(
+        {
+          kind: "cloud",
+          label: server.label,
+          apiBase: server.apiBase,
+          accessToken: server.accessToken,
+        },
+        server,
+        {
+          compensateFinalization,
+          finalize: async () => {
+            // Models the Steward adapter's pre-publication durable decision.
+            await mocks.decideTransaction(transaction);
+            events.push("finalizer");
+            throw new Error("post-decision finalizer failed");
+          },
+        },
+      ),
+    ).rejects.toThrow("post-decision finalizer failed");
+
+    expect(events).toEqual([
+      "decide",
+      "finalizer",
+      "compensate-finalizer",
+      "abort",
+      "compensate:elizaos:active-server",
+      "compensate:elizaos:agent-profiles",
+    ]);
+    expect(mocks.finishTransaction).not.toHaveBeenCalled();
   });
 
   it("serializes A/B selection through live publication", async () => {

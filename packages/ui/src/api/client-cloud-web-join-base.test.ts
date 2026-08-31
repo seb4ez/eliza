@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("@capacitor/core", () => ({
   Capacitor: {
     isNativePlatform: () => false,
+    registerPlugin: vi.fn(() => ({})),
   },
   CapacitorHttp: {
     get: vi.fn(),

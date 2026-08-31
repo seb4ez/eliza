@@ -2,14 +2,12 @@
  * POST /api/auth/steward-session × the cross-host SSO logout marker, through
  * the REAL route module with real HS256 Steward JWTs and the real
  * Postgres-backed marker store on PGlite. After an explicit logout, the
- * paired origin's surviving BRIDGE-ISSUED token (stamped `bridged` by the
- * sso-bridge exchange re-mint) re-POSTs here on its sync cadence — without
- * this gate that re-plants the domain-wide steward cookies the logout just
- * deleted. The gate must 401 with the DISTINCT `session_ended` code (the
- * client treats it as a real revocation and clears its stored session) and
- * set no cookies; stamped tokens issued AFTER the logout must pass. Ordinary
- * (unstamped) tokens are deliberately OUTSIDE the gate: their sync path keeps
- * its pre-bridge no-datastore posture, so the marker never blocks them.
+ * paired origin's surviving token can re-POST here on its sync cadence —
+ * regardless of whether it originally crossed the bridge. Without this gate,
+ * that sync re-plants the cookies the logout just deleted. The gate must 401 with
+ * the DISTINCT `session_ended` code (the client treats it as a real revocation
+ * and clears its stored session), set no cookies, and allow only tokens whose
+ * signed issuance is strictly newer than the logout ordering tolerance.
  */
 
 import {
@@ -52,7 +50,7 @@ let ipCounter = 0;
 async function mintToken(
   userId: string,
   iatOffsetSec: number,
-  opts: { bridged?: boolean } = {},
+  restoreClock = true,
 ): Promise<string> {
   const realNow = Date.now();
   try {
@@ -61,9 +59,7 @@ async function mintToken(
     }
     const minted = await mintStewardTokenFromClaims(
       ENV,
-      // The gate only applies to bridge-issued tokens, so gate cases mint with
-      // the same `bridged` stamp the sso-bridge exchange re-mint applies.
-      { userId, expiration: 0, issuedAt: 0, bridged: opts.bridged === true },
+      { userId, expiration: 0, issuedAt: 0 },
       // Keep the signed issued lifetime at the production one-hour contract.
       // The clock shift exists only to order the token around the logout mark.
       3600,
@@ -71,7 +67,7 @@ async function mintToken(
     if (!minted) throw new Error("test token mint failed");
     return minted.token;
   } finally {
-    setSystemTime();
+    if (restoreClock) setSystemTime();
   }
 }
 
@@ -83,7 +79,8 @@ async function postSession(token: string): Promise<Response> {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        origin: "https://elizacloud.ai",
+        origin: "https://eliza.app",
+        "sec-fetch-site": "same-origin",
         "x-eliza-csrf": STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
         "x-forwarded-for": `10.9.0.${ipCounter}`,
       },
@@ -119,9 +116,9 @@ afterAll(async () => {
 });
 
 describe("logout marker gates the cookie-planting session sync", () => {
-  test("a pre-logout BRIDGE token gets 401 session_ended and NO cookies — the paired origin cannot re-plant a signed-out session", async () => {
+  test("a pre-logout token gets 401 session_ended and NO cookies", async () => {
     const userId = "gate-user-blocked";
-    const preLogoutToken = await mintToken(userId, -10, { bridged: true });
+    const preLogoutToken = await mintToken(userId, -10);
 
     await markSsoBridgeLogout(userId);
 
@@ -131,9 +128,60 @@ describe("logout marker gates the cookie-planting session sync", () => {
     expect(res.headers.get("set-cookie")).toBeNull();
   });
 
-  test("a bridge token issued AFTER the logout passes the gate (fresh consent)", async () => {
+  test("a genuinely new token inside the clock-skew window gets a truthful cooldown and NO cookies", async () => {
+    const userId = "gate-user-cooldown";
+    await markSsoBridgeLogout(userId);
+
+    const postLogoutNow = Date.now();
+    try {
+      // Keep issuer and verifier clocks together. The token is genuinely new,
+      // but its +1s iat is indistinguishable from a pre-logout fast-clock JWT.
+      setSystemTime(new Date(postLogoutNow + 1_000));
+      const response = await postSession(await mintToken(userId, 0, false));
+      expect(response.status).toBe(409);
+      const body = (await response.json()) as {
+        code: string;
+        error: string;
+        retryAfterSeconds: number;
+        retryAtEpochSeconds: number;
+      };
+      expect(body.code).toBe("logout_cooldown");
+      expect(body.error).toContain("sign in again");
+      expect(body.retryAfterSeconds).toBeGreaterThanOrEqual(4);
+      expect(body.retryAfterSeconds).toBeLessThanOrEqual(6);
+      expect(response.headers.get("retry-after")).toBe(
+        String(body.retryAfterSeconds),
+      );
+      expect(body.retryAtEpochSeconds).toBeGreaterThan(
+        Math.floor(Date.now() / 1000),
+      );
+      expect(response.headers.get("set-cookie")).toBeNull();
+    } finally {
+      setSystemTime();
+    }
+  });
+
+  test("a same-second post-logout login is ambiguous rather than falsely called revoked", async () => {
+    const userId = "gate-user-same-second";
+    try {
+      setSystemTime(new Date("2026-08-30T12:00:00.250Z"));
+      await markSsoBridgeLogout(userId);
+      const response = await postSession(await mintToken(userId, 0, false));
+
+      expect(response.status).toBe(409);
+      await expect(response.json()).resolves.toMatchObject({
+        code: "logout_cooldown",
+        error: expect.stringContaining("sign in again"),
+      });
+      expect(response.headers.get("set-cookie")).toBeNull();
+    } finally {
+      setSystemTime();
+    }
+  });
+
+  test("a token issued beyond the post-logout tolerance passes the gate", async () => {
     const userId = "gate-user-fresh";
-    const preLogoutToken = await mintToken(userId, -10, { bridged: true });
+    const preLogoutToken = await mintToken(userId, -10);
     await markSsoBridgeLogout(userId);
 
     const blocked = await postSession(preLogoutToken);
@@ -144,31 +192,35 @@ describe("logout marker gates the cookie-planting session sync", () => {
     // The fresh token must NOT be refused as session_ended. (Later stages of
     // the login pipeline — user sync — have their own dependencies and their
     // own suites; this contract is only that the gate discriminates on iat.)
-    const fresh = await postSession(
-      await mintToken(userId, 5, { bridged: true }),
-    );
-    const freshBody = (await fresh.json()) as { code?: string };
-    expect(freshBody.code).not.toBe("session_ended");
+    try {
+      // Keep the test clock six seconds ahead through verification: this
+      // models real elapsed time, rather than presenting a future token to an
+      // otherwise unadvanced verifier clock.
+      const fresh = await postSession(await mintToken(userId, 6, false));
+      const freshBody = (await fresh.json()) as { code?: string };
+      expect(freshBody.code).not.toBe("session_ended");
+      expect(freshBody.code).not.toBe("invalid_token");
+    } finally {
+      setSystemTime();
+    }
   });
 
-  test("a bridge-token user with no marker is never blocked by the gate", async () => {
-    const res = await postSession(
-      await mintToken("gate-user-unmarked", -10, { bridged: true }),
-    );
+  test("a token with no marker is never blocked by the gate", async () => {
+    const res = await postSession(await mintToken("gate-user-unmarked", -10));
     const body = (await res.json()) as { code?: string };
     expect(body.code).not.toBe("session_ended");
   });
 
-  test("an ORDINARY (unstamped) token is outside the gate — even a stamped logout marker does not block it", async () => {
-    // Scoping contract: a token that never crossed the bridge keeps its
-    // pre-bridge behavior (the reviewer-mandated availability posture). Only
-    // the bridge stamp opts a token into the marker read.
+  test("an ordinary token is also blocked by a stamped logout marker", async () => {
     const userId = "gate-user-ordinary";
     const preLogoutToken = await mintToken(userId, -10);
     await markSsoBridgeLogout(userId);
 
     const res = await postSession(preLogoutToken);
-    const body = (await res.json()) as { code?: string };
-    expect(body.code).not.toBe("session_ended");
+    expect(res.status).toBe(401);
+    expect(((await res.json()) as { code?: string }).code).toBe(
+      "session_ended",
+    );
+    expect(res.headers.get("set-cookie")).toBeNull();
   });
 });

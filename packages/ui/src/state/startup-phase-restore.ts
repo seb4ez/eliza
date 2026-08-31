@@ -12,7 +12,6 @@ import {
 import {
   clearStoredStewardToken,
   hasStewardAuthedCookie,
-  readStoredStewardToken,
   writeStoredStewardToken,
 } from "@elizaos/shared/steward-session-client";
 import { client, type FirstRunOptions } from "../api";
@@ -28,6 +27,15 @@ import {
   isElectrobunRuntime,
 } from "../bridge";
 import { normalizeCloudApiKeyToken } from "../cloud/lib/cloud-api-key-token";
+import {
+  hasStewardSessionRecovery,
+  isStewardSessionRecoverySnapshotLive,
+  readStewardSessionRecovery,
+} from "../cloud/lib/steward-session-recovery-marker";
+import {
+  configuredStewardTenantId,
+  DEFAULT_STEWARD_TENANT_ID,
+} from "../cloud/shell/steward-config";
 import { getBootConfig } from "../config/boot-config";
 import {
   ANDROID_LOCAL_AGENT_IPC_BASE,
@@ -64,6 +72,10 @@ import {
   resolveCloudEnvironmentBase,
 } from "../utils/cloud-agent-base";
 import { getElizaApiBase, getElizaApiToken } from "../utils/eliza-globals";
+import {
+  captureStoredStewardLoginAuthority,
+  type StoredStewardLoginAuthority,
+} from "./cloud-steward-login";
 import {
   detectExistingFirstRunConnection,
   type ExistingFirstRunProbeResult,
@@ -117,10 +129,51 @@ const RESTORE_DEFAULT_DIRECT_CLOUD_BASE_URL = "https://eliza.app";
 const STEWARD_REFRESH_AUTHORITY_SUPERSEDED = Symbol(
   "steward-refresh-authority-superseded",
 );
+type RestoredStewardSession = {
+  token: string;
+  authority: StoredStewardLoginAuthority;
+};
 type RestoredStewardToken =
-  | string
+  | RestoredStewardSession
   | null
   | typeof STEWARD_REFRESH_AUTHORITY_SUPERSEDED;
+
+type RestoreCredentialAuthority = {
+  isCurrent(): boolean;
+};
+
+export type RestoredConnectionAuthority = {
+  /** False once a newer Steward recovery generation supersedes this restore. */
+  isCurrent(): boolean;
+  /** Clear only the exact staged client target owned by this restore. */
+  clearIfCurrent(): boolean;
+};
+
+export type RestoredConnectionResult =
+  | { status: "applied"; authority: RestoredConnectionAuthority }
+  | { status: "steward-recovery-pending" };
+
+const INDEPENDENT_RESTORED_CONNECTION_AUTHORITY: RestoredConnectionAuthority = {
+  isCurrent: () => true,
+  clearIfCurrent: () => false,
+};
+
+/**
+ * Capture an exact receipt-free Steward recovery generation for credentials
+ * which are not themselves stored Steward tokens (notably native owner API
+ * keys). A later login must permanently supersede this authority even when its
+ * receipt begins and retires entirely while startup is suspended.
+ */
+function captureCleanStewardRecoveryAuthority(): RestoreCredentialAuthority | null {
+  const snapshot = readStewardSessionRecovery(
+    configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID),
+  );
+  if (!snapshot.storageAvailable || snapshot.receipts.length > 0) return null;
+  const authority: RestoreCredentialAuthority = {
+    isCurrent: () => isStewardSessionRecoverySnapshotLive(snapshot),
+  };
+  return authority.isCurrent() ? authority : null;
+}
 
 /**
  * `runStartupProbeWithTimeout` deliberately does not abort an ambiguous
@@ -168,8 +221,15 @@ function recoverCloudAgentId(active: PersistedActiveServer): string | null {
 async function reconcileLegacyDedicatedCloudApiBase(
   active: PersistedActiveServer,
   ownerToken: string | null,
+  ownerAuthority?: { isCurrent(): boolean },
 ): Promise<PersistedActiveServer | null> {
-  if (!ownerToken || !isDedicatedCloudAgentBase(active.apiBase)) return null;
+  if (
+    !ownerToken ||
+    !isDedicatedCloudAgentBase(active.apiBase) ||
+    ownerAuthority?.isCurrent() === false
+  ) {
+    return null;
+  }
   const agentId = recoverCloudAgentId(active);
   if (!agentId) return null;
   const pageHostname =
@@ -183,6 +243,7 @@ async function reconcileLegacyDedicatedCloudApiBase(
     }),
   );
   try {
+    if (ownerAuthority?.isCurrent() === false) return null;
     const response = await fetch(
       `${cloudApiBase}/api/v1/eliza/agents/${encodeURIComponent(agentId)}`,
       {
@@ -193,8 +254,9 @@ async function reconcileLegacyDedicatedCloudApiBase(
         signal: AbortSignal.timeout(CLOUD_AGENT_TIER_PROBE_TIMEOUT_MS),
       },
     );
-    if (!response.ok) return null;
+    if (!response.ok || ownerAuthority?.isCurrent() === false) return null;
     const payload: unknown = await response.json();
+    if (ownerAuthority?.isCurrent() === false) return null;
     if (typeof payload !== "object" || payload === null) return null;
     const data = (payload as Record<string, unknown>).data;
     if (typeof data !== "object" || data === null) return null;
@@ -293,6 +355,8 @@ export interface RestoringSessionCtx {
   restoredActiveServer: PersistedActiveServer;
   shouldPreserveCompletedFirstRun: boolean;
   hadPriorFirstRun: boolean;
+  /** Exact restored client target carried into every backend poll boundary. */
+  restoredConnectionAuthority?: RestoredConnectionAuthority;
 }
 
 function isMobileLocalAgentApiBase(value: string | undefined): boolean {
@@ -444,6 +508,12 @@ function resolveRestoreStewardRefreshEndpoint(): string | undefined {
   }
 }
 
+function isStewardRecoveryPending(): boolean {
+  return hasStewardSessionRecovery(
+    configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID),
+  );
+}
+
 /**
  * Pick the Steward token to hand the client when restoring a cloud session.
  *
@@ -465,9 +535,19 @@ function resolveRestoreStewardRefreshEndpoint(): string | undefined {
  *
  * The refresh runs at most once per restore, so there is no refresh loop.
  */
-async function resolveRestoredStewardToken(): Promise<RestoredStewardToken> {
-  const stored = readStoredStewardToken()?.trim();
-  if (!stored) {
+async function resolveRestoredStewardToken(
+  storedAuthority: StoredStewardLoginAuthority | null,
+): Promise<RestoredStewardToken> {
+  if (!storedAuthority) {
+    // A cookie-only recovery has no stored bearer from which to derive an
+    // authority. Capture the clean generation before the network await so a
+    // login B which makes the refresh return `null` is still distinguishable
+    // from a terminal no-session result. Without this fence the caller could
+    // erase B's shared-agent binding after the newer login had begun.
+    const cookieAdmissionAuthority = captureCleanStewardRecoveryAuthority();
+    if (!cookieAdmissionAuthority) {
+      return STEWARD_REFRESH_AUTHORITY_SUPERSEDED;
+    }
     // No app-origin token, but the host-only Eliza session
     // cookie is present — the user signed in on the console (or another
     // managed Eliza tab). Recover the access token from it (bounded, same as
@@ -475,17 +555,32 @@ async function resolveRestoredStewardToken(): Promise<RestoredStewardToken> {
     // the top-level LoginView gate and the first-run conductor both skip.
     if (typeof window !== "undefined" && hasStewardAuthedCookie()) {
       const refreshCommit = createStewardRestoreRefreshFence();
+      const recoveredAuthority = {
+        current: null as StoredStewardLoginAuthority | null,
+      };
       const refreshProbe = await runStartupProbeWithTimeout(
         () =>
           refreshCloudStewardSession({
             endpoint: resolveRestoreStewardRefreshEndpoint(),
             commitRefreshedSession: async (session, authority) => {
               refreshCommit.capture(authority);
-              if (!session.token || !refreshCommit.validate()) return;
+              const validate = () =>
+                cookieAdmissionAuthority.isCurrent() &&
+                refreshCommit.validate();
+              if (!session.token || !validate()) return;
               await writeStoredStewardToken(session.token, {
-                validate: refreshCommit.validate,
+                validate,
               });
-              if (!refreshCommit.validate()) return;
+              if (!validate()) return;
+              const committed = captureStoredStewardLoginAuthority();
+              if (
+                !committed ||
+                committed.token !== session.token ||
+                !committed.isCurrent()
+              ) {
+                return;
+              }
+              recoveredAuthority.current = committed;
               try {
                 window.dispatchEvent(new CustomEvent("steward-token-sync"));
               } catch {
@@ -495,7 +590,8 @@ async function resolveRestoredStewardToken(): Promise<RestoredStewardToken> {
           }),
         STEWARD_RESTORE_REFRESH_TIMEOUT_MS,
       );
-      const refreshWasSuperseded = refreshCommit.wasSuperseded();
+      const refreshWasSuperseded =
+        !cookieAdmissionAuthority.isCurrent() || refreshCommit.wasSuperseded();
       refreshCommit.close();
       if (refreshWasSuperseded) {
         return STEWARD_REFRESH_AUTHORITY_SUPERSEDED;
@@ -508,18 +604,38 @@ async function resolveRestoredStewardToken(): Promise<RestoredStewardToken> {
         );
       }
       if (recovered?.token) {
-        return recovered.token;
+        if (
+          recoveredAuthority.current?.token === recovered.token &&
+          recoveredAuthority.current.isCurrent()
+        ) {
+          return {
+            token: recovered.token,
+            authority: recoveredAuthority.current,
+          };
+        }
+        return STEWARD_REFRESH_AUTHORITY_SUPERSEDED;
       }
     }
-    return null;
+    return cookieAdmissionAuthority.isCurrent()
+      ? null
+      : STEWARD_REFRESH_AUTHORITY_SUPERSEDED;
   }
+  if (!storedAuthority.isCurrent()) {
+    return STEWARD_REFRESH_AUTHORITY_SUPERSEDED;
+  }
+  const stored = storedAuthority.token;
   const secs = cloudTokenSecsRemaining(stored);
   // Opaque/device-code token (no decodable `exp`) → nothing to refresh.
-  if (secs === null) return stored;
+  if (secs === null) return { token: stored, authority: storedAuthority };
   // Comfortably valid → restore instantly.
-  if (secs >= STEWARD_RESTORE_REFRESH_AHEAD_SECS) return stored;
+  if (secs >= STEWARD_RESTORE_REFRESH_AHEAD_SECS) {
+    return { token: stored, authority: storedAuthority };
+  }
 
   const refreshCommit = createStewardRestoreRefreshFence();
+  const refreshedAuthority = {
+    current: null as StoredStewardLoginAuthority | null,
+  };
   const refreshProbe = await runStartupProbeWithTimeout(
     () =>
       refreshCloudStewardSession({
@@ -531,6 +647,15 @@ async function resolveRestoredStewardToken(): Promise<RestoredStewardToken> {
             validate: refreshCommit.validate,
           });
           if (!refreshCommit.validate()) return;
+          const committed = captureStoredStewardLoginAuthority();
+          if (
+            !committed ||
+            committed.token !== session.token ||
+            !committed.isCurrent()
+          ) {
+            return;
+          }
+          refreshedAuthority.current = committed;
           try {
             if (typeof window !== "undefined") {
               window.dispatchEvent(new CustomEvent("steward-token-sync"));
@@ -556,17 +681,32 @@ async function resolveRestoredStewardToken(): Promise<RestoredStewardToken> {
   }
 
   if (refreshed?.token) {
-    return refreshed.token;
+    if (
+      refreshedAuthority.current?.token === refreshed.token &&
+      refreshedAuthority.current.isCurrent()
+    ) {
+      return {
+        token: refreshed.token,
+        authority: refreshedAuthority.current,
+      };
+    }
+    return STEWARD_REFRESH_AUTHORITY_SUPERSEDED;
   }
 
   // Refresh failed / timed out. A truly-expired token is a dead credential —
   // drop it so we restore unauthenticated instead of a guaranteed-401 dial.
   if (secs <= 0) {
-    await clearStoredStewardToken({ expectedToken: stored });
+    const cleared = await clearStoredStewardToken({
+      expectedToken: stored,
+      validate: storedAuthority.isCurrent,
+    });
+    if (!cleared) return STEWARD_REFRESH_AUTHORITY_SUPERSEDED;
     clearSharedCloudAccountBinding();
     return null;
   }
-  return stored;
+  return storedAuthority.isCurrent()
+    ? { token: stored, authority: storedAuthority }
+    : STEWARD_REFRESH_AUTHORITY_SUPERSEDED;
 }
 
 /**
@@ -581,14 +721,15 @@ async function dropShadowingStewardToken(
   reason: string,
   expectedToken: string,
   validate?: () => boolean,
-): Promise<void> {
+): Promise<boolean> {
   try {
-    await clearStoredStewardToken({ expectedToken, validate });
+    return await clearStoredStewardToken({ expectedToken, validate });
   } catch (error) {
     logger.error(
       { error, reason },
       "[startup-phase-restore] denied delete left a shadowing Steward JWT in protected storage",
     );
+    return false;
   }
 }
 
@@ -597,7 +738,7 @@ export async function applyRestoredConnection(args: {
   clientRef: Pick<typeof client, "setBaseUrl" | "setToken"> &
     Partial<Pick<typeof client, "stageSessionTarget">>;
   startLocalRuntime?: () => Promise<void>;
-}) {
+}): Promise<RestoredConnectionResult> {
   const { restoredActiveServer, clientRef, startLocalRuntime } = args;
 
   if (restoredActiveServer.kind === "local") {
@@ -607,16 +748,13 @@ export async function applyRestoredConnection(args: {
     if (startLocalRuntime) {
       await startLocalRuntime();
     }
-    return;
+    return {
+      status: "applied",
+      authority: INDEPENDENT_RESTORED_CONNECTION_AUTHORITY,
+    };
   }
 
   if (restoredActiveServer.kind === "cloud") {
-    // Environment reconciliation is synchronous. The selected target's known
-    // credential is cleared before the base changes, then the selected record's
-    // known credential is installed. A slower Steward refresh may replace it.
-    // Never send an agent-local paired token to the Cloud control plane. A
-    // refreshed Steward session, or the native host's Cloud owner key, is the
-    // valid authority for this owner lookup.
     const resolved = backfillCloudApiBase(restoredActiveServer);
     const agentId = recoverCloudAgentId(resolved);
     if (!isTrustedCloudApiBaseUrl(resolved.apiBase, agentId)) {
@@ -626,16 +764,47 @@ export async function applyRestoredConnection(args: {
       clearPersistedActiveServer();
       clientRef.setToken(null);
       clientRef.setBaseUrl(null);
-      return;
+      return {
+        status: "applied",
+        authority: INDEPENDENT_RESTORED_CONNECTION_AUTHORITY,
+      };
     }
-    const restoreProbeToken = readStoredStewardToken()?.trim() || null;
+
+    type ClientTargetAuthority = NonNullable<
+      ReturnType<typeof client.stageSessionTarget>
+    >;
+    let nativeOwnerPublicationStarted = false;
+    let nativeOwnerInstalledTargetAuthority: ClientTargetAuthority | null =
+      null;
+
+    // Capture the exact bearer + monotonic recovery generation before any
+    // client publication. A raw account-A token is not admissible while a
+    // durable account-B receipt exists (or recovery storage is unavailable).
+    const storedStewardAuthority = captureStoredStewardLoginAuthority();
+    const recoveryPendingAtAdmission = isStewardRecoveryPending();
+    const restoreProbeToken = storedStewardAuthority?.token ?? null;
     // Capture the host-injected owner key before clientRef.setToken(null)
     // mutates boot config. Native/Electrobun device-code sessions may have no
     // persisted active-server token and rely exclusively on this credential.
-    const nativeOwnerApiKey =
-      isNative || isElectrobunRuntime()
+    const readNativeOwnerApiKey = (): string | null =>
+      !isCloudPairLoopbackOrigin(resolved.apiBase) &&
+      (isNative || isElectrobunRuntime())
         ? (normalizeCloudApiKeyToken(resolved.accessToken) ??
           normalizeCloudApiKeyToken(getElizaApiToken()))
+        : null;
+    const nativeOwnerApiKey = readNativeOwnerApiKey();
+    const nativeOwnerRecoveryAuthority = nativeOwnerApiKey
+      ? captureCleanStewardRecoveryAuthority()
+      : null;
+    const nativeOwnerAuthority: RestoreCredentialAuthority | null =
+      nativeOwnerApiKey && nativeOwnerRecoveryAuthority
+        ? {
+            isCurrent: () =>
+              nativeOwnerRecoveryAuthority.isCurrent() &&
+              (nativeOwnerPublicationStarted
+                ? nativeOwnerInstalledTargetAuthority?.isCurrent() === true
+                : readNativeOwnerApiKey() === nativeOwnerApiKey),
+          }
         : null;
     const usesLocalDockerCredential = isCloudPairLoopbackOrigin(
       resolved.apiBase,
@@ -646,140 +815,372 @@ export async function applyRestoredConnection(args: {
     const isManagedSharedControlPlane = isManagedCloudSharedAgentBase(
       resolved.apiBase,
     );
-    const initialToken = usesLocalDockerCredential
-      ? resolved.accessToken || null
-      : isAgentlessControlPlane
-        ? restoreProbeToken
-        : resolved.accessToken || restoreProbeToken || null;
-    let provisionalTargetAuthority: ReturnType<
-      typeof client.stageSessionTarget
-    > = null;
-    if (initialToken && clientRef.stageSessionTarget && resolved.apiBase) {
-      provisionalTargetAuthority = clientRef.stageSessionTarget({
-        baseUrl: resolved.apiBase,
-        token: initialToken,
-      });
-      if (!provisionalTargetAuthority?.publish()) {
-        provisionalTargetAuthority?.restoreIfCurrent();
-        clientRef.setToken(null);
-        clientRef.setBaseUrl(null);
-        return;
-      }
-    } else {
-      clientRef.setToken(null);
-      clientRef.setBaseUrl(resolved.apiBase ?? null);
-      clientRef.setToken(initialToken);
+    const independentAgentToken =
+      usesLocalDockerCredential ||
+      (!isManagedSharedControlPlane &&
+        isDedicatedCloudAgentBase(resolved.apiBase))
+        ? resolved.accessToken || null
+        : null;
+    const stewardAuthorityRequired =
+      !usesLocalDockerCredential &&
+      !independentAgentToken &&
+      !nativeOwnerApiKey;
+    if (
+      (recoveryPendingAtAdmission && stewardAuthorityRequired) ||
+      (nativeOwnerApiKey && !nativeOwnerAuthority)
+    ) {
+      return { status: "steward-recovery-pending" };
     }
+
+    let initialToken: string | null;
+    if (usesLocalDockerCredential) {
+      initialToken = independentAgentToken;
+    } else if (isManagedSharedControlPlane || isAgentlessControlPlane) {
+      initialToken = restoreProbeToken ?? nativeOwnerApiKey;
+    } else if (isDedicatedCloudAgentBase(resolved.apiBase)) {
+      initialToken =
+        independentAgentToken ?? restoreProbeToken ?? nativeOwnerApiKey;
+    } else {
+      initialToken =
+        restoreProbeToken ?? nativeOwnerApiKey ?? resolved.accessToken ?? null;
+    }
+    const initialCredentialAuthority: RestoreCredentialAuthority | null =
+      initialToken && initialToken === restoreProbeToken
+        ? storedStewardAuthority
+        : initialToken && initialToken === nativeOwnerApiKey
+          ? nativeOwnerAuthority
+          : nativeOwnerAuthority;
+
+    let liveTargetAuthority: ClientTargetAuthority | null = null;
+    let fallbackTargetInstalled = false;
+    const clearLiveTargetIfCurrent = (): boolean => {
+      if (liveTargetAuthority) {
+        const cleared = liveTargetAuthority.clearIfCurrent();
+        if (cleared) liveTargetAuthority = null;
+        return cleared;
+      }
+      if (!fallbackTargetInstalled) return false;
+      fallbackTargetInstalled = false;
+      clientRef.setToken(null);
+      return true;
+    };
+    const publishTarget = (
+      baseUrl: string,
+      token: string | null,
+      credentialAuthority: RestoreCredentialAuthority | null,
+    ): "published" | "failed" | "superseded" => {
+      if (credentialAuthority?.isCurrent() === false) return "superseded";
+      if (clientRef.stageSessionTarget) {
+        const staged = clientRef.stageSessionTarget({ baseUrl, token });
+        if (!staged) return "failed";
+        if (nativeOwnerAuthority) {
+          nativeOwnerPublicationStarted = true;
+          nativeOwnerInstalledTargetAuthority = staged;
+        }
+        if (credentialAuthority?.isCurrent() === false) {
+          staged.restoreIfCurrent();
+          return "superseded";
+        }
+        if (!staged.publish()) {
+          staged.restoreIfCurrent();
+          return "failed";
+        }
+        liveTargetAuthority = staged;
+        fallbackTargetInstalled = false;
+        if (credentialAuthority?.isCurrent() === false) {
+          staged.clearIfCurrent();
+          liveTargetAuthority = null;
+          return "superseded";
+        }
+        return "published";
+      }
+
+      // Test and legacy client shims without atomic staging still fence every
+      // individual publication. The production client always takes the staged
+      // path above, so a mixed base/token pair is never externally observable.
+      if (nativeOwnerAuthority) nativeOwnerPublicationStarted = true;
+      clientRef.setToken(null);
+      if (credentialAuthority?.isCurrent() === false) return "superseded";
+      clientRef.setBaseUrl(baseUrl);
+      if (credentialAuthority?.isCurrent() === false) return "superseded";
+      clientRef.setToken(token);
+      fallbackTargetInstalled = true;
+      if (credentialAuthority?.isCurrent() === false) {
+        clearLiveTargetIfCurrent();
+        return "superseded";
+      }
+      return "published";
+    };
+
+    const initialPublication = publishTarget(
+      resolved.apiBase as string,
+      initialToken,
+      initialCredentialAuthority,
+    );
+    if (initialPublication === "superseded") {
+      clearLiveTargetIfCurrent();
+      return { status: "steward-recovery-pending" };
+    }
+    if (initialPublication === "failed") {
+      clientRef.setToken(null);
+      clientRef.setBaseUrl(null);
+      return {
+        status: "applied",
+        authority: INDEPENDENT_RESTORED_CONNECTION_AUTHORITY,
+      };
+    }
+
     let stewardTokenPromise: Promise<RestoredStewardToken>;
-    if (nativeOwnerApiKey && restoreProbeToken) {
+    if (recoveryPendingAtAdmission) {
+      stewardTokenPromise = Promise.resolve(
+        STEWARD_REFRESH_AUTHORITY_SUPERSEDED,
+      );
+    } else if (
+      nativeOwnerApiKey &&
+      nativeOwnerAuthority &&
+      restoreProbeToken &&
+      storedStewardAuthority
+    ) {
       const secs = cloudTokenSecsRemaining(restoreProbeToken);
       if (secs !== null && secs < STEWARD_RESTORE_REFRESH_AHEAD_SECS) {
         // A near-expiry Steward JWT would shadow the valid owner-key fallback.
         // Try rotation once; on failure remove only that JWT so native Cloud
         // requests continue with the independently valid owner key.
+        const rotationFence = createStewardRestoreRefreshFence();
         const rotationCommit = {
-          authority: null as { validate: () => boolean } | null,
+          storedAuthority: null as StoredStewardLoginAuthority | null,
         };
-        stewardTokenPromise = refreshCloudStewardSession({
-          commitRefreshedSession: async (session, authority) => {
-            rotationCommit.authority = authority;
-            const fresh = session.token?.trim();
-            if (!fresh || !authority.validate()) return;
-            await writeStoredStewardToken(fresh, {
-              validate: authority.validate,
-            });
-            if (!authority.validate()) return;
-          },
-        })
-          .then(async (refreshed) => {
-            const fresh = refreshed?.token?.trim() || null;
-            if (!fresh) {
-              if (rotationCommit.authority?.validate() === false) {
-                return STEWARD_REFRESH_AUTHORITY_SUPERSEDED;
-              }
-              await dropShadowingStewardToken(
-                "rotation-returned-no-token",
-                restoreProbeToken,
-                rotationCommit.authority?.validate,
-              );
-              if (rotationCommit.authority?.validate() === false) {
-                return STEWARD_REFRESH_AUTHORITY_SUPERSEDED;
-              }
-            }
-            return fresh;
-          })
-          .catch(async () => {
-            // error-policy:J4 the valid native owner key remains available;
-            // remove the shadowing near-expiry JWT and visibly continue with it.
-            if (rotationCommit.authority?.validate() === false) {
-              return STEWARD_REFRESH_AUTHORITY_SUPERSEDED;
-            }
-            await dropShadowingStewardToken(
-              "rotation-failed",
-              restoreProbeToken,
-              rotationCommit.authority?.validate,
+        stewardTokenPromise = (async () => {
+          const rotationProbe = await runStartupProbeWithTimeout(
+            () =>
+              refreshCloudStewardSession({
+                commitRefreshedSession: async (session, authority) => {
+                  rotationFence.capture(authority);
+                  const validatePublication = () =>
+                    nativeOwnerAuthority.isCurrent() &&
+                    rotationFence.validate();
+                  const fresh = session.token?.trim();
+                  if (
+                    !fresh ||
+                    !storedStewardAuthority.isCurrent() ||
+                    !validatePublication()
+                  ) {
+                    return;
+                  }
+                  await writeStoredStewardToken(fresh, {
+                    validate: validatePublication,
+                  });
+                  if (!validatePublication()) return;
+                  const committed = captureStoredStewardLoginAuthority();
+                  if (committed?.token === fresh && committed.isCurrent()) {
+                    rotationCommit.storedAuthority = committed;
+                  }
+                },
+              }),
+            STEWARD_RESTORE_REFRESH_TIMEOUT_MS,
+          );
+          const rotationWasSuperseded =
+            !nativeOwnerAuthority.isCurrent() || rotationFence.wasSuperseded();
+          rotationFence.close();
+          if (rotationWasSuperseded) {
+            return STEWARD_REFRESH_AUTHORITY_SUPERSEDED;
+          }
+          if (rotationProbe.kind !== "ok") {
+            logger.warn(
+              { error: rotationProbe.error, kind: rotationProbe.kind },
+              "[startup-phase-restore] native owner-key Steward rotation did not complete",
             );
-            if (rotationCommit.authority?.validate() === false) {
-              return STEWARD_REFRESH_AUTHORITY_SUPERSEDED;
-            }
-            return null;
-          });
+          }
+          const fresh =
+            rotationProbe.kind === "ok"
+              ? rotationProbe.value?.token?.trim() || null
+              : null;
+          if (fresh) {
+            const committed = rotationCommit.storedAuthority;
+            return committed?.token === fresh && committed.isCurrent()
+              ? { token: fresh, authority: committed }
+              : STEWARD_REFRESH_AUTHORITY_SUPERSEDED;
+          }
+
+          // The valid native owner key remains available. Remove only the
+          // exact shadowing JWT, and only while both its token authority and
+          // the owner key's admission generation are still current.
+          const cleared = await dropShadowingStewardToken(
+            rotationProbe.kind === "ok"
+              ? "rotation-returned-no-token"
+              : "rotation-failed-or-timed-out",
+            restoreProbeToken,
+            () =>
+              nativeOwnerAuthority.isCurrent() &&
+              storedStewardAuthority.isCurrent(),
+          );
+          return cleared ? null : STEWARD_REFRESH_AUTHORITY_SUPERSEDED;
+        })();
       } else {
-        stewardTokenPromise = Promise.resolve(restoreProbeToken);
+        stewardTokenPromise = Promise.resolve({
+          token: restoreProbeToken,
+          authority: storedStewardAuthority,
+        });
       }
     } else {
       stewardTokenPromise = nativeOwnerApiKey
         ? Promise.resolve(null)
-        : resolveRestoredStewardToken();
+        : resolveRestoredStewardToken(storedStewardAuthority);
     }
     // Cloud = Steward everywhere (DECISIONS.md D3): prefer the live Steward
     // session token over the token captured at provision time (which may have
     // rotated since). If that stored JWT expired while the app was closed,
     // refresh it BEFORE handing it to the client so a returning user never
     // boots into a permanently-401ing session (see resolveRestoredStewardToken).
-    const stewardToken = await stewardTokenPromise;
-    if (stewardToken === STEWARD_REFRESH_AUTHORITY_SUPERSEDED) {
-      provisionalTargetAuthority?.clearIfCurrent();
-      return;
+    const restoredSteward = await stewardTokenPromise;
+    if (nativeOwnerApiKey && nativeOwnerAuthority?.isCurrent() !== true) {
+      clearLiveTargetIfCurrent();
+      return { status: "steward-recovery-pending" };
     }
-    if (isManagedSharedControlPlane && !stewardToken && !nativeOwnerApiKey) {
+    if (restoredSteward === STEWARD_REFRESH_AUTHORITY_SUPERSEDED) {
+      if (
+        initialCredentialAuthority ||
+        (!independentAgentToken && !nativeOwnerApiKey)
+      ) {
+        clearLiveTargetIfCurrent();
+      }
+      if (!independentAgentToken && !nativeOwnerApiKey) {
+        return { status: "steward-recovery-pending" };
+      }
+    }
+    const stewardSession =
+      restoredSteward === STEWARD_REFRESH_AUTHORITY_SUPERSEDED
+        ? null
+        : restoredSteward;
+    if (stewardSession && !stewardSession.authority.isCurrent()) {
+      if (
+        initialCredentialAuthority ||
+        (!independentAgentToken && !nativeOwnerApiKey)
+      ) {
+        clearLiveTargetIfCurrent();
+      }
+      if (!independentAgentToken && !nativeOwnerApiKey) {
+        return { status: "steward-recovery-pending" };
+      }
+    }
+    const currentStewardSession =
+      stewardSession?.authority.isCurrent() === true ? stewardSession : null;
+    if (
+      isManagedSharedControlPlane &&
+      !currentStewardSession &&
+      !nativeOwnerApiKey
+    ) {
       // Terminal refresh failure or a missing account session makes the saved
       // shared target unsafe. Clear every account-scoped mirror before startup
       // can reinstall the provision-time token or poll the previous agent.
       clearSharedCloudAccountBinding();
       clientRef.setToken(null);
       clientRef.setBaseUrl(null);
-      return;
+      return {
+        status: "applied",
+        authority: INDEPENDENT_RESTORED_CONNECTION_AUTHORITY,
+      };
     }
     // The compatibility lookup must use the post-refresh authority. The stored
     // pre-refresh JWT can be expired, while native/Electrobun restores may
     // intentionally rely on a host-injected Cloud owner key instead.
-    const controlPlaneOwnerToken = stewardToken ?? nativeOwnerApiKey;
-    const tierRepairPromise =
-      !isManagedSharedControlPlane &&
-      isDedicatedCloudAgentBase(restoredActiveServer.apiBase)
-        ? reconcileLegacyDedicatedCloudApiBase(resolved, controlPlaneOwnerToken)
-        : Promise.resolve(null);
+    const controlPlaneOwnerToken =
+      currentStewardSession?.token ?? nativeOwnerApiKey;
+    const controlPlaneOwnerAuthority: RestoreCredentialAuthority | null =
+      currentStewardSession?.authority ?? nativeOwnerAuthority;
     // Dedicated agent subdomains and explicit local-Docker pair targets use an
     // agent-local bearer for `/api/*`. The edge-owned dedicated path can keep
     // its Steward recovery fallback; a loopback process must never receive a
     // Cloud control-plane credential when its paired bearer is absent.
-    clientRef.setToken(
-      usesLocalDockerCredential
-        ? resolved.accessToken || null
-        : isManagedSharedControlPlane
-          ? stewardToken || nativeOwnerApiKey || null
-          : isDedicatedCloudAgentBase(resolved.apiBase)
-            ? resolved.accessToken || stewardToken || null
-            : isAgentlessControlPlane
-              ? stewardToken || nativeOwnerApiKey || null
-              : stewardToken ||
-                nativeOwnerApiKey ||
-                resolved.accessToken ||
-                null,
-    );
+    const finalToken = usesLocalDockerCredential
+      ? resolved.accessToken || null
+      : isManagedSharedControlPlane
+        ? currentStewardSession?.token || nativeOwnerApiKey || null
+        : isDedicatedCloudAgentBase(resolved.apiBase)
+          ? resolved.accessToken || currentStewardSession?.token || null
+          : isAgentlessControlPlane
+            ? currentStewardSession?.token || nativeOwnerApiKey || null
+            : currentStewardSession?.token ||
+              nativeOwnerApiKey ||
+              resolved.accessToken ||
+              null;
+    const finalUsesSteward =
+      !usesLocalDockerCredential &&
+      Boolean(currentStewardSession) &&
+      (isManagedSharedControlPlane ||
+        isAgentlessControlPlane ||
+        !isDedicatedCloudAgentBase(resolved.apiBase) ||
+        !resolved.accessToken);
+    const finalCredentialAuthority: RestoreCredentialAuthority | null =
+      finalUsesSteward
+        ? (currentStewardSession?.authority ?? null)
+        : !usesLocalDockerCredential &&
+            nativeOwnerApiKey &&
+            finalToken === nativeOwnerApiKey
+          ? nativeOwnerAuthority
+          : null;
+    if (finalToken !== initialToken) {
+      let finalPublication: "published" | "failed" | "superseded";
+      if (!clientRef.stageSessionTarget) {
+        if (finalCredentialAuthority?.isCurrent() === false) {
+          finalPublication = "superseded";
+        } else {
+          clientRef.setToken(finalToken);
+          fallbackTargetInstalled = true;
+          if (finalCredentialAuthority?.isCurrent() === false) {
+            clearLiveTargetIfCurrent();
+            finalPublication = "superseded";
+          } else {
+            finalPublication = "published";
+          }
+        }
+      } else {
+        finalPublication = publishTarget(
+          resolved.apiBase as string,
+          finalToken,
+          finalCredentialAuthority,
+        );
+      }
+      if (finalPublication === "superseded") {
+        clearLiveTargetIfCurrent();
+        return { status: "steward-recovery-pending" };
+      }
+      if (finalPublication === "failed") {
+        clearLiveTargetIfCurrent();
+        return {
+          status: "applied",
+          authority: INDEPENDENT_RESTORED_CONNECTION_AUTHORITY,
+        };
+      }
+    }
+
+    let liveCredentialAuthority =
+      finalCredentialAuthority ?? nativeOwnerAuthority;
+    const restoredConnectionAuthority: RestoredConnectionAuthority = {
+      // Credential generations alone cannot identify the installed runtime
+      // target: account B may select the same account/agent/token, and an
+      // A→B→A value cycle must not revive A. The staged target's monotonic
+      // revision is the exact, ABA-resistant authority for every Cloud path,
+      // including independent agent bearers which have no Steward authority.
+      isCurrent: () =>
+        liveTargetAuthority?.isCurrent() === true &&
+        (liveCredentialAuthority?.isCurrent() ?? true),
+      clearIfCurrent: clearLiveTargetIfCurrent,
+    };
+
+    const tierRepairPromise =
+      !isManagedSharedControlPlane &&
+      isDedicatedCloudAgentBase(restoredActiveServer.apiBase)
+        ? reconcileLegacyDedicatedCloudApiBase(
+            resolved,
+            controlPlaneOwnerToken,
+            controlPlaneOwnerAuthority ?? undefined,
+          )
+        : Promise.resolve(null);
     void tierRepairPromise.then((repaired) => {
       if (!repaired || repaired.apiBase === resolved.apiBase) return;
+      if (!restoredConnectionAuthority.isCurrent()) return;
+      if (controlPlaneOwnerAuthority?.isCurrent() === false) return;
       if (!isTrustedCloudApiBaseUrl(repaired.apiBase, agentId)) return;
       const current = loadPersistedActiveServer();
       // A user can switch agents while the compatibility probe is in flight.
@@ -791,14 +1192,26 @@ export async function applyRestoredConnection(args: {
       ) {
         return;
       }
-      savePersistedActiveServer(repaired);
-      clientRef.setToken(null);
-      clientRef.setBaseUrl(repaired.apiBase ?? null);
+      if (!restoredConnectionAuthority.isCurrent()) return;
       // A shared adapter is a Cloud control-plane target. The same owner
       // authority that proved the tier must remain installed after rerouting.
-      clientRef.setToken(controlPlaneOwnerToken);
+      const publication = publishTarget(
+        repaired.apiBase as string,
+        controlPlaneOwnerToken,
+        controlPlaneOwnerAuthority ?? null,
+      );
+      if (publication !== "published") return;
+      liveCredentialAuthority = controlPlaneOwnerAuthority ?? null;
+      if (
+        !restoredConnectionAuthority.isCurrent() ||
+        controlPlaneOwnerAuthority?.isCurrent() === false
+      ) {
+        clearLiveTargetIfCurrent();
+        return;
+      }
+      savePersistedActiveServer(repaired);
     });
-    return;
+    return { status: "applied", authority: restoredConnectionAuthority };
   }
 
   if (isMobileLocalActiveServer(restoredActiveServer)) {
@@ -809,7 +1222,10 @@ export async function applyRestoredConnection(args: {
     // transport. Without this branch the remote-host SECURITY backstop below
     // dropped the record on every cold launch (see canRestoreActiveServer).
     clientRef.setBaseUrl(restoredActiveServer.apiBase ?? null);
-    return;
+    return {
+      status: "applied",
+      authority: INDEPENDENT_RESTORED_CONNECTION_AUTHORITY,
+    };
   }
 
   const reconciled = reconcilePersistedApiBaseWithLive(
@@ -823,7 +1239,10 @@ export async function applyRestoredConnection(args: {
       `[startup-phase-restore] dropping persisted remote active-server with untrusted apiBase host: ${reconciled ?? "(none)"}`,
     );
     clearPersistedActiveServer();
-    return;
+    return {
+      status: "applied",
+      authority: INDEPENDENT_RESTORED_CONNECTION_AUTHORITY,
+    };
   }
   if (reconciled && reconciled !== restoredActiveServer.apiBase) {
     savePersistedActiveServer({
@@ -834,6 +1253,10 @@ export async function applyRestoredConnection(args: {
   clientRef.setToken(null);
   clientRef.setBaseUrl(reconciled ?? null);
   clientRef.setToken(restoredActiveServer.accessToken ?? null);
+  return {
+    status: "applied",
+    authority: INDEPENDENT_RESTORED_CONNECTION_AUTHORITY,
+  };
 }
 
 function activeServerToTarget(
@@ -914,16 +1337,29 @@ function preserveCloudAuthTokenForFirstRun(
   server: PersistedActiveServer,
 ): void {
   if (server.kind !== "cloud") return;
+  const authority = captureStoredStewardLoginAuthority();
+  // A login/logout mutation owns the client target while its durable receipt
+  // is unresolved. Do not copy raw account A or overwrite account B's newer
+  // same-tab target; the recovery surface must reconcile that generation first.
+  if (!authority && isStewardRecoveryPending()) return;
   // Only the independent Steward store is safe to carry to the control plane.
   // A rejected Cloud record's access token may be an agent-local pair bearer.
-  const token = readStoredStewardToken()?.trim() || null;
-  client.setToken(null);
-  client.setBaseUrl(
-    resolveDirectCloudAuthApiBase(
-      getBootConfig().cloudApiBase || RESTORE_DEFAULT_DIRECT_CLOUD_BASE_URL,
-    ),
+  const baseUrl = resolveDirectCloudAuthApiBase(
+    getBootConfig().cloudApiBase || RESTORE_DEFAULT_DIRECT_CLOUD_BASE_URL,
   );
-  client.setToken(token);
+  const token = authority?.token ?? null;
+  if (authority?.isCurrent() === false) return;
+  const staged = client.stageSessionTarget({ baseUrl, token });
+  if (!staged) return;
+  if (authority?.isCurrent() === false) {
+    staged.restoreIfCurrent();
+    return;
+  }
+  if (!staged.publish()) {
+    staged.restoreIfCurrent();
+    return;
+  }
+  if (authority?.isCurrent() === false) staged.clearIfCurrent();
 }
 
 /**
@@ -1110,7 +1546,7 @@ export async function runRestoringSession(
     void desktopRuntimeMode();
   }
 
-  await applyRestoredConnection({
+  const restoredConnection = await applyRestoredConnection({
     restoredActiveServer,
     clientRef: client,
     startLocalRuntime: async () => {
@@ -1128,10 +1564,44 @@ export async function runRestoringSession(
     },
   });
 
+  const deferToStewardRecovery = (
+    authority?: RestoredConnectionAuthority,
+  ): void => {
+    authority?.clearIfCurrent();
+    ctxRef.current = null;
+    deps.setFirstRunOptions(buildStaticFirstRunOptions(deps.uiLanguage));
+    deps.setFirstRunComplete(false);
+    deps.setFirstRunLoading(false);
+    // A durable login receipt is active intent, not an unreachable prior
+    // backend. Route to the sign-in/first-run recovery surface without polling
+    // account A or surfacing the generic prior-backend error.
+    dispatch({ type: "NO_SESSION", hadPriorFirstRun: false });
+  };
+
+  if (cancelled.current) {
+    if (restoredConnection.status === "applied") {
+      restoredConnection.authority.clearIfCurrent();
+    }
+    return;
+  }
+  if (restoredConnection.status === "steward-recovery-pending") {
+    deferToStewardRecovery();
+    return;
+  }
+  const restoredAuthority = restoredConnection.authority;
+  if (!restoredAuthority.isCurrent()) {
+    deferToStewardRecovery(restoredAuthority);
+    return;
+  }
+
   if (
     isManagedCloudSharedAgentBase(restoredActiveServer.apiBase) &&
     !loadPersistedActiveServer()
   ) {
+    if (!restoredAuthority.isCurrent()) {
+      deferToStewardRecovery(restoredAuthority);
+      return;
+    }
     deps.setFirstRunOptions(buildStaticFirstRunOptions(deps.uiLanguage));
     deps.setFirstRunComplete(false);
     deps.setFirstRunLoading(false);
@@ -1147,12 +1617,20 @@ export async function runRestoringSession(
   // cannot answer authoritatively without a bearer token, and the poll phase
   // may route that restore to pairing-required (which never mounts the shell,
   // so the post-paint hook — which covers every painted path — never fires).
+  if (!restoredAuthority.isCurrent()) {
+    deferToStewardRecovery(restoredAuthority);
+    return;
+  }
   if (
     restoredActiveServer.kind === "local" ||
     restoredActiveServer.accessToken ||
     getElizaApiToken()
   ) {
-    primeAuthStatusProbe();
+    primeAuthStatusProbe(restoredAuthority);
+  }
+  if (!restoredAuthority.isCurrent()) {
+    deferToStewardRecovery(restoredAuthority);
+    return;
   }
 
   ctxRef.current = {
@@ -1160,6 +1638,7 @@ export async function runRestoringSession(
     restoredActiveServer,
     shouldPreserveCompletedFirstRun: preserveCompleted,
     hadPriorFirstRun: hadPrior,
+    restoredConnectionAuthority: restoredAuthority,
   };
   // When the desktop shell runs in a non-"local" runtime mode (e.g. "external",
   // pointed at a backend it does NOT host) it has SKIPPED its embedded agent.
@@ -1172,9 +1651,17 @@ export async function runRestoringSession(
   let resolvedTarget = activeServerToTarget(restoredActiveServer);
   if (resolvedTarget === "embedded-local" && isElectrobunRuntime()) {
     const runtimeMode = await desktopRuntimeMode();
+    if (!restoredAuthority.isCurrent()) {
+      deferToStewardRecovery(restoredAuthority);
+      return;
+    }
     if (runtimeMode?.mode && runtimeMode.mode !== "local") {
       resolvedTarget = "remote-backend";
     }
+  }
+  if (!restoredAuthority.isCurrent()) {
+    deferToStewardRecovery(restoredAuthority);
+    return;
   }
   dispatch({
     type: "SESSION_RESTORED",

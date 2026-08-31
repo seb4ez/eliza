@@ -9,10 +9,13 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   clearPendingCloudHandoff,
+  clearPendingCloudHandoffIfCurrent,
+  isPendingCloudHandoffCurrent,
   loadPendingCloudHandoff,
   PENDING_HANDOFF_TTL_MS,
   type PendingCloudHandoff,
   savePendingCloudHandoff,
+  savePendingCloudHandoffIfCurrent,
 } from "./pending-handoff-store";
 
 const STORAGE_KEY = "eliza:cloud-handoff-pending";
@@ -73,5 +76,33 @@ describe("pending-handoff-store", () => {
     );
     expect(loadPendingCloudHandoff()).toBeNull();
     expect(window.localStorage.getItem(STORAGE_KEY)).toBeNull();
+  });
+
+  it("does not let stale A clear B's complete replacement marker", () => {
+    const markerA = marker();
+    const markerB = marker({
+      sharedAgentId: "shared-b",
+      dedicatedAgentId: "dedicated-b",
+      startedAt: markerA.startedAt + 1,
+    });
+    savePendingCloudHandoff(markerA);
+    savePendingCloudHandoff(markerB);
+
+    expect(clearPendingCloudHandoffIfCurrent(markerA)).toBe(false);
+    expect(isPendingCloudHandoffCurrent(markerA)).toBe(false);
+    expect(isPendingCloudHandoffCurrent(markerB)).toBe(true);
+    expect(loadPendingCloudHandoff()).toEqual(markerB);
+  });
+
+  it("does not let stale A's fresh target overwrite B's marker", () => {
+    const markerB = marker({
+      sharedAgentId: "shared-b",
+      dedicatedAgentId: "dedicated-b",
+    });
+    const freshA = marker({ dedicatedAgentId: "dedicated-fresh-a" });
+    savePendingCloudHandoff(markerB);
+
+    expect(savePendingCloudHandoffIfCurrent(null, freshA)).toBe(false);
+    expect(loadPendingCloudHandoff()).toEqual(markerB);
   });
 });

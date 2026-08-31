@@ -50,7 +50,7 @@ const mocks = vi.hoisted(() => ({
         activeAgentId: PERSONAL_ELIZA_ID,
         agentName: "Eliza Cloud",
         apiBase: PERSONAL_ELIZA_API_BASE,
-        runtime: "dedicated" as const,
+        runtime: "shared" as "shared" | "dedicated",
       }),
     ),
     submitFirstRun: vi.fn(async () => undefined),
@@ -58,6 +58,11 @@ const mocks = vi.hoisted(() => ({
     getBaseUrl: vi.fn(() => ""),
     setBaseUrl: vi.fn(),
     setToken: vi.fn(),
+    stageSessionTarget: vi.fn(() => ({
+      publish: () => true,
+      restoreIfCurrent: () => true,
+      clearIfCurrent: () => true,
+    })),
     getRestAuthToken: vi.fn(() => null),
     cloudLoginDirect: vi.fn(async (cloudApiBase: string) => ({
       ok: true,
@@ -198,6 +203,11 @@ const PERSONAL_ELIZA_API_BASE =
 const windowWithElectrobun = window as Window & {
   __electrobunWindowId?: number;
 };
+// Vitest runs this suite at http://localhost, where the browser client uses
+// the local (non-`__Host-`) v2 authority marker. Legacy `steward-authed` is
+// intentionally ignored by the production reader and must not be used as an
+// authenticated fixture.
+const LOCAL_STEWARD_AUTHED_COOKIE = "steward-authed-v2-local";
 
 // This jsdom env exposes `window.localStorage` as an object without methods;
 // install a real in-memory Storage (mirrors `first-run.test.ts`) so the finish
@@ -375,9 +385,11 @@ afterEach(() => {
   delete windowWithElectrobun.__electrobunWindowId;
   __resetPreparedDesktopCloudLoginSessionForTests();
   ensureLocalStorage().clear();
-  // Drop the steward-authed marker cookie some cloud-only tests plant — a
+  // Drop the v2 steward-authed marker cookie some cloud-only tests plant — a
   // leaked cookie would flip later mounts into the silent recovery branch.
-  writeTestCookie("steward-authed=; expires=Thu, 01 Jan 1970 00:00:00 GMT");
+  writeTestCookie(
+    `${LOCAL_STEWARD_AUTHED_COOKIE}=; expires=Thu, 01 Jan 1970 00:00:00 GMT`,
+  );
 });
 
 function writeTestCookie(value: string): void {
@@ -1752,89 +1764,36 @@ describe("cloud-only onboarding (runtime chooser off — the production default)
     // attempt cancel this request without changing that server-side policy.
     expect(
       Object.keys(mocks.client.getPersonalSharedEliza.mock.calls[0][0]).sort(),
-    ).toEqual([
-      "authToken",
-      "cloudApiBase",
-      "onProgress",
-      "requestDedicatedAdoptionConfirmation",
-      "signal",
-    ]);
+    ).toEqual(["authToken", "cloudApiBase", "signal"]);
     expect(
       mocks.client.getPersonalSharedEliza.mock.calls[0][0]?.signal,
     ).toBeInstanceOf(AbortSignal);
     unmount();
   });
 
-  it("shows the exact safe Dedicated terms and waits for a visible confirmation gesture", async () => {
-    const quoteId = "b".repeat(64);
-    const dedicatedAgentId = "00000000-0000-4000-8000-000000000020";
+  it("keeps first-run entry read-only and leaves Dedicated consent to management", async () => {
     mocks.client.getPersonalSharedEliza.mockImplementationOnce(
       async (options: Record<string, unknown>) => {
-        const request = options.requestDedicatedAdoptionConfirmation as (
-          quote: Record<string, unknown>,
-          context: { reason: "initial"; signal?: AbortSignal },
-        ) => Promise<Record<string, unknown> | null>;
-        const confirmation = await request(
-          {
-            quoteId,
-            dedicatedAgentId,
-            adoptionState: "available",
-            status: "error",
-            startsCompute: true,
-            hourlyRateUsd: 0.01,
-            dailyRateUsd: 0.24,
-            minimumBalanceUsd: 0.72,
-            minimumRunwayDays: 3,
-            balanceUsd: 115.54,
-            deficitUsd: 0,
-            stateDisposition: "verified_backup_present",
-            canAdopt: true,
-            requiresCatalogRestore: false,
-            requiresConfirmation: true,
-            action: "adopt_existing_dedicated",
-          },
-          {
-            reason: "initial",
-            signal: options.signal as AbortSignal,
-          },
+        expect(options).not.toHaveProperty(
+          "requestDedicatedAdoptionConfirmation",
         );
-        expect(confirmation).toEqual({
-          action: "adopt_existing_dedicated",
-          quoteId,
-        });
         return {
           personalElizaId: PERSONAL_ELIZA_ID,
           agentId: PERSONAL_ELIZA_ID,
-          activeAgentId: dedicatedAgentId,
+          activeAgentId: PERSONAL_ELIZA_ID,
           agentName: "Eliza Cloud",
-          apiBase: `https://${dedicatedAgentId}.cloud.eliza.app`,
-          runtime: "dedicated" as const,
+          apiBase: PERSONAL_ELIZA_API_BASE,
+          runtime: "shared" as const,
         };
       },
     );
     const spies = seedAppStore({ elizaCloudConnected: true });
     const { turn, unmount } = renderConductor();
 
-    const confirmationTurn = await waitForTurn(
-      turn,
-      "first-run:dedicated-adoption",
-    );
-    expect(confirmationTurn.text).toContain("$0.01/hour ($0.24/day)");
-    expect(confirmationTurn.text).toContain("Current status: error");
-    expect(confirmationTurn.text).toContain("Balance: $115.54");
-    expect(confirmationTurn.text).toContain("3 days of runway");
-    expect(confirmationTurn.text).toContain("starts Dedicated compute");
-    expect(confirmationTurn.text).toContain("restore its reviewed backup");
-    expect(confirmationTurn.text).not.toContain(quoteId);
-    expect(confirmationTurn.text).not.toContain(dedicatedAgentId);
-    expect(spies.completeFirstRun).not.toHaveBeenCalled();
-
-    expect(
-      tryHandleFirstRunAction("__first_run__:dedicated-adoption:confirm"),
-    ).toBe(true);
     await waitFor(() =>
       expect(spies.completeFirstRun).toHaveBeenCalledWith("chat"),
     );
+    expect(turn("first-run:dedicated-adoption")).toBeUndefined();
     unmount();
   });
 
@@ -1909,12 +1868,11 @@ describe("cloud-only onboarding (runtime chooser off — the production default)
     unmount();
   });
 
-  it("cross-subdomain cookie at mount (#15133): recovers the session BEFORE seeding anything — zero onboarding turns, straight into the single agent", async () => {
-    // First visit to the app subdomain after signing in on the console: no
-    // app-origin localStorage, but the non-HttpOnly steward-authed marker is
-    // present and the bounded refresh returns a token.
+  it("hosted cookie at mount (#15133): recovers the session BEFORE seeding anything — zero onboarding turns, straight into the single agent", async () => {
+    // First visit with no app-origin localStorage, but with the same-origin v2
+    // non-HttpOnly authority marker: the bounded refresh returns a token.
     localStorage.removeItem("steward_session_token");
-    writeTestCookie("steward-authed=1");
+    writeTestCookie(`${LOCAL_STEWARD_AUTHED_COOKIE}=1`);
     mocks.refreshCloudStewardSession.mockImplementation(async (options) => {
       const session = { token: "cookie-token" };
       await options?.commitRefreshedSession?.(session, {
@@ -1958,7 +1916,7 @@ describe("cloud-only onboarding (runtime chooser off — the production default)
   it("greets once after an auth-first login recovers through the hosted cookie session", async () => {
     localStorage.removeItem("steward_session_token");
     markCloudAuthFirstScreenGreeting();
-    writeTestCookie("steward-authed=1");
+    writeTestCookie(`${LOCAL_STEWARD_AUTHED_COOKIE}=1`);
     mocks.refreshCloudStewardSession.mockImplementation(async (options) => {
       const session = { token: "cookie-token" };
       await options?.commitRefreshedSession?.(session, {
@@ -1988,7 +1946,7 @@ describe("cloud-only onboarding (runtime chooser off — the production default)
 
   it("a stale marker cookie degrades to today's sign-in greeting after the bounded refresh fails — then the token poll still upgrades to welcome-back", async () => {
     localStorage.removeItem("steward_session_token");
-    writeTestCookie("steward-authed=1");
+    writeTestCookie(`${LOCAL_STEWARD_AUTHED_COOKIE}=1`);
     mocks.refreshCloudStewardSession.mockResolvedValue(null);
     mocks.client.getCloudStatus.mockResolvedValue({ connected: false });
     const spies = seedAppStore({ elizaCloudConnected: false });
@@ -2026,7 +1984,7 @@ describe("cloud-only onboarding (runtime chooser off — the production default)
 
   it("the silent cookie hold answers free text with the provisioning persona, and an unmount mid-refresh seeds nothing", async () => {
     localStorage.removeItem("steward_session_token");
-    writeTestCookie("steward-authed=1");
+    writeTestCookie(`${LOCAL_STEWARD_AUTHED_COOKIE}=1`);
     let resolveRefresh: (value: { token: string } | null) => void = () => {};
     mocks.refreshCloudStewardSession.mockImplementation(
       () =>

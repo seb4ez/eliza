@@ -34,4 +34,24 @@ describe("cloud-agent management ownership", () => {
       expect(adapter).not.toContain("client.resumeCloudCompatAgent");
     }
   });
+
+  it("fences lifecycle publication on one captured management authority", () => {
+    const owner = read("./cloud-agent-management-pattern.ts");
+
+    expect(owner).toContain("captureCloudManagementAuthority");
+    expect(owner).toContain("authority.isCurrent()");
+    expect(owner).toContain("waitForDeleteJob(res.data.jobId, authority)");
+    expect(owner).toContain("resyncStatus(agent.agent_id, authority)");
+    expect(owner).not.toContain("const token = getManagementToken()");
+  });
+
+  it("routes both presentation adapters through the owner-aware management resolver", () => {
+    const panelAdapter = read("./sections/AgentSection.tsx");
+    const settingsAdapter = read("../CloudAgentsSection.tsx");
+
+    for (const adapter of [panelAdapter, settingsAdapter]) {
+      expect(adapter).toContain("currentCloudManagementToken");
+    }
+    expect(settingsAdapter).not.toContain("getCloudAuthToken");
+  });
 });

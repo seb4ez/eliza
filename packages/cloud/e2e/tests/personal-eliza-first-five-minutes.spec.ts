@@ -391,6 +391,7 @@ test.describe("personal Eliza first five minutes", () => {
         headers: {
           "Content-Type": "application/json",
           Origin: stack.urls.api,
+          "Sec-Fetch-Site": "same-origin",
           "X-Eliza-CSRF": STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
         },
         // The browser's explicit claim ceremony: since #21925 a continuation

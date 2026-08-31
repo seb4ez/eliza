@@ -43,6 +43,8 @@ export interface CloudHandoffSupervisorParams {
   authedFetch: AuthedAgentFetch;
   /** Switch the live client to the ready container base. */
   onSwitch: (containerBase: string) => void | Promise<void>;
+  /** Exact login/session authority which owns this background migration. */
+  validateAuthority?: () => boolean;
   intervalMs?: number;
   timeoutMs?: number;
   log?: (message: string) => void;
@@ -103,6 +105,7 @@ export async function startCloudConversationHandoff(
     intervalMs: params.intervalMs,
     timeoutMs: params.timeoutMs,
     log: params.log,
+    validateAuthority: params.validateAuthority,
     checkPersonalReady: async () => {
       const base = await params.readiness.resolveReadyBase();
       if (!base) return { ready: false };

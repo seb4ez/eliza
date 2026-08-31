@@ -7,12 +7,17 @@ import { Capacitor, CapacitorHttp } from "@capacitor/core";
 import { ElizaError } from "@elizaos/core";
 import {
   clearStoredStewardToken,
+  dispatchStewardSessionChange,
   readStoredStewardToken,
   STEWARD_CSRF_HEADER,
   STEWARD_REFRESH_ENDPOINT,
   STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
+  STEWARD_TOKEN_KEY,
+  StewardTokenRemovalError,
+  type StewardTokenWriteAuthority,
   writeStoredStewardToken,
 } from "@elizaos/shared/steward-session-client";
+import { getElectrobunRendererRpc } from "../bridge/electrobun-rpc";
 import { isElectrobunRuntime } from "../bridge/electrobun-runtime";
 import {
   type AgentReadinessProbe,
@@ -25,12 +30,10 @@ import {
   type StewardSessionMutationLease,
 } from "../cloud/lib/steward-session-mutation-queue";
 import {
-  beginStewardSessionRecovery,
-  completeStewardSessionRecovery,
-  isStewardSessionRecoveryReceiptLive,
+  createStewardSessionRecoverySnapshotPublicationFence,
   isStewardSessionRecoverySnapshotLive,
   readStewardSessionRecovery,
-  rejectStewardSessionRecovery,
+  type StewardSessionRecoveryCommittedAuthority,
 } from "../cloud/lib/steward-session-recovery-marker";
 import {
   configuredStewardTenantId,
@@ -178,13 +181,13 @@ type CloudAgentExecutionTier =
   | "dedicated-always"
   | "custom";
 
-interface CloudAgentDeleteCondition {
+export interface CloudAgentDeleteCondition {
   expectedAgentName: string;
   expectedCreatedAt: string;
   expectedExecutionTier: CloudAgentExecutionTier;
 }
 
-interface CloudAgentCleanupReceipt {
+export interface CloudAgentCleanupReceipt {
   deleteCondition: CloudAgentDeleteCondition;
 }
 
@@ -193,8 +196,7 @@ function requireConfirmedFreshCloudAgentCreate(
   created: boolean | undefined,
   source?: string,
 ): void {
-  const freshWarmPoolSource =
-    source === "warm_pool" || source === "warm_pool_recovery";
+  const freshWarmPoolSource = isFreshWarmPoolCreateSource(source);
   if (forceCreate && created !== true && !freshWarmPoolSource) {
     throw new Error(
       "Eliza Cloud did not confirm that a new agent was created. No agent was opened; refresh your session and try again.",
@@ -202,8 +204,25 @@ function requireConfirmedFreshCloudAgentCreate(
   }
 }
 
+function isFreshWarmPoolCreateSource(source?: string): boolean {
+  return source === "warm_pool" || source === "warm_pool_recovery";
+}
+
 /** Async-job envelope returned by the restart/suspend/resume lifecycle routes. */
 type LifecycleResult = { jobId: string; status: string; message: string };
+
+/**
+ * Immutable account authority for one Cloud control-plane operation.
+ *
+ * Management callers must carry all three fields through the whole transport
+ * ladder. Falling back to the mutable singleton token after a direct attempt
+ * would let a request admitted by account A dispatch as account B.
+ */
+export interface ExactCloudAccountAuthority {
+  apiBase: string;
+  token: string;
+  validateAuthority: () => boolean;
+}
 
 function isCloudRouteNotFound(error: unknown): error is ApiError {
   return (
@@ -526,6 +545,60 @@ function shouldUseNativeStewardRefreshHttp(endpoint: string): boolean {
   return Capacitor.isNativePlatform() || isElectrobunRuntime();
 }
 
+type StewardBearerRefreshResponse = {
+  status: number;
+  data: unknown;
+};
+
+/**
+ * Dispatch a bearer-backed Steward refresh through the shell-native transport.
+ * Electrobun must never fall through to CapacitorHttp (not installed) or
+ * WKWebView fetch (CORS-blocked): require its live desktop RPC bridge and use
+ * the shared desktop transport's exact header/body normalization.
+ */
+async function requestStewardBearerRefresh(
+  endpoint: string,
+  token: string,
+): Promise<StewardBearerRefreshResponse> {
+  const headers = {
+    Accept: "application/json",
+    Authorization: `Bearer ${token}`,
+  };
+  if (isElectrobunRuntime()) {
+    const rpc = getElectrobunRendererRpc();
+    const desktopTransport = desktopHttpTransportForUrl(endpoint);
+    if (!rpc?.request?.desktopHttpRequest || !desktopTransport) {
+      throw new Error(
+        "Electrobun Steward refresh requires the desktop HTTP bridge",
+      );
+    }
+    const response = await withDirectCloudHttpTimeout(
+      desktopTransport.request(
+        endpoint,
+        { method: "POST", headers, body: null },
+        { timeoutMs: DIRECT_CLOUD_HTTP_TIMEOUT_MS },
+      ),
+      { method: "POST", url: endpoint },
+    );
+    return {
+      status: response.status,
+      data: await response.text(),
+    };
+  }
+
+  return withDirectCloudHttpTimeout(
+    CapacitorHttp.request({
+      url: endpoint,
+      method: "POST",
+      headers,
+      responseType: "json",
+      connectTimeout: 10_000,
+      readTimeout: 10_000,
+    }),
+    { method: "POST", url: endpoint },
+  );
+}
+
 /**
  * True when the document is itself served from a known Eliza Cloud host, which
  * is the only place a cloud-API request can collapse to a same-origin path. The
@@ -669,7 +742,35 @@ export function getCloudAuthToken(client?: ElizaClient): string | null {
 async function clearStoredStewardTokenIfCurrent(
   token: string,
 ): Promise<boolean> {
-  const cleared = await clearStoredStewardToken({ expectedToken: token });
+  // The transport sends the canonical trimmed bearer, while the protected
+  // store may still contain the byte-exact predecessor with surrounding
+  // whitespace. Capture that raw predecessor and use it for the destructive
+  // CAS: a later account/token write must make this stale 401 clear fail.
+  const rawStoredToken = readStoredStewardToken();
+  if (!rawStoredToken || rawStoredToken.trim() !== token.trim()) return false;
+  let cleared: boolean;
+  try {
+    cleared = await clearStoredStewardToken({
+      expectedToken: rawStoredToken,
+    });
+  } catch (error) {
+    const protectedStoreUnavailable =
+      error instanceof StewardTokenRemovalError &&
+      error.cause instanceof Error &&
+      error.cause.message === "Desktop protected storage is unavailable";
+    if (!isElectrobunRuntime() || !protectedStoreUnavailable) throw error;
+    // A renderer can receive a terminal 401 before the desktop storage bridge
+    // has hydrated. Its raw local predecessor is then the only readable
+    // authority. Retire only those exact bytes; a concurrent B publication
+    // changes the CAS and survives. The next bridge hydration remains free to
+    // reconcile any independently durable host value.
+    if (window.localStorage.getItem(STEWARD_TOKEN_KEY) !== rawStoredToken) {
+      return false;
+    }
+    window.localStorage.removeItem(STEWARD_TOKEN_KEY);
+    dispatchStewardSessionChange("cleared");
+    cleared = true;
+  }
   if (cleared && typeof window !== "undefined") {
     window.dispatchEvent(new CustomEvent("steward-token-sync"));
   }
@@ -874,20 +975,7 @@ export async function refreshCloudStewardSession(opts?: {
       mutationLease: opts.mutationLease,
       validateAuthority: refreshAuthority.validate,
       request: async () => {
-        const response = await withDirectCloudHttpTimeout(
-          CapacitorHttp.request({
-            url: endpoint,
-            method: "POST",
-            headers: {
-              Accept: "application/json",
-              Authorization: `Bearer ${token}`,
-            },
-            responseType: "json",
-            connectTimeout: 10_000,
-            readTimeout: 10_000,
-          }),
-          { method: "POST", url: endpoint },
-        );
+        const response = await requestStewardBearerRefresh(endpoint, token);
         const failure =
           response.status === 401
             ? (parseDirectCloudJsonSafe(response.data) as {
@@ -1475,11 +1563,22 @@ async function directCloudRequest<T>(
   client: ElizaClient,
   path: string,
   init?: RequestInit,
+  authorityOverride?: {
+    apiBase: string;
+    token: string;
+    validateAuthority?: () => boolean;
+  },
+  options: { allowSupersededResponse?: boolean } = {},
 ): Promise<T | null> {
-  const apiBase = resolveDirectCloudClientApiBase(client);
+  assertCloudSelectionAuthority(authorityOverride?.validateAuthority);
+  const apiBase = authorityOverride
+    ? resolveDirectCloudAuthApiBase(authorityOverride.apiBase)
+    : resolveDirectCloudClientApiBase(client);
   if (!apiBase) return null;
 
-  const token = readDirectCloudToken(client);
+  const token = authorityOverride
+    ? authorityOverride.token.trim()
+    : readDirectCloudToken(client);
   if (!token) return null;
 
   const url = `${apiBase}${path}`;
@@ -1495,6 +1594,7 @@ async function directCloudRequest<T>(
 
   if (shouldUseNativeCloudHttp()) {
     const data = directCloudBodyData(init?.body);
+    assertCloudSelectionAuthority(authorityOverride?.validateAuthority);
     const res = await withDirectCloudHttpTimeout(
       CapacitorHttp.request({
         url,
@@ -1507,11 +1607,16 @@ async function directCloudRequest<T>(
       }),
       { method, url },
     );
-    if (res.status === 401) {
+    const authorityCurrent = authorityOverride?.validateAuthority?.() !== false;
+    if (!authorityCurrent && !options.allowSupersededResponse) {
+      throw cloudSelectionSupersededError();
+    }
+    if (res.status === 401 && !authorityOverride) {
       await clearStoredStewardTokenIfCurrent(token);
     }
     const parsed = parseDirectCloudJson(res.data) as T;
     if (!isAcceptableDirectCloudResponse(res.status, parsed)) {
+      if (!authorityCurrent) throw cloudSelectionSupersededError();
       throw Object.assign(
         new Error(directCloudResponseErrorMessage(res.status, parsed)),
         {
@@ -1526,6 +1631,7 @@ async function directCloudRequest<T>(
   }
 
   const requestUrl = resolveBrowserCloudApiRequestUrl(url);
+  assertCloudSelectionAuthority(authorityOverride?.validateAuthority);
   const { res, text } = await fetchDirectCloudWithTimeout(
     requestUrl,
     { ...init, method, headers },
@@ -1537,11 +1643,16 @@ async function directCloudRequest<T>(
       text: res.status === 401 ? "" : await res.text(),
     }),
   );
-  if (res.status === 401) {
+  const authorityCurrent = authorityOverride?.validateAuthority?.() !== false;
+  if (!authorityCurrent && !options.allowSupersededResponse) {
+    throw cloudSelectionSupersededError();
+  }
+  if (res.status === 401 && !authorityOverride) {
     await clearStoredStewardTokenIfCurrent(token);
   }
   const data = parseDirectCloudJsonSafe(text);
   if (!isAcceptableDirectCloudResponse(res.status, data)) {
+    if (!authorityCurrent) throw cloudSelectionSupersededError();
     throw Object.assign(
       new Error(directCloudResponseErrorMessage(res.status, data)),
       {
@@ -1553,6 +1664,33 @@ async function directCloudRequest<T>(
     );
   }
   return data as T;
+}
+
+async function fetchCloudWithExactAuthority<T>(
+  authority: ExactCloudAccountAuthority,
+  path: string,
+  init?: RequestInit,
+  fetchOptions?: { allowNonOk?: boolean },
+  options: { allowSupersededResponse?: boolean } = {},
+): Promise<T> {
+  assertCloudSelectionAuthority(authority.validateAuthority);
+  if (shouldUseNativeCloudHttp()) {
+    // The exact direct transport is the only native path which can prove that
+    // the supplied owner credential was installed. Never fall back to the
+    // dedicated client's agent-local bearer.
+    throw new ElizaError(
+      "The exact Cloud account transport is unavailable on this device.",
+      { code: "CLOUD_ACCOUNT_AUTHORITY_UNAVAILABLE" },
+    );
+  }
+  const exactClient = new ElizaClient(authority.apiBase, authority.token);
+  assertCloudSelectionAuthority(authority.validateAuthority);
+  const response = await exactClient.fetch<T>(path, init, fetchOptions);
+  const authorityCurrent = authority.validateAuthority();
+  if (!authorityCurrent && !options.allowSupersededResponse) {
+    throw cloudSelectionSupersededError();
+  }
+  return response;
 }
 
 /**
@@ -1957,7 +2095,7 @@ declare module "./client-base" {
       identity?: { organizationId?: string; userId?: string },
     ): Promise<CloudLoginPersistResponse>;
     cloudDisconnect(): Promise<{ ok: boolean }>;
-    getCloudCompatAgents(): Promise<{
+    getCloudCompatAgents(authority?: ExactCloudAccountAuthority): Promise<{
       success: boolean;
       data: CloudCompatAgent[];
       error?: string;
@@ -1981,6 +2119,10 @@ declare module "./client-base" {
        * request byte-identical — every existing caller still reuses.
        */
       forceCreate?: boolean;
+      /** Internal exact login authority checked at every mutating dispatch. */
+      validateAuthority?: () => boolean;
+      /** Immutable management transport; never substituted with client state. */
+      authority?: ExactCloudAccountAuthority;
     }): Promise<{
       success: boolean;
       /**
@@ -2014,7 +2156,10 @@ declare module "./client-base" {
     provisionCloudCompatAgent(
       agentId: string,
     ): Promise<CloudCompatAgentProvisionResponse>;
-    getCloudCompatAgent(agentId: string): Promise<{
+    getCloudCompatAgent(
+      agentId: string,
+      authority?: ExactCloudAccountAuthority,
+    ): Promise<{
       success: boolean;
       data: CloudCompatAgent;
       error?: string;
@@ -2112,6 +2257,7 @@ declare module "./client-base" {
     deleteCloudCompatAgent(
       agentId: string,
       condition?: CloudAgentDeleteCondition,
+      authority?: ExactCloudAccountAuthority,
     ): Promise<{
       success: boolean;
       error?: string;
@@ -2124,12 +2270,16 @@ declare module "./client-base" {
     updateCloudCompatAgent(
       agentId: string,
       edit: { agentName?: string; agentConfig?: Record<string, unknown> },
+      authority?: ExactCloudAccountAuthority,
     ): Promise<{
       success: boolean;
       error?: string;
       data: { agentId: string; agentName: string };
     }>;
-    getCloudCompatAgentStatus(agentId: string): Promise<{
+    getCloudCompatAgentStatus(
+      agentId: string,
+      authority?: ExactCloudAccountAuthority,
+    ): Promise<{
       success: boolean;
       data: CloudCompatAgentStatus;
     }>;
@@ -2141,11 +2291,17 @@ declare module "./client-base" {
       success: boolean;
       data: { jobId: string; status: string; message: string };
     }>;
-    suspendCloudCompatAgent(agentId: string): Promise<{
+    suspendCloudCompatAgent(
+      agentId: string,
+      authority?: ExactCloudAccountAuthority,
+    ): Promise<{
       success: boolean;
       data: { jobId: string; status: string; message: string };
     }>;
-    resumeCloudCompatAgent(agentId: string): Promise<{
+    resumeCloudCompatAgent(
+      agentId: string,
+      authority?: ExactCloudAccountAuthority,
+    ): Promise<{
       success: boolean;
       data: { jobId: string; status: string; message: string };
     }>;
@@ -2163,7 +2319,10 @@ declare module "./client-base" {
         acceptingNewAgents: boolean;
       };
     }>;
-    getCloudCompatJobStatus(jobId: string): Promise<{
+    getCloudCompatJobStatus(
+      jobId: string,
+      authority?: ExactCloudAccountAuthority,
+    ): Promise<{
       success: boolean;
       data: CloudCompatJob;
       error?: string;
@@ -2258,6 +2417,8 @@ declare module "./client-base" {
       cloudApiBase: string;
       authToken: string;
       signal?: AbortSignal;
+      /** Exact upstream login authority checked around every remote effect. */
+      validateAuthority?: () => boolean;
       onProgress?: (status: string, detail?: string) => void;
       /**
        * User-gesture boundary for an existing-row adoption. Silent startup
@@ -2320,6 +2481,10 @@ declare module "./client-base" {
       wakeTimeoutMs?: number;
       /** Cancel selection/wake polling while preserving an accepted create receipt for compensation. */
       signal?: AbortSignal;
+      /** Exact caller authority; invalidation aborts every transport fallback. */
+      validateAuthority?: () => boolean;
+      /** Already-captured account transport (used by Settings management). */
+      accountAuthority?: ExactCloudAccountAuthority;
     }): Promise<{
       agentId: string;
       agentName: string;
@@ -2335,6 +2500,12 @@ declare module "./client-base" {
       executionTier?: string | null;
       /** Exact fresh-create identity; absent for reused or legacy responses. */
       cleanupReceipt?: CloudAgentCleanupReceipt;
+      /** Exact login publication retained across the caller's await boundary. */
+      authority?: StewardSessionRecoveryCommittedAuthority & {
+        restoreIfCurrent(): Promise<void>;
+        /** Compensate a stale post-return selection before any caller bind. */
+        compensateIfSuperseded(): Promise<void>;
+      };
     }>;
     /**
      * Background shared→personal handoff for a freshly provisioned cloud agent:
@@ -2357,6 +2528,8 @@ declare module "./client-base" {
        */
       dedicatedAgentId?: string;
       onSwitch: (containerBase: string) => void | Promise<void>;
+      /** Exact login/session authority which owns this background handoff. */
+      validateAuthority?: () => boolean;
       intervalMs?: number;
       timeoutMs?: number;
       log?: (message: string) => void;
@@ -2721,16 +2894,33 @@ ElizaClient.prototype.cloudDisconnect = async function (this: ElizaClient) {
 
 ElizaClient.prototype.getCloudCompatAgents = async function (
   this: ElizaClient,
+  authority,
 ) {
+  assertCloudSelectionAuthority(authority?.validateAuthority);
   const direct = await directCloudRequest<{
     success: boolean;
     data?: DirectCloudAgent[];
     error?: string;
-  }>(this, "/api/v1/eliza/agents");
+  }>(this, "/api/v1/eliza/agents", undefined, authority);
   if (direct) {
     return {
       success: direct.success,
       data: (direct.data ?? []).map(toCloudCompatAgent),
+    };
+  }
+
+  assertCloudSelectionAuthority(authority?.validateAuthority);
+  if (authority) {
+    const response = await fetchCloudWithExactAuthority<{
+      success: boolean;
+      data?: DirectCloudAgent[];
+      error?: string;
+    }>(authority, "/api/v1/eliza/agents");
+    assertCloudSelectionAuthority(authority.validateAuthority);
+    return {
+      success: response.success,
+      data: (response.data ?? []).map(toCloudCompatAgent),
+      ...(response.error ? { error: response.error } : {}),
     };
   }
 
@@ -2761,6 +2951,8 @@ ElizaClient.prototype.createCloudCompatAgent = async function (
   this: ElizaClient,
   opts,
 ) {
+  assertCloudSelectionAuthority(opts.validateAuthority);
+  assertCloudSelectionAuthority(opts.authority?.validateAuthority);
   // Phase-0 tier flip. The backend derives `execution_tier` from the request:
   // `alwaysOn: true` → DEDICATED always-on container; omitting it (for a plain
   // chat agent) → SHARED, container-free, instant. Default is dedicated — only
@@ -2776,26 +2968,36 @@ ElizaClient.prototype.createCloudCompatAgent = async function (
     source?: string;
     data: unknown;
     error?: string;
-  }>(this, "/api/v1/eliza/agents", {
-    method: "POST",
-    body: JSON.stringify({
-      agentName: opts.agentName,
-      // The Eliza app provisions a DEDICATED (own-container, always-on) agent —
-      // the paid tier. Zero-balance users get the cloud's 402 add-credits prompt
-      // rather than silently receiving paid compute.
-      // (With the Phase-0 shared-tier flag on, `alwaysOn` is dropped so the
-      // backend derives a SHARED agent instead — see tierFields above.)
-      ...tierFields,
-      // Opt out of the backend reuse guard so a SEPARATE agent is minted (the
-      // shared→dedicated handoff target). Omitted by default → reuse unchanged.
-      ...(opts.forceCreate ? { forceCreate: true } : {}),
-      ...(opts.agentConfig ? { agentConfig: opts.agentConfig } : {}),
-      ...(opts.environmentVars
-        ? { environmentVars: opts.environmentVars }
-        : {}),
-    }),
-  });
+  }>(
+    this,
+    "/api/v1/eliza/agents",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        agentName: opts.agentName,
+        // The Eliza app provisions a DEDICATED (own-container, always-on) agent —
+        // the paid tier. Zero-balance users get the cloud's 402 add-credits prompt
+        // rather than silently receiving paid compute.
+        // (With the Phase-0 shared-tier flag on, `alwaysOn` is dropped so the
+        // backend derives a SHARED agent instead — see tierFields above.)
+        ...tierFields,
+        // Opt out of the backend reuse guard so a SEPARATE agent is minted (the
+        // shared→dedicated handoff target). Omitted by default → reuse unchanged.
+        ...(opts.forceCreate ? { forceCreate: true } : {}),
+        ...(opts.agentConfig ? { agentConfig: opts.agentConfig } : {}),
+        ...(opts.environmentVars
+          ? { environmentVars: opts.environmentVars }
+          : {}),
+      }),
+    },
+    opts.authority,
+    { allowSupersededResponse: true },
+  );
   if (direct) {
+    // A newer login may start while the mutating request is in flight. Parse
+    // and return the exact create receipt first so the owning selection flow
+    // can conditionally compensate the accepted server mutation; throwing
+    // here would strand a fresh agent without its id/createdAt authority.
     requireConfirmedFreshCloudAgentCreate(
       opts.forceCreate,
       direct.created,
@@ -2804,7 +3006,10 @@ ElizaClient.prototype.createCloudCompatAgent = async function (
     const data = parseDirectCloudAgentCreateData(direct.data, opts.agentName);
     return {
       success: direct.success,
-      created: opts.forceCreate ? true : direct.created,
+      created:
+        opts.forceCreate || isFreshWarmPoolCreateSource(direct.source)
+          ? true
+          : direct.created,
       data: {
         agentId: data.id,
         agentName: data.agentName,
@@ -2812,6 +3017,59 @@ ElizaClient.prototype.createCloudCompatAgent = async function (
         status: data.status,
         nodeId: null,
         message: direct.success ? "Agent created" : (direct.error ?? ""),
+        createdAt: data.createdAt,
+        executionTier: data.executionTier,
+      },
+    };
+  }
+
+  assertCloudSelectionAuthority(opts.validateAuthority);
+  assertCloudSelectionAuthority(opts.authority?.validateAuthority);
+
+  if (opts.authority) {
+    const response = await fetchCloudWithExactAuthority<{
+      success: boolean;
+      created?: boolean;
+      source?: string;
+      data: unknown;
+      error?: string;
+    }>(
+      opts.authority,
+      "/api/v1/eliza/agents",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          agentName: opts.agentName,
+          ...tierFields,
+          ...(opts.forceCreate ? { forceCreate: true } : {}),
+          ...(opts.agentConfig ? { agentConfig: opts.agentConfig } : {}),
+          ...(opts.environmentVars
+            ? { environmentVars: opts.environmentVars }
+            : {}),
+        }),
+      },
+      undefined,
+      { allowSupersededResponse: true },
+    );
+    requireConfirmedFreshCloudAgentCreate(
+      opts.forceCreate,
+      response.created,
+      response.source,
+    );
+    const data = parseDirectCloudAgentCreateData(response.data, opts.agentName);
+    return {
+      success: response.success,
+      created:
+        opts.forceCreate || isFreshWarmPoolCreateSource(response.source)
+          ? true
+          : response.created,
+      data: {
+        agentId: data.id,
+        agentName: data.agentName,
+        jobId: data.jobId ?? "",
+        status: data.status,
+        nodeId: null,
+        message: response.success ? "Agent created" : (response.error ?? ""),
         createdAt: data.createdAt,
         executionTier: data.executionTier,
       },
@@ -2835,6 +3093,7 @@ ElizaClient.prototype.createCloudCompatAgent = async function (
   }
 
   if (isDirectCloudBase(this)) {
+    assertCloudSelectionAuthority(opts.validateAuthority);
     const response = await this.fetch<{
       success: boolean;
       // See the direct-path note: `created: false` is valid only without force.
@@ -2866,7 +3125,10 @@ ElizaClient.prototype.createCloudCompatAgent = async function (
     const data = parseDirectCloudAgentCreateData(response.data, opts.agentName);
     return {
       success: response.success,
-      created: opts.forceCreate ? true : response.created,
+      created:
+        opts.forceCreate || isFreshWarmPoolCreateSource(response.source)
+          ? true
+          : response.created,
       data: {
         agentId: data.id,
         agentName: data.agentName,
@@ -2886,6 +3148,7 @@ ElizaClient.prototype.createCloudCompatAgent = async function (
     );
   }
 
+  assertCloudSelectionAuthority(opts.validateAuthority);
   return this.fetch("/api/cloud/compat/agents", {
     method: "POST",
     body: JSON.stringify(opts),
@@ -2947,17 +3210,39 @@ ElizaClient.prototype.provisionCloudCompatAgent = async function (
 ElizaClient.prototype.getCloudCompatAgent = async function (
   this: ElizaClient,
   agentId,
+  authority,
 ) {
+  assertCloudSelectionAuthority(authority?.validateAuthority);
   const direct = await directCloudRequest<{
     success: boolean;
     data?: DirectCloudAgent;
     error?: string;
-  }>(this, `/api/v1/eliza/agents/${encodeURIComponent(agentId)}`);
+  }>(
+    this,
+    `/api/v1/eliza/agents/${encodeURIComponent(agentId)}`,
+    undefined,
+    authority,
+  );
   if (direct) {
     return {
       success: direct.success,
       data: toCloudCompatAgent(direct.data ?? { id: agentId }),
       ...(direct.error ? { error: direct.error } : {}),
+    };
+  }
+
+  assertCloudSelectionAuthority(authority?.validateAuthority);
+  if (authority) {
+    const response = await fetchCloudWithExactAuthority<{
+      success: boolean;
+      data?: DirectCloudAgent;
+      error?: string;
+    }>(authority, `/api/v1/eliza/agents/${encodeURIComponent(agentId)}`);
+    assertCloudSelectionAuthority(authority.validateAuthority);
+    return {
+      success: response.success,
+      data: toCloudCompatAgent(response.data ?? { id: agentId }),
+      ...(response.error ? { error: response.error } : {}),
     };
   }
 
@@ -3194,7 +3479,9 @@ ElizaClient.prototype.deleteCloudCompatAgent = async function (
   this: ElizaClient,
   agentId,
   condition,
+  authority,
 ) {
+  assertCloudSelectionAuthority(authority?.validateAuthority);
   const normalizeDelete = (response: {
     success?: boolean;
     data?: { message?: string; status?: string; jobId?: string };
@@ -3223,11 +3510,35 @@ ElizaClient.prototype.deleteCloudCompatAgent = async function (
     success: boolean;
     data?: { message?: string; status?: string; jobId?: string };
     error?: string;
-  }>(this, `/api/v1/eliza/agents/${encodeURIComponent(agentId)}`, {
-    method: "DELETE",
-    ...(condition ? { body: JSON.stringify(condition) } : {}),
-  });
+  }>(
+    this,
+    `/api/v1/eliza/agents/${encodeURIComponent(agentId)}`,
+    {
+      method: "DELETE",
+      ...(condition ? { body: JSON.stringify(condition) } : {}),
+    },
+    authority,
+  );
   if (direct) return normalizeDelete(direct);
+
+  assertCloudSelectionAuthority(authority?.validateAuthority);
+  if (authority) {
+    const response = await fetchCloudWithExactAuthority<{
+      success: boolean;
+      data?: { message?: string; status?: string; jobId?: string };
+      error?: string;
+    }>(
+      authority,
+      `/api/v1/eliza/agents/${encodeURIComponent(agentId)}`,
+      {
+        method: "DELETE",
+        ...(condition ? { body: JSON.stringify(condition) } : {}),
+      },
+      { allowNonOk: true },
+    );
+    assertCloudSelectionAuthority(authority.validateAuthority);
+    return normalizeDelete(response);
+  }
 
   if (isDirectCloudAuthMissing(this)) {
     return {
@@ -3267,7 +3578,9 @@ ElizaClient.prototype.updateCloudCompatAgent = async function (
   this: ElizaClient,
   agentId,
   edit,
+  authority,
 ) {
+  assertCloudSelectionAuthority(authority?.validateAuthority);
   const path = `/api/v1/eliza/agents/${encodeURIComponent(agentId)}`;
   const body = JSON.stringify({
     ...(edit.agentName !== undefined ? { agentName: edit.agentName } : {}),
@@ -3292,8 +3605,19 @@ ElizaClient.prototype.updateCloudCompatAgent = async function (
     success: boolean;
     data?: { agentId?: string; agentName?: string };
     error?: string;
-  }>(this, path, { method: "PATCH", body });
+  }>(this, path, { method: "PATCH", body }, authority);
   if (direct) return normalize(direct);
+
+  assertCloudSelectionAuthority(authority?.validateAuthority);
+  if (authority) {
+    const response = await fetchCloudWithExactAuthority<{
+      success: boolean;
+      data?: { agentId?: string; agentName?: string };
+      error?: string;
+    }>(authority, path, { method: "PATCH", body }, { allowNonOk: true });
+    assertCloudSelectionAuthority(authority.validateAuthority);
+    return normalize(response);
+  }
 
   if (isDirectCloudAuthMissing(this)) {
     return {
@@ -3321,7 +3645,9 @@ ElizaClient.prototype.updateCloudCompatAgent = async function (
 ElizaClient.prototype.getCloudCompatAgentStatus = async function (
   this: ElizaClient,
   agentId,
+  authority,
 ) {
+  assertCloudSelectionAuthority(authority?.validateAuthority);
   // Direct-cloud fallback for mobile/web clients that have no local
   // Eliza API server proxying `/api/cloud/compat/agents/...`. The
   // direct cloud surface returns a richer agent record at
@@ -3330,7 +3656,12 @@ ElizaClient.prototype.getCloudCompatAgentStatus = async function (
   const direct = await directCloudRequest<{
     success: boolean;
     data?: DirectCloudAgent;
-  }>(this, `/api/v1/eliza/agents/${encodeURIComponent(agentId)}`);
+  }>(
+    this,
+    `/api/v1/eliza/agents/${encodeURIComponent(agentId)}`,
+    undefined,
+    authority,
+  );
   if (direct) {
     const a = toCloudCompatAgent(direct.data ?? { id: agentId });
     return {
@@ -3344,6 +3675,30 @@ ElizaClient.prototype.getCloudCompatAgentStatus = async function (
         suspendedReason: null,
         databaseStatus: a.database_status,
       },
+    };
+  }
+
+  assertCloudSelectionAuthority(authority?.validateAuthority);
+  if (authority) {
+    const response = await fetchCloudWithExactAuthority<{
+      success: boolean;
+      data?: DirectCloudAgent;
+      error?: string;
+    }>(authority, `/api/v1/eliza/agents/${encodeURIComponent(agentId)}`);
+    assertCloudSelectionAuthority(authority.validateAuthority);
+    const a = toCloudCompatAgent(response.data ?? { id: agentId });
+    return {
+      success: response.success,
+      data: {
+        status: a.status,
+        lastHeartbeat: a.last_heartbeat_at,
+        bridgeUrl: a.bridge_url,
+        webUiUrl: a.webUiUrl,
+        currentNode: null,
+        suspendedReason: response.error ?? null,
+        databaseStatus: a.database_status,
+      },
+      ...(response.error ? { error: response.error } : {}),
     };
   }
 
@@ -3427,7 +3782,9 @@ async function runCloudLifecycleAction(
   client: ElizaClient,
   agentId: string,
   action: "suspend" | "resume",
+  authority?: ExactCloudAccountAuthority,
 ): Promise<{ success: boolean; error?: string; data: LifecycleResult }> {
+  assertCloudSelectionAuthority(authority?.validateAuthority);
   const encoded = encodeURIComponent(agentId);
   const directPath = `/api/v1/eliza/agents/${encoded}/${action}`;
 
@@ -3435,8 +3792,19 @@ async function runCloudLifecycleAction(
     success: boolean;
     data?: { jobId?: string; status?: string; message?: string };
     error?: string;
-  }>(client, directPath, { method: "POST" });
+  }>(client, directPath, { method: "POST" }, authority);
   if (direct) return normalizeCloudLifecycleResponse(direct, action);
+
+  assertCloudSelectionAuthority(authority?.validateAuthority);
+  if (authority) {
+    const response = await fetchCloudWithExactAuthority<{
+      success: boolean;
+      data?: { jobId?: string; status?: string; message?: string };
+      error?: string;
+    }>(authority, directPath, { method: "POST" }, { allowNonOk: true });
+    assertCloudSelectionAuthority(authority.validateAuthority);
+    return normalizeCloudLifecycleResponse(response, action);
+  }
 
   if (isDirectCloudAuthMissing(client)) {
     return {
@@ -3482,15 +3850,17 @@ ElizaClient.prototype.restartCloudCompatAgent = async function (
 ElizaClient.prototype.suspendCloudCompatAgent = async function (
   this: ElizaClient,
   agentId,
+  authority,
 ) {
-  return runCloudLifecycleAction(this, agentId, "suspend");
+  return runCloudLifecycleAction(this, agentId, "suspend", authority);
 };
 
 ElizaClient.prototype.resumeCloudCompatAgent = async function (
   this: ElizaClient,
   agentId,
+  authority,
 ) {
-  return runCloudLifecycleAction(this, agentId, "resume");
+  return runCloudLifecycleAction(this, agentId, "resume", authority);
 };
 
 ElizaClient.prototype.launchCloudCompatAgent = async function (
@@ -3537,17 +3907,34 @@ ElizaClient.prototype.getCloudCompatAvailability = async function (
 ElizaClient.prototype.getCloudCompatJobStatus = async function (
   this: ElizaClient,
   jobId,
+  authority,
 ) {
+  assertCloudSelectionAuthority(authority?.validateAuthority);
   const direct = await directCloudRequest<{
     success: boolean;
     data?: DirectCloudJob;
     error?: string;
-  }>(this, `/api/v1/jobs/${encodeURIComponent(jobId)}`);
+  }>(this, `/api/v1/jobs/${encodeURIComponent(jobId)}`, undefined, authority);
   if (direct) {
     return {
       success: direct.success,
       data: toCloudCompatJob(direct.data ?? { id: jobId }),
       ...(direct.error ? { error: direct.error } : {}),
+    };
+  }
+
+  assertCloudSelectionAuthority(authority?.validateAuthority);
+  if (authority) {
+    const response = await fetchCloudWithExactAuthority<{
+      success: boolean;
+      data?: DirectCloudJob;
+      error?: string;
+    }>(authority, `/api/v1/jobs/${encodeURIComponent(jobId)}`);
+    assertCloudSelectionAuthority(authority.validateAuthority);
+    return {
+      success: response.success,
+      data: toCloudCompatJob(response.data ?? { id: jobId }),
+      ...(response.error ? { error: response.error } : {}),
     };
   }
 
@@ -4370,10 +4757,13 @@ export async function waitForCloudAgentRunning(
     timeoutMs?: number;
     onProgress?: (status: string, detail?: string) => void;
     signal?: AbortSignal;
+    validateAuthority?: () => boolean;
+    authority?: ExactCloudAccountAuthority;
   },
 ): Promise<CloudCompatAgent> {
   const { agentId, onProgress } = options;
   options.signal?.throwIfAborted();
+  assertCloudSelectionAuthority(options.validateAuthority);
   const pollIntervalMs = Math.max(
     50,
     options.pollIntervalMs ?? CLOUD_AGENT_WAKE_POLL_INTERVAL_MS,
@@ -4388,29 +4778,34 @@ export async function waitForCloudAgentRunning(
     "starting",
     "Starting your agent — a cold boot can take a few minutes...",
   );
-  const resume = await client
-    .resumeCloudCompatAgent(agentId)
-    .catch((cause: unknown) => {
-      const hard = nonTransientWakeFailure(cause);
-      if (hard) {
-        throw new CloudAgentWakeError({
-          message: wakeFailureMessage(
-            "Starting your cloud agent failed",
-            hard.status,
-            hard.retryAfter,
-            cause,
-          ),
-          phase: "resume",
-          agentId,
-          ...hard,
+  options.signal?.throwIfAborted();
+  assertCloudSelectionAuthority(options.validateAuthority);
+  const resumeRequest = options.authority
+    ? client.resumeCloudCompatAgent(agentId, options.authority)
+    : client.resumeCloudCompatAgent(agentId);
+  const resume = await resumeRequest.catch((cause: unknown) => {
+    const hard = nonTransientWakeFailure(cause);
+    if (hard) {
+      throw new CloudAgentWakeError({
+        message: wakeFailureMessage(
+          "Starting your cloud agent failed",
+          hard.status,
+          hard.retryAfter,
           cause,
-        });
-      }
-      // error-policy:J4 a transport failure without a terminal HTTP status is
-      // an idempotent wake nudge lost in transit; the bounded status poll is
-      // the authority and can still observe the agent becoming ready.
-      return null;
-    });
+        ),
+        phase: "resume",
+        agentId,
+        ...hard,
+        cause,
+      });
+    }
+    // error-policy:J4 a transport failure without a terminal HTTP status is
+    // an idempotent wake nudge lost in transit; the bounded status poll is
+    // the authority and can still observe the agent becoming ready.
+    return null;
+  });
+  options.signal?.throwIfAborted();
+  assertCloudSelectionAuthority(options.validateAuthority);
   if (resume && !resume.success) {
     const failure = envelopeFailure(resume);
     throw new CloudAgentWakeError({
@@ -4428,32 +4823,36 @@ export async function waitForCloudAgentRunning(
   let backoffMs: number | null = null;
   for (;;) {
     options.signal?.throwIfAborted();
+    assertCloudSelectionAuthority(options.validateAuthority);
     backoffMs = null;
-    const detail = await client
-      .getCloudCompatAgent(agentId)
-      .catch((cause: unknown) => {
-        const hard = nonTransientWakeFailure(cause);
-        if (hard) {
-          throw new CloudAgentWakeError({
-            message: wakeFailureMessage(
-              "Checking your cloud agent failed",
-              hard.status,
-              hard.retryAfter,
-              cause,
-            ),
-            phase: "status-poll",
-            agentId,
-            lastObservedStatus: lastStatus,
-            ...hard,
+    const detailRequest = options.authority
+      ? client.getCloudCompatAgent(agentId, options.authority)
+      : client.getCloudCompatAgent(agentId);
+    const detail = await detailRequest.catch((cause: unknown) => {
+      const hard = nonTransientWakeFailure(cause);
+      if (hard) {
+        throw new CloudAgentWakeError({
+          message: wakeFailureMessage(
+            "Checking your cloud agent failed",
+            hard.status,
+            hard.retryAfter,
             cause,
-          });
-        }
-        // error-policy:J4 a transient status read counts as an unknown tick
-        // inside this bounded poll; the deadline below throws with the last
-        // status. A Retry-After on that rejection sets the next tick's pace.
-        backoffMs = transientWakeRetryDelayMs(cause);
-        return null;
-      });
+          ),
+          phase: "status-poll",
+          agentId,
+          lastObservedStatus: lastStatus,
+          ...hard,
+          cause,
+        });
+      }
+      // error-policy:J4 a transient status read counts as an unknown tick
+      // inside this bounded poll; the deadline below throws with the last
+      // status. A Retry-After on that rejection sets the next tick's pace.
+      backoffMs = transientWakeRetryDelayMs(cause);
+      return null;
+    });
+    options.signal?.throwIfAborted();
+    assertCloudSelectionAuthority(options.validateAuthority);
     if (detail && !detail.success) {
       const failure = envelopeFailure(detail);
       throw new CloudAgentWakeError({
@@ -4470,7 +4869,11 @@ export async function waitForCloudAgentRunning(
     const agent = detail?.data ?? null;
     if (agent) {
       lastStatus = agent.status || "unknown";
-      if (lastStatus === "running") return agent;
+      if (lastStatus === "running") {
+        options.signal?.throwIfAborted();
+        assertCloudSelectionAuthority(options.validateAuthority);
+        return agent;
+      }
       if (CLOUD_AGENT_FAILED_STATUSES.has(lastStatus.toLowerCase())) {
         throw new CloudAgentWakeError({
           message: agent.error_message
@@ -4494,10 +4897,14 @@ export async function waitForCloudAgentRunning(
       });
     }
     onProgress?.("starting", describeAgentWakeWait(elapsedMs));
+    options.signal?.throwIfAborted();
+    assertCloudSelectionAuthority(options.validateAuthority);
     await abortableDelay(
       Math.min(Math.max(pollIntervalMs, backoffMs ?? 0), timeoutMs - elapsedMs),
       options.signal,
     );
+    options.signal?.throwIfAborted();
+    assertCloudSelectionAuthority(options.validateAuthority);
   }
 }
 
@@ -4590,10 +4997,13 @@ export async function waitForCloudProvisionJob(
     timeoutMs?: number;
     onProgress?: (status: string, detail?: string) => void;
     signal?: AbortSignal;
+    validateAuthority?: () => boolean;
+    authority?: ExactCloudAccountAuthority;
   },
 ): Promise<void> {
   const { agentId, jobId, onProgress } = options;
   options.signal?.throwIfAborted();
+  assertCloudSelectionAuthority(options.validateAuthority);
   const pollIntervalMs = Math.max(
     50,
     options.pollIntervalMs ?? CLOUD_AGENT_WAKE_POLL_INTERVAL_MS,
@@ -4607,33 +5017,37 @@ export async function waitForCloudProvisionJob(
   let backoffMs: number | null = null;
   for (;;) {
     options.signal?.throwIfAborted();
+    assertCloudSelectionAuthority(options.validateAuthority);
     backoffMs = null;
-    const res = await client
-      .getCloudCompatJobStatus(jobId)
-      .catch((cause: unknown) => {
-        const hard = nonTransientWakeFailure(cause);
-        if (hard) {
-          throw new CloudAgentWakeError({
-            message: wakeFailureMessage(
-              "Provisioning your cloud agent failed",
-              hard.status,
-              hard.retryAfter,
-              cause,
-            ),
-            phase: "provision-job",
-            agentId,
-            jobId,
-            lastObservedStatus: lastStatus,
-            ...hard,
+    const statusRequest = options.authority
+      ? client.getCloudCompatJobStatus(jobId, options.authority)
+      : client.getCloudCompatJobStatus(jobId);
+    const res = await statusRequest.catch((cause: unknown) => {
+      const hard = nonTransientWakeFailure(cause);
+      if (hard) {
+        throw new CloudAgentWakeError({
+          message: wakeFailureMessage(
+            "Provisioning your cloud agent failed",
+            hard.status,
+            hard.retryAfter,
             cause,
-          });
-        }
-        // error-policy:J4 a transient job read counts as an unknown tick
-        // inside this bounded poll; the deadline below throws with the last
-        // status. A Retry-After on that rejection sets the next tick's pace.
-        backoffMs = transientWakeRetryDelayMs(cause);
-        return null;
-      });
+          ),
+          phase: "provision-job",
+          agentId,
+          jobId,
+          lastObservedStatus: lastStatus,
+          ...hard,
+          cause,
+        });
+      }
+      // error-policy:J4 a transient job read counts as an unknown tick
+      // inside this bounded poll; the deadline below throws with the last
+      // status. A Retry-After on that rejection sets the next tick's pace.
+      backoffMs = transientWakeRetryDelayMs(cause);
+      return null;
+    });
+    options.signal?.throwIfAborted();
+    assertCloudSelectionAuthority(options.validateAuthority);
     if (res && !res.success) {
       const failure = envelopeFailure(res);
       throw new CloudAgentWakeError({
@@ -4651,7 +5065,11 @@ export async function waitForCloudProvisionJob(
     const job = res?.data ?? null;
     if (job) {
       lastStatus = job.state || job.status;
-      if (job.status === "completed") return;
+      if (job.status === "completed") {
+        options.signal?.throwIfAborted();
+        assertCloudSelectionAuthority(options.validateAuthority);
+        return;
+      }
       if (job.status === "failed") {
         throw new CloudAgentWakeError({
           message: job.error
@@ -4680,10 +5098,14 @@ export async function waitForCloudProvisionJob(
       "provisioning",
       describeProvisioningWait(lastStatus, elapsedMs),
     );
+    options.signal?.throwIfAborted();
+    assertCloudSelectionAuthority(options.validateAuthority);
     await abortableDelay(
       Math.min(Math.max(pollIntervalMs, backoffMs ?? 0), timeoutMs - elapsedMs),
       options.signal,
     );
+    options.signal?.throwIfAborted();
+    assertCloudSelectionAuthority(options.validateAuthority);
   }
 }
 
@@ -4829,8 +5251,10 @@ function inProgressDedicatedActivationPolicy(
 function throwIfDedicatedStartupDeadlineElapsed(
   deadline: number,
   signal?: AbortSignal,
+  validateAuthority?: () => boolean,
 ): void {
   signal?.throwIfAborted();
+  assertCloudSelectionAuthority(validateAuthority);
   if (Date.now() >= deadline) {
     throw new DOMException("The startup deadline elapsed", "TimeoutError");
   }
@@ -4981,7 +5405,11 @@ async function adoptSelectedPersonalDedicatedEliza(
 ): Promise<string | null> {
   const adoptionUrl = `${upgradeUrl}/adopt-existing`;
   const fetchCurrentQuote = async () => {
-    throwIfDedicatedStartupDeadlineElapsed(deadline, options.signal);
+    throwIfDedicatedStartupDeadlineElapsed(
+      deadline,
+      options.signal,
+      options.validateAuthority,
+    );
     const response = await directCloudJsonResponse<unknown>(adoptionUrl, {
       headers: {
         Accept: "application/json",
@@ -4989,14 +5417,22 @@ async function adoptSelectedPersonalDedicatedEliza(
       },
       ...(options.signal ? { signal: options.signal } : {}),
     });
-    throwIfDedicatedStartupDeadlineElapsed(deadline, options.signal);
+    throwIfDedicatedStartupDeadlineElapsed(
+      deadline,
+      options.signal,
+      options.validateAuthority,
+    );
     return response;
   };
   let quoteResponse = await fetchCurrentQuote();
   let confirmationReason: "initial" | "quote_changed" = "initial";
   let firstTargetId: string | null = null;
   for (;;) {
-    throwIfDedicatedStartupDeadlineElapsed(deadline, options.signal);
+    throwIfDedicatedStartupDeadlineElapsed(
+      deadline,
+      options.signal,
+      options.validateAuthority,
+    );
     const quoteRoot = recordOrNull(quoteResponse.data);
     const responseCode = directCloudErrorMetadata(quoteResponse.data).code;
     if (
@@ -5061,7 +5497,11 @@ async function adoptSelectedPersonalDedicatedEliza(
       reason: confirmationReason,
       ...(options.signal ? { signal: options.signal } : {}),
     });
-    throwIfDedicatedStartupDeadlineElapsed(deadline, options.signal);
+    throwIfDedicatedStartupDeadlineElapsed(
+      deadline,
+      options.signal,
+      options.validateAuthority,
+    );
     if (
       confirmation?.action !== "adopt_existing_dedicated" ||
       confirmation.quoteId !== quote.quoteId
@@ -5088,7 +5528,11 @@ async function adoptSelectedPersonalDedicatedEliza(
         ...(options.signal ? { signal: options.signal } : {}),
       },
     );
-    throwIfDedicatedStartupDeadlineElapsed(deadline, options.signal);
+    throwIfDedicatedStartupDeadlineElapsed(
+      deadline,
+      options.signal,
+      options.validateAuthority,
+    );
     const adoptionRoot = recordOrNull(adoptionResponse.data);
     const adoptionCode = directCloudErrorMetadata(adoptionResponse.data).code;
     if (
@@ -5144,17 +5588,34 @@ async function ensurePersonalDedicatedElizaWithinDeadline(
   options: EnsurePersonalDedicatedElizaOptions,
   deadline: number,
 ): ReturnType<ElizaClient["ensurePersonalDedicatedEliza"]> {
-  throwIfDedicatedStartupDeadlineElapsed(deadline, options.signal);
+  throwIfDedicatedStartupDeadlineElapsed(
+    deadline,
+    options.signal,
+    options.validateAuthority,
+  );
   const personal = await this.getPersonalSharedEliza(options);
-  throwIfDedicatedStartupDeadlineElapsed(deadline, options.signal);
+  throwIfDedicatedStartupDeadlineElapsed(
+    deadline,
+    options.signal,
+    options.validateAuthority,
+  );
   if (personal.runtime === "dedicated") {
     return { ...personal, runtime: "dedicated" as const };
   }
 
   const cloudApiBase = resolveDirectCloudAuthApiBase(options.cloudApiBase);
   const upgradeUrl = `${cloudApiBase}/api/v1/eliza/agents/${encodeURIComponent(personal.personalElizaId)}/upgrade-tier`;
-  throwIfDedicatedStartupDeadlineElapsed(deadline, options.signal);
+  throwIfDedicatedStartupDeadlineElapsed(
+    deadline,
+    options.signal,
+    options.validateAuthority,
+  );
   options.onProgress?.("provisioning", "Starting your Dedicated agent…");
+  throwIfDedicatedStartupDeadlineElapsed(
+    deadline,
+    options.signal,
+    options.validateAuthority,
+  );
 
   const quoteResponse = await directCloudJsonResponse<unknown>(upgradeUrl, {
     headers: {
@@ -5163,7 +5624,11 @@ async function ensurePersonalDedicatedElizaWithinDeadline(
     },
     ...(options.signal ? { signal: options.signal } : {}),
   });
-  throwIfDedicatedStartupDeadlineElapsed(deadline, options.signal);
+  throwIfDedicatedStartupDeadlineElapsed(
+    deadline,
+    options.signal,
+    options.validateAuthority,
+  );
   const quoteRoot = recordOrNull(quoteResponse.data);
   const quote = recordOrNull(quoteRoot?.data);
   const quoteId = firstString(quote?.quoteId);
@@ -5192,7 +5657,11 @@ async function ensurePersonalDedicatedElizaWithinDeadline(
     );
   }
 
-  throwIfDedicatedStartupDeadlineElapsed(deadline, options.signal);
+  throwIfDedicatedStartupDeadlineElapsed(
+    deadline,
+    options.signal,
+    options.validateAuthority,
+  );
   const quoteActivation = recordOrNull(quote?.activation);
   const activationState = firstString(quoteActivation?.state);
   let quotedTargetId: string | null = null;
@@ -5279,7 +5748,11 @@ async function ensurePersonalDedicatedElizaWithinDeadline(
         ...(options.signal ? { signal: options.signal } : {}),
       },
     );
-    throwIfDedicatedStartupDeadlineElapsed(deadline, options.signal);
+    throwIfDedicatedStartupDeadlineElapsed(
+      deadline,
+      options.signal,
+      options.validateAuthority,
+    );
     const activationRoot = recordOrNull(activationResponse.data);
     const activation = recordOrNull(activationRoot?.data);
     let activatedTargetId = firstString(activation?.dedicatedAgentId);
@@ -5344,7 +5817,11 @@ async function ensurePersonalDedicatedElizaWithinDeadline(
 
   const intervalMs = options.pollIntervalMs ?? 5_000;
   for (;;) {
-    throwIfDedicatedStartupDeadlineElapsed(deadline, options.signal);
+    throwIfDedicatedStartupDeadlineElapsed(
+      deadline,
+      options.signal,
+      options.validateAuthority,
+    );
     const remainingMs = deadline - Date.now();
     if (remainingMs <= 0) {
       throw new Error(
@@ -5359,8 +5836,17 @@ async function ensurePersonalDedicatedElizaWithinDeadline(
         authToken: options.authToken,
         signal: options.signal,
       });
-      throwIfDedicatedStartupDeadlineElapsed(deadline, options.signal);
+      throwIfDedicatedStartupDeadlineElapsed(
+        deadline,
+        options.signal,
+        options.validateAuthority,
+      );
       options.onProgress?.("ready", "Connected to your Dedicated agent");
+      throwIfDedicatedStartupDeadlineElapsed(
+        deadline,
+        options.signal,
+        options.validateAuthority,
+      );
       return {
         personalElizaId: personal.personalElizaId,
         agentId: personal.personalElizaId,
@@ -5381,9 +5867,19 @@ async function ensurePersonalDedicatedElizaWithinDeadline(
         "starting",
         "Your Dedicated agent is still starting…",
       );
+      throwIfDedicatedStartupDeadlineElapsed(
+        deadline,
+        options.signal,
+        options.validateAuthority,
+      );
       await abortableDelay(
         Math.min(intervalMs, deadline - Date.now()),
         options.signal,
+      );
+      throwIfDedicatedStartupDeadlineElapsed(
+        deadline,
+        options.signal,
+        options.validateAuthority,
       );
     }
   }
@@ -5410,9 +5906,14 @@ ElizaClient.prototype.ensurePersonalDedicatedEliza = async function (
     // only a proven overall deadline adds the stable startup-deadline context.
     options.signal?.throwIfAborted();
     if (operationDeadline.deadlineElapsed() || Date.now() >= deadline) {
+      const deadlineCause = operationDeadline.deadlineElapsed()
+        ? operationDeadline.signal.reason
+        : error instanceof DOMException && error.name === "TimeoutError"
+          ? error
+          : new DOMException("The startup deadline elapsed", "TimeoutError");
       throw new Error(
         "Dedicated agent did not become ready before the signed-in startup deadline.",
-        { cause: error },
+        { cause: deadlineCause },
       );
     }
     throw error;
@@ -5421,18 +5922,452 @@ ElizaClient.prototype.ensurePersonalDedicatedEliza = async function (
   }
 };
 
+function cloudSelectionSupersededError(): ElizaError {
+  return new ElizaError(
+    "Cloud session selection was superseded by a newer login.",
+    { code: "STEWARD_SESSION_SUPERSEDED" },
+  );
+}
+
+function assertCloudSelectionAuthority(
+  validateAuthority?: () => boolean,
+): void {
+  if (validateAuthority?.() === false) {
+    throw cloudSelectionSupersededError();
+  }
+}
+
+function attachCloudSelectionAuthority<T extends object>(
+  result: T,
+  authority:
+    | (StewardSessionRecoveryCommittedAuthority & {
+        restoreIfCurrent(): Promise<void>;
+        compensateIfSuperseded(): Promise<void>;
+      })
+    | null,
+): T {
+  if (authority) {
+    // Keep wire/snapshot compatibility for callers which serialize a result;
+    // the authority is a live local capability, never response data.
+    Object.defineProperty(result, "authority", {
+      configurable: false,
+      enumerable: false,
+      value: authority,
+      writable: false,
+    });
+  }
+  return result;
+}
+
+function createCloudSelectionResultAuthority(
+  authority:
+    | (StewardSessionRecoveryCommittedAuthority & {
+        restoreIfCurrent(): Promise<void>;
+      })
+    | null,
+  compensateExternal?: () => Promise<void>,
+):
+  | (StewardSessionRecoveryCommittedAuthority & {
+      restoreIfCurrent(): Promise<void>;
+      compensateIfSuperseded(): Promise<void>;
+    })
+  | null {
+  if (!authority) return null;
+  let compensation: Promise<void> | null = null;
+  return {
+    isCurrent: authority.isCurrent,
+    restoreIfCurrent: authority.restoreIfCurrent,
+    compensateIfSuperseded: async () => {
+      if (authority.isCurrent()) return;
+      compensation ??= (async () => {
+        const failures: unknown[] = [];
+        try {
+          await compensateExternal?.();
+        } catch (error) {
+          failures.push(error);
+        }
+        try {
+          await authority.restoreIfCurrent();
+        } catch (error) {
+          failures.push(error);
+        }
+        if (failures.length > 0) {
+          throw new AggregateError(
+            failures,
+            "The stale Cloud selection could not be fully compensated.",
+          );
+        }
+      })();
+      await compensation;
+    },
+  };
+}
+
+const CONDITIONAL_CLOUD_CLEANUP_TIMEOUT_MS = 60_000;
+const CONDITIONAL_CLOUD_CLEANUP_POLL_INTERVAL_MS = 1_000;
+
+async function deleteFreshCloudAgentAndWaitForCompletion(options: {
+  client: ElizaClient;
+  cloudApiBase: string;
+  authToken: string;
+  agentId: string;
+  deleteCondition: CloudAgentDeleteCondition;
+  timeoutMs?: number;
+  pollIntervalMs?: number;
+}): Promise<void> {
+  const exactAuthority: ExactCloudAccountAuthority = {
+    apiBase: options.cloudApiBase,
+    token: options.authToken,
+    // Compensation intentionally survives a later login B. Its immutable
+    // account-A bearer and conditional create identity are the authority.
+    validateAuthority: () => true,
+  };
+  const deleted = await directCloudRequest<{
+    success?: boolean;
+    error?: string;
+    data?: { message?: string; status?: string; jobId?: string };
+  }>(
+    options.client,
+    `/api/v1/eliza/agents/${encodeURIComponent(options.agentId)}`,
+    {
+      method: "DELETE",
+      body: JSON.stringify(options.deleteCondition),
+    },
+    exactAuthority,
+  );
+  if (deleted?.success !== true) {
+    throw new Error(
+      deleted?.error ??
+        "Eliza Cloud did not acknowledge the conditional agent cleanup.",
+    );
+  }
+
+  const jobId = deleted.data?.jobId?.trim() ?? "";
+  if (!jobId) return;
+
+  const deadline =
+    Date.now() + (options.timeoutMs ?? CONDITIONAL_CLOUD_CLEANUP_TIMEOUT_MS);
+  for (;;) {
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `Timed out waiting for conditional cleanup job ${jobId} to complete.`,
+      );
+    }
+    const job = await directCloudRequest<{
+      success?: boolean;
+      error?: string;
+      data?: DirectCloudJob;
+    }>(
+      options.client,
+      `/api/v1/jobs/${encodeURIComponent(jobId)}`,
+      undefined,
+      exactAuthority,
+    );
+    if (job?.success !== true || !job.data) {
+      throw new Error(
+        job?.error ?? "Eliza Cloud could not read the cleanup job.",
+      );
+    }
+    const status = normalizeCloudJobStatus(
+      firstString(
+        job.data.status,
+        job.data.state,
+        job.data.phase,
+        job.data.data?.status,
+        job.data.data?.state,
+        job.data.data?.phase,
+      ),
+    );
+    if (status === "completed") return;
+    if (status === "failed") {
+      throw new Error(
+        errorStringOrNull(job.data.error) ??
+          job.data.message ??
+          job.data.reason ??
+          `Conditional cleanup job ${jobId} failed.`,
+      );
+    }
+    await new Promise((resolve) =>
+      setTimeout(
+        resolve,
+        Math.min(
+          options.pollIntervalMs ?? CONDITIONAL_CLOUD_CLEANUP_POLL_INTERVAL_MS,
+          Math.max(0, deadline - Date.now()),
+        ),
+      ),
+    );
+  }
+}
+
+/**
+ * Conditionally removes one freshly-created agent with the exact account-A
+ * bearer and immutable identity returned by its create response. This narrow
+ * compensation boundary deliberately ignores the client's mutable canonical
+ * token: a newer login may already own it by the time a stale create resolves.
+ * Ambiguous/reused responses are never destructive.
+ */
+export async function compensateFreshCloudCompatAgentCreate(options: {
+  client: ElizaClient;
+  cloudApiBase: string;
+  authToken: string;
+  created: boolean | undefined;
+  agentId: string;
+  agentName: string;
+  createdAt: string | null | undefined;
+  executionTier: string | null | undefined;
+}): Promise<boolean> {
+  const agentId = options.agentId.trim();
+  const agentName = options.agentName.trim();
+  const createdAt = options.createdAt?.trim() || null;
+  const executionTier = parseCloudAgentExecutionTier(
+    options.executionTier?.trim() || null,
+  );
+  if (
+    options.created !== true ||
+    !agentId ||
+    !agentName ||
+    !createdAt ||
+    !executionTier
+  ) {
+    return false;
+  }
+  await deleteFreshCloudAgentAndWaitForCompletion({
+    client: options.client,
+    cloudApiBase: options.cloudApiBase,
+    authToken: options.authToken,
+    agentId,
+    deleteCondition: {
+      expectedAgentName: agentName,
+      expectedCreatedAt: createdAt,
+      expectedExecutionTier: executionTier,
+    },
+  });
+  return true;
+}
+
+/**
+ * Remove a confirmed fresh create after local binding/persistence failed.
+ * Cleanup intentionally keeps the immutable creator credential even when a
+ * newer login owns the renderer; using the mutable singleton here could delete
+ * another account's row or leak a paid account-A agent.
+ */
+export async function cleanupFreshCloudCompatAgentCreate(options: {
+  client: ElizaClient;
+  cloudApiBase: string;
+  authToken: string;
+  agentId: string;
+  cleanupReceipt: CloudAgentCleanupReceipt;
+  /** Test/host tuning; production callers use the bounded defaults. */
+  timeoutMs?: number;
+  pollIntervalMs?: number;
+}): Promise<void> {
+  await deleteFreshCloudAgentAndWaitForCompletion({
+    client: options.client,
+    cloudApiBase: options.cloudApiBase,
+    authToken: options.authToken,
+    agentId: options.agentId,
+    deleteCondition: options.cleanupReceipt.deleteCondition,
+    timeoutMs: options.timeoutMs,
+    pollIntervalMs: options.pollIntervalMs,
+  });
+}
+
+/**
+ * Reads one Cloud agent with the caller's immutable account authority.
+ *
+ * Recovery flows must not borrow the client's mutable canonical token: a
+ * newer login can replace it while an old pending handoff is being resumed.
+ * This helper pins both the trusted Cloud control-plane base and exact bearer,
+ * and fences the read on both sides of the await.
+ */
+export async function getCloudCompatAgentWithExactAuthority(options: {
+  client: ElizaClient;
+  agentId: string;
+  cloudApiBase: string;
+  authToken: string;
+  validateAuthority: () => boolean;
+}): Promise<{
+  success: boolean;
+  data: CloudCompatAgent;
+  error?: string;
+}> {
+  assertCloudSelectionAuthority(options.validateAuthority);
+  const cloudApiBase = resolveConfiguredDirectCloudApiBase(
+    options.cloudApiBase,
+  );
+  if (!cloudApiBase) {
+    throw Object.assign(
+      new Error("Cloud handoff recovery requires a trusted Cloud API base."),
+      { code: "CLOUD_HANDOFF_UNTRUSTED_API_BASE" },
+    );
+  }
+  const direct = await directCloudRequest<{
+    success: boolean;
+    data?: DirectCloudAgent;
+    error?: string;
+  }>(
+    options.client,
+    `/api/v1/eliza/agents/${encodeURIComponent(options.agentId)}`,
+    undefined,
+    { apiBase: cloudApiBase, token: options.authToken },
+  );
+  assertCloudSelectionAuthority(options.validateAuthority);
+  if (!direct) {
+    throw new Error("The trusted Cloud handoff target could not be read.");
+  }
+  return {
+    success: direct.success,
+    data: toCloudCompatAgent(direct.data ?? { id: options.agentId }),
+    ...(direct.error ? { error: direct.error } : {}),
+  };
+}
+
+/**
+ * Creates the explicit Retry target with the caller's immutable account
+ * authority and returns the full conditional-cleanup receipt even when that
+ * authority is superseded while the POST is in flight. The caller can then
+ * compensate the exact fresh resource instead of leaking it.
+ */
+export async function createFreshDedicatedCloudCompatAgentWithExactAuthority(options: {
+  client: ElizaClient;
+  cloudApiBase: string;
+  authToken: string;
+  agentName: string;
+  validateAuthority: () => boolean;
+}): Promise<{
+  success: boolean;
+  created: true;
+  authorityCurrent: boolean;
+  data: {
+    agentId: string;
+    agentName: string;
+    jobId: string;
+    status: string;
+    nodeId: null;
+    message: string;
+    createdAt: string | null;
+    executionTier: CloudAgentExecutionTier | null;
+  };
+}> {
+  assertCloudSelectionAuthority(options.validateAuthority);
+  const cloudApiBase = resolveConfiguredDirectCloudApiBase(
+    options.cloudApiBase,
+  );
+  if (!cloudApiBase) {
+    throw Object.assign(
+      new Error("Cloud handoff recovery requires a trusted Cloud API base."),
+      { code: "CLOUD_HANDOFF_UNTRUSTED_API_BASE" },
+    );
+  }
+  const direct = await directCloudRequest<{
+    success: boolean;
+    created?: boolean;
+    source?: string;
+    data: unknown;
+    error?: string;
+  }>(
+    options.client,
+    "/api/v1/eliza/agents",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        agentName: options.agentName,
+        alwaysOn: true,
+        forceCreate: true,
+      }),
+    },
+    { apiBase: cloudApiBase, token: options.authToken },
+  );
+  if (!direct) {
+    throw new Error("The trusted Cloud handoff target could not be created.");
+  }
+  requireConfirmedFreshCloudAgentCreate(true, direct.created, direct.source);
+  const data = parseDirectCloudAgentCreateData(direct.data, options.agentName);
+  return {
+    success: direct.success,
+    created: true,
+    authorityCurrent: options.validateAuthority(),
+    data: {
+      agentId: data.id,
+      agentName: data.agentName,
+      jobId: data.jobId ?? "",
+      status: data.status,
+      nodeId: null,
+      message: direct.success ? "Agent created" : (direct.error ?? ""),
+      createdAt: data.createdAt,
+      executionTier: data.executionTier,
+    },
+  };
+}
+
+async function compensateFreshCloudAgentCreate(options: {
+  client: ElizaClient;
+  cloudApiBase: string;
+  authToken: string;
+  agentId: string;
+  cleanupReceipt: CloudAgentCleanupReceipt | undefined;
+  reason: unknown;
+}): Promise<never> {
+  const compensationFailure = (
+    errors: unknown[],
+    message: string,
+  ): AggregateError & { code?: unknown } => {
+    const failure: AggregateError & { code?: unknown } = new AggregateError(
+      errors,
+      message,
+    );
+    const reasonCode = (options.reason as { code?: unknown } | null)?.code;
+    if (reasonCode !== undefined) failure.code = reasonCode;
+    return failure;
+  };
+  if (!options.cleanupReceipt) {
+    throw compensationFailure(
+      [options.reason],
+      "The superseded Cloud agent could not be removed because its exact create identity was unavailable.",
+    );
+  }
+  try {
+    await deleteFreshCloudAgentAndWaitForCompletion({
+      client: options.client,
+      cloudApiBase: options.cloudApiBase,
+      authToken: options.authToken,
+      agentId: options.agentId,
+      deleteCondition: options.cleanupReceipt.deleteCondition,
+    });
+  } catch (cleanupError) {
+    throw compensationFailure(
+      [options.reason, cleanupError],
+      "The Cloud login was superseded after agent creation and conditional cleanup failed.",
+    );
+  }
+  throw options.reason;
+}
+
 async function persistCloudSelectionStewardAuthority(
   token: string,
   signal?: AbortSignal,
-): Promise<void> {
+): Promise<
+  | (StewardSessionRecoveryCommittedAuthority & {
+      restoreIfCurrent(): Promise<void>;
+    })
+  | null
+> {
   // Non-renderer callers have no shared browser origin to coordinate. Preserve
   // the established server/test behavior there; every browser/native renderer
   // uses the durable receipt + origin lease below.
   if (typeof window === "undefined") {
     await writeStoredStewardToken(token, { signal });
-    return;
+    return null;
   }
 
+  const tenantId = configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID);
+  const recoverySnapshot = readStewardSessionRecovery(tenantId);
+  if (
+    !recoverySnapshot.storageAvailable ||
+    recoverySnapshot.receipts.length > 0
+  ) {
+    throw cloudSelectionSupersededError();
+  }
   const expectedStoredToken = readStoredStewardToken()?.trim() || null;
   if (expectedStoredToken && expectedStoredToken !== token) {
     throw new ElizaError(
@@ -5440,54 +6375,53 @@ async function persistCloudSelectionStewardAuthority(
       { code: "STEWARD_SESSION_SUPERSEDED" },
     );
   }
-  const recovery = beginStewardSessionRecovery(
-    configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID),
-    "provider",
-  );
-  let writeStarted = false;
-  try {
-    const committed = await enqueueStewardSessionMutation(async () => {
-      signal?.throwIfAborted();
-      if (!isStewardSessionRecoveryReceiptLive(recovery)) return false;
-      if ((readStoredStewardToken()?.trim() || null) !== expectedStoredToken) {
-        return false;
-      }
-      writeStarted = true;
+  const committed = await enqueueStewardSessionMutation(async () => {
+    signal?.throwIfAborted();
+    const recoveryPublication =
+      createStewardSessionRecoverySnapshotPublicationFence(recoverySnapshot);
+    if (!recoveryPublication.validate()) return null;
+    if ((readStoredStewardToken()?.trim() || null) !== expectedStoredToken) {
+      return null;
+    }
+    const writeAuthority: StewardTokenWriteAuthority | null =
       await writeStoredStewardToken(token, {
         signal,
         validate: () => {
           const currentToken = readStoredStewardToken()?.trim() || null;
           return (
-            isStewardSessionRecoveryReceiptLive(recovery) &&
+            recoveryPublication.validate() &&
             (currentToken === expectedStoredToken || currentToken === token)
           );
         },
+        finalizeBeforePublish: recoveryPublication.finalizeBeforePublish,
       });
-      signal?.throwIfAborted();
-      if (
-        !isStewardSessionRecoveryReceiptLive(recovery) ||
-        readStoredStewardToken()?.trim() !== token
-      ) {
-        return false;
-      }
-      completeStewardSessionRecovery(recovery);
-      return true;
-    });
-    if (!committed) {
-      throw new ElizaError(
-        "Cloud session selection was superseded by a newer login.",
-        { code: "STEWARD_SESSION_SUPERSEDED" },
-      );
+    if (
+      !writeAuthority ||
+      !recoveryPublication.isFinalized() ||
+      readStoredStewardToken() !== token
+    ) {
+      await writeAuthority?.restorePredecessor();
+      return null;
     }
-  } catch (error) {
-    // A cancellation/lock failure before protected storage was touched is a
-    // definitive local rejection. Once the write begins, retain the receipt:
-    // secure-store response loss cannot prove which credential became durable.
-    if (!writeStarted && isStewardSessionRecoveryReceiptLive(recovery)) {
-      rejectStewardSessionRecovery(recovery);
+    if (!recoveryPublication.publishChange()) {
+      await writeAuthority.restorePredecessor();
+      return null;
     }
-    throw error;
+    return {
+      isCurrent: () =>
+        isStewardSessionRecoverySnapshotLive(recoverySnapshot) &&
+        recoverySnapshot.receipts.length === 0 &&
+        readStoredStewardToken() === token,
+      restoreIfCurrent: async () => {
+        await writeAuthority.restorePredecessor();
+      },
+    };
+  });
+  if (!committed?.isCurrent()) {
+    await committed?.restoreIfCurrent();
+    throw cloudSelectionSupersededError();
   }
+  return committed;
 }
 
 ElizaClient.prototype.selectOrProvisionCloudAgent = async function (
@@ -5495,6 +6429,7 @@ ElizaClient.prototype.selectOrProvisionCloudAgent = async function (
   options,
 ) {
   options.signal?.throwIfAborted();
+  assertCloudSelectionAuthority(options.validateAuthority);
   const {
     cloudApiBase,
     authToken,
@@ -5508,270 +6443,490 @@ ElizaClient.prototype.selectOrProvisionCloudAgent = async function (
   } = options;
   const onProgress = options.onProgress;
   const resolvedCloudApiBase = resolveDirectCloudAuthApiBase(cloudApiBase);
+  if (
+    options.accountAuthority &&
+    (options.accountAuthority.token !== authToken ||
+      resolveDirectCloudAuthApiBase(options.accountAuthority.apiBase) !==
+        resolvedCloudApiBase)
+  ) {
+    throw new ElizaError(
+      "Cloud management authority does not match the request.",
+      {
+        code: "STEWARD_SESSION_SUPERSEDED",
+      },
+    );
+  }
   let forceCreateForTerminalAgents = false;
   let forceCreatePastSharedAgents = false;
-  // Cold-boot callers pass the Steward session explicitly. Persist it only
-  // before a Cloud agent connection exists: once the app is bound to a
-  // dedicated agent, the caller's fallback may be that agent's bearer, which
-  // must never be relabeled as a control-plane credential.
-  if (authToken && !isDedicatedCloudAgentClient(this)) {
-    await persistCloudSelectionStewardAuthority(authToken, options.signal);
-  }
-
-  // Reuse an existing agent unless the caller explicitly forces a new one. This
-  // is the fix for "a new cloud agent is created on every sign-in" — the create
-  // path only runs when the user has no agent yet.
-  if (!forceCreate) {
-    const list = knownAgents
-      ? { success: true as const, data: knownAgents }
-      : await (async () => {
-          // "listing", not "creating": this is the reuse LOOKUP, and
-          // downstream consumers (the first-run silent cloud entry, #15133)
-          // distinguish real provisioning phases from bookkeeping by this code.
-          // Display consumers render the detail text, so the rename is
-          // invisible to them.
-          onProgress?.("listing", "Finding your agents...");
-          // A failed agent-list lookup must NOT fall through to provisioning. A
-          // transient error (expired token, network blip, or a success:false
-          // body) previously collapsed to an empty list and minted a brand-new
-          // billed agent even though the user already had one — the root of the
-          // "it creates multiple agents" report. Only an authoritative success
-          // list may conclude the user has no agent to reuse; otherwise surface
-          // the error so the caller can retry rather than duplicate.
-          return await this.getCloudCompatAgents().catch((cause: unknown) => ({
-            success: false as const,
-            data: [] as CloudCompatAgent[],
-            error: cause instanceof Error ? cause.message : undefined,
-            cause,
-          }));
-        })();
-    if (!list.success) {
-      // Keep the original rejection on the cause chain: callers (the join
-      // flow's stale-binding recovery) classify the structural agent-gone
-      // shape by status/code via `isCloudAgentGoneError`, which the flattened
-      // message alone cannot carry.
+  // Cold-boot callers pass the Steward session explicitly. Before a Cloud
+  // connection exists, persist that login and retain its publication
+  // authority. Once the app is already bound to a Dedicated agent, capture
+  // the same authority only when the explicit token is still the canonical
+  // Steward token. A Dedicated client may otherwise expose an agent-local
+  // bearer as a fallback; that credential must never be relabeled as account
+  // authority or allowed to drive an account-level create.
+  let cloudSelectionAuthority:
+    | (StewardSessionRecoveryCommittedAuthority & {
+        restoreIfCurrent(): Promise<void>;
+      })
+    | null = null;
+  const dedicatedClient = isDedicatedCloudAgentClient(this);
+  const canonicalStewardToken = readStoredStewardToken()?.trim() || null;
+  if (options.accountAuthority) {
+    assertCloudSelectionAuthority(options.accountAuthority.validateAuthority);
+  } else if (
+    authToken &&
+    (!dedicatedClient || canonicalStewardToken === authToken)
+  ) {
+    cloudSelectionAuthority = await persistCloudSelectionStewardAuthority(
+      authToken,
+      options.signal,
+    );
+  } else if (authToken && dedicatedClient) {
+    if (isDirectCloudAuthMissing(this)) {
+      throw new ElizaError(directCloudAuthMissingMessage(), {
+        code: "STEWARD_SESSION_SUPERSEDED",
+      });
+    }
+    if (forceCreate) {
       throw new Error(
-        list.error ||
-          "Couldn't reach Eliza Cloud to find your agents. Check your connection and try again.",
-        { cause: "cause" in list ? list.cause : undefined },
+        "Creating a distinct Cloud agent requires a signed-in direct Eliza Cloud session.",
       );
     }
-    // Dedicated mode must not bind a temporary shared bridge as if it were a
-    // dedicated sandbox. The Cloud API exposes the authoritative tier; carry
-    // it through the compat model instead of guessing from URL presence. A
-    // shared-only organization needs forceCreate below so the backend reuse
-    // guard cannot hand the same bridge back to an always-on create request.
-    const eligibleAgents = preferSharedTier
-      ? list.data
-      : list.data.filter((agent) => agent.execution_tier !== "shared");
-    forceCreatePastSharedAgents =
-      !preferSharedTier &&
-      list.data.some((agent) => agent.execution_tier === "shared");
-    const chosen = pickPreferredCloudAgent(eligibleAgents, preferAgentId);
-    forceCreateForTerminalAgents =
-      eligibleAgents.length > 0 &&
-      !chosen &&
-      eligibleAgents.every(isTerminalFailedCloudAgent);
-    if (chosen) {
-      let agent = chosen;
-      // A picked agent that is not `running` is a dedicated cold boot: shared
-      // rows are BORN `running` (they are container-free, served instantly by
-      // the in-Worker runtime), so a non-running pick always has a container
-      // to wake (~5 minutes — #8621). Binding its list-row base immediately
-      // would exhaust the ~60 s 202-retry budget on the first chat call AND
-      // risks a stale pointer (the list row's URLs predate the wake) — so wait
-      // for `running` here; `waitForCloudAgentRunning` kicks a resume and
-      // resolves with the FRESH post-wake record, whose URLs we bind below.
-      if (agent.status !== "running") {
-        agent = await waitForCloudAgentRunning(this, {
-          agentId: chosen.agent_id,
+    throw new ElizaError(
+      "A current Steward session is required to manage Cloud agents.",
+      { code: "STEWARD_SESSION_SUPERSEDED" },
+    );
+  }
+  const selectionAuthorityIsCurrent = () =>
+    (options.validateAuthority?.() ?? true) &&
+    (options.accountAuthority?.validateAuthority() ?? true) &&
+    (cloudSelectionAuthority?.isCurrent() ?? true);
+  const exactCloudAuthority: ExactCloudAccountAuthority =
+    options.accountAuthority
+      ? {
+          ...options.accountAuthority,
+          validateAuthority: selectionAuthorityIsCurrent,
+        }
+      : {
+          apiBase: resolvedCloudApiBase,
+          token: authToken,
+          validateAuthority: selectionAuthorityIsCurrent,
+        };
+  const resultAuthorityBase =
+    cloudSelectionAuthority ??
+    (options.accountAuthority
+      ? {
+          isCurrent: selectionAuthorityIsCurrent,
+          restoreIfCurrent: async () => {},
+        }
+      : null);
+  const canCompensateAcceptedCreate = resultAuthorityBase !== null;
+  try {
+    assertCloudSelectionAuthority(selectionAuthorityIsCurrent);
+
+    // Reuse an existing agent unless the caller explicitly forces a new one. This
+    // is the fix for "a new cloud agent is created on every sign-in" — the create
+    // path only runs when the user has no agent yet.
+    if (!forceCreate) {
+      assertCloudSelectionAuthority(selectionAuthorityIsCurrent);
+      const list = knownAgents
+        ? { success: true as const, data: knownAgents }
+        : await (async () => {
+            // "listing", not "creating": this is the reuse LOOKUP, and
+            // downstream consumers (the first-run silent cloud entry, #15133)
+            // distinguish real provisioning phases from bookkeeping by this code.
+            // Display consumers render the detail text, so the rename is
+            // invisible to them.
+            assertCloudSelectionAuthority(selectionAuthorityIsCurrent);
+            onProgress?.("listing", "Finding your agents...");
+            assertCloudSelectionAuthority(selectionAuthorityIsCurrent);
+            // A failed agent-list lookup must NOT fall through to provisioning. A
+            // transient error (expired token, network blip, or a success:false
+            // body) previously collapsed to an empty list and minted a brand-new
+            // billed agent even though the user already had one — the root of the
+            // "it creates multiple agents" report. Only an authoritative success
+            // list may conclude the user has no agent to reuse; otherwise surface
+            // the error so the caller can retry rather than duplicate.
+            return await this.getCloudCompatAgents(exactCloudAuthority).catch(
+              (cause: unknown) => ({
+                success: false as const,
+                data: [] as CloudCompatAgent[],
+                error: cause instanceof Error ? cause.message : undefined,
+                cause,
+              }),
+            );
+          })();
+      assertCloudSelectionAuthority(selectionAuthorityIsCurrent);
+      if (!list.success) {
+        // Keep the original rejection on the cause chain: callers (the join
+        // flow's stale-binding recovery) classify the structural agent-gone
+        // shape by status/code via `isCloudAgentGoneError`, which the flattened
+        // message alone cannot carry.
+        throw new Error(
+          list.error ||
+            "Couldn't reach Eliza Cloud to find your agents. Check your connection and try again.",
+          { cause: "cause" in list ? list.cause : undefined },
+        );
+      }
+      // Dedicated mode must not bind a temporary shared bridge as if it were a
+      // dedicated sandbox. The Cloud API exposes the authoritative tier; carry
+      // it through the compat model instead of guessing from URL presence. A
+      // shared-only organization needs forceCreate below so the backend reuse
+      // guard cannot hand the same bridge back to an always-on create request.
+      const eligibleAgents = preferSharedTier
+        ? list.data
+        : list.data.filter((agent) => agent.execution_tier !== "shared");
+      forceCreatePastSharedAgents =
+        !preferSharedTier &&
+        list.data.some((agent) => agent.execution_tier === "shared");
+      const chosen = pickPreferredCloudAgent(eligibleAgents, preferAgentId);
+      forceCreateForTerminalAgents =
+        eligibleAgents.length > 0 &&
+        !chosen &&
+        eligibleAgents.every(isTerminalFailedCloudAgent);
+      if (chosen) {
+        let agent = chosen;
+        // A picked agent that is not `running` is a dedicated cold boot: shared
+        // rows are BORN `running` (they are container-free, served instantly by
+        // the in-Worker runtime), so a non-running pick always has a container
+        // to wake (~5 minutes — #8621). Binding its list-row base immediately
+        // would exhaust the ~60 s 202-retry budget on the first chat call AND
+        // risks a stale pointer (the list row's URLs predate the wake) — so wait
+        // for `running` here; `waitForCloudAgentRunning` kicks a resume and
+        // resolves with the FRESH post-wake record, whose URLs we bind below.
+        if (agent.status !== "running") {
+          assertCloudSelectionAuthority(selectionAuthorityIsCurrent);
+          agent = await waitForCloudAgentRunning(this, {
+            agentId: chosen.agent_id,
+            ...(typeof options.wakePollIntervalMs === "number"
+              ? { pollIntervalMs: options.wakePollIntervalMs }
+              : {}),
+            ...(typeof options.wakeTimeoutMs === "number"
+              ? { timeoutMs: options.wakeTimeoutMs }
+              : {}),
+            ...(onProgress ? { onProgress } : {}),
+            ...(options.signal ? { signal: options.signal } : {}),
+            validateAuthority: selectionAuthorityIsCurrent,
+            authority: exactCloudAuthority,
+          });
+          assertCloudSelectionAuthority(selectionAuthorityIsCurrent);
+        }
+        const hasDedicatedBase = Boolean(
+          agent.bridge_url || agent.web_ui_url || agent.webUiUrl,
+        );
+        const useSharedAdapter = Boolean(
+          agent.execution_tier === "shared" ||
+            (!hasDedicatedBase &&
+              (preferSharedTier || preferStewardAgentAdapter)),
+        );
+        const apiBase = useSharedAdapter
+          ? buildCloudSharedAgentApiBase(resolvedCloudApiBase, agent.agent_id)
+          : resolveDedicatedCloudAgentApiBase({
+              bridgeUrl: agent.bridge_url,
+              webUiUrl: agent.web_ui_url ?? agent.webUiUrl,
+              agentId: agent.agent_id,
+              cloudApiBase: resolvedCloudApiBase,
+            });
+        onProgress?.("ready", "Connected to your agent");
+        assertCloudSelectionAuthority(selectionAuthorityIsCurrent);
+        return attachCloudSelectionAuthority(
+          {
+            agentId: agent.agent_id,
+            agentName: agent.agent_name,
+            apiBase,
+            bridgeUrl: agent.bridge_url,
+            created: false,
+            requiresAgentPairing: false,
+            executionTier: agent.execution_tier ?? null,
+          },
+          createCloudSelectionResultAuthority(resultAuthorityBase),
+        );
+      }
+    }
+
+    // Create a NEW agent. createCloudCompatAgent provisions a DEDICATED (alwaysOn)
+    // agent — the billed container product served at its own public subdomain
+    // (https://<id>.cloud.eliza.app), reached with the cloud token via the
+    // unified-auth Worker. A dedicated agent's reachable base is that subdomain,
+    // NOT the shared REST adapter (which 404s for non-shared agents), so resolve
+    // the base from the agent's web_ui_url exactly like the reuse branch above.
+    // The subdomain is returned as soon as the agent record exists (before the
+    // container finishes booting), so re-read the created agent to pick it up;
+    // if that lookup fails or has no URL yet, fall back to the standard dedicated
+    // subdomain for the known agent id.
+    assertCloudSelectionAuthority(selectionAuthorityIsCurrent);
+    onProgress?.("creating", `Creating ${name}...`);
+    assertCloudSelectionAuthority(selectionAuthorityIsCurrent);
+    const mustForceCreate =
+      forceCreate ||
+      forceCreatePastSharedAgents ||
+      (forceCreateForTerminalAgents && !preferSharedTier);
+    const created = await this.createCloudCompatAgent({
+      agentName: name,
+      ...(bio?.length ? { agentConfig: { bio } } : {}),
+      ...(mustForceCreate ? { forceCreate: true } : {}),
+      ...(preferSharedTier ? { preferSharedTier: true } : {}),
+      validateAuthority: selectionAuthorityIsCurrent,
+      authority: exactCloudAuthority,
+    });
+    if (!created.success || !created.data.agentId) {
+      throw new Error(created.data.message || "Failed to create cloud agent");
+    }
+    requireConfirmedFreshCloudAgentCreate(mustForceCreate, created.created);
+    const agentId = created.data.agentId;
+    const cleanupReceipt =
+      created.created === true &&
+      created.data.createdAt &&
+      created.data.executionTier
+        ? {
+            deleteCondition: {
+              expectedAgentName: created.data.agentName || name,
+              expectedCreatedAt: created.data.createdAt,
+              expectedExecutionTier: created.data.executionTier,
+            },
+          }
+        : undefined;
+    const cancellationReceipt = () =>
+      attachCloudSelectionAuthority(
+        {
+          agentId,
+          agentName: created.data.agentName || name,
+          apiBase: buildCloudSharedAgentApiBase(resolvedCloudApiBase, agentId),
+          bridgeUrl: null,
+          created: created.created !== false,
+          requiresAgentPairing: false,
+          executionTier: preferSharedTier ? ("shared" as const) : null,
+          ...(cleanupReceipt ? { cleanupReceipt } : {}),
+        },
+        createCloudSelectionResultAuthority(resultAuthorityBase),
+      );
+    const compensateAcceptedCreate = (reason: unknown): Promise<never> =>
+      created.created === true
+        ? compensateFreshCloudAgentCreate({
+            client: this,
+            cloudApiBase: resolvedCloudApiBase,
+            authToken,
+            agentId,
+            cleanupReceipt,
+            reason,
+          })
+        : Promise.reject(reason);
+    if (!selectionAuthorityIsCurrent()) {
+      if (!canCompensateAcceptedCreate) return cancellationReceipt();
+      return await compensateAcceptedCreate(cloudSelectionSupersededError());
+    }
+    // Once create is accepted, callers need the authoritative id even if the
+    // remaining wait is cancelled so they can compensate the external mutation.
+    if (options.signal?.aborted) {
+      if (!canCompensateAcceptedCreate) return cancellationReceipt();
+      return await compensateAcceptedCreate(
+        options.signal.reason ?? new DOMException("Cancelled", "AbortError"),
+      );
+    }
+    // The provisioning-job wait and the running wait below are two halves of ONE
+    // join, so they share ONE budget. Giving each the full wake timeout let a job
+    // that finished at 5:59 hand a fresh six minutes to the status poll — the
+    // twelve-minute spinner of #18463. Each wait gets whatever is left.
+    const wakeBudgetMs =
+      typeof options.wakeTimeoutMs === "number"
+        ? options.wakeTimeoutMs
+        : CLOUD_AGENT_WAKE_TIMEOUT_MS;
+    const wakeDeadlineAt = Date.now() + wakeBudgetMs;
+    const remainingWakeMs = () => Math.max(0, wakeDeadlineAt - Date.now());
+    // A 202 async create names its canonical provisioning job. Follow THAT job
+    // to terminal — its row carries the real failure reason long before the
+    // agent-detail poll below would time out — instead of discarding the id.
+    if (created.data.jobId) {
+      try {
+        await waitForCloudProvisionJob(this, {
+          agentId,
+          jobId: created.data.jobId,
           ...(typeof options.wakePollIntervalMs === "number"
             ? { pollIntervalMs: options.wakePollIntervalMs }
             : {}),
-          ...(typeof options.wakeTimeoutMs === "number"
-            ? { timeoutMs: options.wakeTimeoutMs }
-            : {}),
+          timeoutMs: remainingWakeMs(),
           ...(onProgress ? { onProgress } : {}),
           ...(options.signal ? { signal: options.signal } : {}),
+          validateAuthority: selectionAuthorityIsCurrent,
+          authority: exactCloudAuthority,
         });
-      }
-      const hasDedicatedBase = Boolean(
-        agent.bridge_url || agent.web_ui_url || agent.webUiUrl,
-      );
-      const useSharedAdapter = Boolean(
-        agent.execution_tier === "shared" ||
-          (!hasDedicatedBase &&
-            (preferSharedTier || preferStewardAgentAdapter)),
-      );
-      const apiBase = useSharedAdapter
-        ? buildCloudSharedAgentApiBase(resolvedCloudApiBase, agent.agent_id)
-        : resolveDedicatedCloudAgentApiBase({
-            bridgeUrl: agent.bridge_url,
-            webUiUrl: agent.web_ui_url ?? agent.webUiUrl,
-            agentId: agent.agent_id,
-            cloudApiBase: resolvedCloudApiBase,
-          });
-      onProgress?.("ready", "Connected to your agent");
-      return {
-        agentId: agent.agent_id,
-        agentName: agent.agent_name,
-        apiBase,
-        bridgeUrl: agent.bridge_url,
-        created: false,
-        requiresAgentPairing: false,
-        executionTier: agent.execution_tier ?? null,
-      };
-    }
-  }
-
-  // Create a NEW agent. createCloudCompatAgent provisions a DEDICATED (alwaysOn)
-  // agent — the billed container product served at its own public subdomain
-  // (https://<id>.cloud.eliza.app), reached with the cloud token via the
-  // unified-auth Worker. A dedicated agent's reachable base is that subdomain,
-  // NOT the shared REST adapter (which 404s for non-shared agents), so resolve
-  // the base from the agent's web_ui_url exactly like the reuse branch above.
-  // The subdomain is returned as soon as the agent record exists (before the
-  // container finishes booting), so re-read the created agent to pick it up;
-  // if that lookup fails or has no URL yet, fall back to the standard dedicated
-  // subdomain for the known agent id.
-  onProgress?.("creating", `Creating ${name}...`);
-  const mustForceCreate =
-    forceCreate ||
-    forceCreatePastSharedAgents ||
-    (forceCreateForTerminalAgents && !preferSharedTier);
-  const created = await this.createCloudCompatAgent({
-    agentName: name,
-    ...(bio?.length ? { agentConfig: { bio } } : {}),
-    ...(mustForceCreate ? { forceCreate: true } : {}),
-    ...(preferSharedTier ? { preferSharedTier: true } : {}),
-  });
-  if (!created.success || !created.data.agentId) {
-    throw new Error(created.data.message || "Failed to create cloud agent");
-  }
-  requireConfirmedFreshCloudAgentCreate(mustForceCreate, created.created);
-  const agentId = created.data.agentId;
-  const cleanupReceipt =
-    created.data.createdAt && created.data.executionTier
-      ? {
-          deleteCondition: {
-            expectedAgentName: created.data.agentName || name,
-            expectedCreatedAt: created.data.createdAt,
-            expectedExecutionTier: created.data.executionTier,
-          },
+      } catch (error) {
+        if (!selectionAuthorityIsCurrent()) {
+          if (!canCompensateAcceptedCreate) return cancellationReceipt();
+          return await compensateAcceptedCreate(
+            cloudSelectionSupersededError(),
+          );
         }
-      : undefined;
-  const cancellationReceipt = () => ({
-    agentId,
-    agentName: created.data.agentName || name,
-    apiBase: buildCloudSharedAgentApiBase(resolvedCloudApiBase, agentId),
-    bridgeUrl: null,
-    created: created.created !== false,
-    requiresAgentPairing: false,
-    executionTier: preferSharedTier ? ("shared" as const) : null,
-    ...(cleanupReceipt ? { cleanupReceipt } : {}),
-  });
-  // Once create is accepted, callers need the authoritative id even if the
-  // remaining wait is cancelled so they can compensate the external mutation.
-  if (options.signal?.aborted) return cancellationReceipt();
-  // The provisioning-job wait and the running wait below are two halves of ONE
-  // join, so they share ONE budget. Giving each the full wake timeout let a job
-  // that finished at 5:59 hand a fresh six minutes to the status poll — the
-  // twelve-minute spinner of #18463. Each wait gets whatever is left.
-  const wakeBudgetMs =
-    typeof options.wakeTimeoutMs === "number"
-      ? options.wakeTimeoutMs
-      : CLOUD_AGENT_WAKE_TIMEOUT_MS;
-  const wakeDeadlineAt = Date.now() + wakeBudgetMs;
-  const remainingWakeMs = () => Math.max(0, wakeDeadlineAt - Date.now());
-  // A 202 async create names its canonical provisioning job. Follow THAT job
-  // to terminal — its row carries the real failure reason long before the
-  // agent-detail poll below would time out — instead of discarding the id.
-  if (created.data.jobId) {
-    try {
-      await waitForCloudProvisionJob(this, {
-        agentId,
-        jobId: created.data.jobId,
-        ...(typeof options.wakePollIntervalMs === "number"
-          ? { pollIntervalMs: options.wakePollIntervalMs }
-          : {}),
-        timeoutMs: remainingWakeMs(),
-        ...(onProgress ? { onProgress } : {}),
-        ...(options.signal ? { signal: options.signal } : {}),
-      });
-    } catch (error) {
-      if (options.signal?.aborted && error === options.signal.reason) {
-        return cancellationReceipt();
+        if (options.signal?.aborted) {
+          if (!canCompensateAcceptedCreate) return cancellationReceipt();
+          return await compensateAcceptedCreate(options.signal.reason ?? error);
+        }
+        throw error;
       }
-      throw error;
-    }
-  }
-  // error-policy:J4 detail is an optimization probe (warm-pool fast path);
-  // on failure the standard dedicated subdomain is still the desired default.
-  const detail = await this.getCloudCompatAgent(agentId).catch(() => null);
-  let detailAgent = detail?.success ? detail.data : null;
-  const detailHasDedicatedBase = Boolean(
-    detailAgent?.bridge_url || detailAgent?.web_ui_url || detailAgent?.webUiUrl,
-  );
-  const useSharedAdapter = Boolean(
-    detailAgent?.execution_tier === "shared" ||
-      (!detailHasDedicatedBase &&
-        (preferSharedTier || preferStewardAgentAdapter)),
-  );
-  // A freshly-created dedicated agent's subdomain is populated immediately, but
-  // its container takes ~30-120s to boot. When the caller wants a dedicated
-  // runtime, wait here so the first chat request does not land on the shared
-  // adapter for a non-shared agent or race the container cold boot.
-  const initialDedicatedApiBase = resolveDedicatedCloudAgentApiBase({
-    bridgeUrl: detailAgent?.bridge_url ?? null,
-    webUiUrl: detailAgent?.web_ui_url ?? detailAgent?.webUiUrl,
-    agentId,
-    cloudApiBase: resolvedCloudApiBase,
-  });
-  if (
-    !useSharedAdapter &&
-    detailAgent &&
-    detailAgent.status !== "running" &&
-    isDedicatedCloudAgentBase(initialDedicatedApiBase)
-  ) {
-    try {
-      detailAgent = await waitForCloudAgentRunning(this, {
-        agentId,
-        ...(typeof options.wakePollIntervalMs === "number"
-          ? { pollIntervalMs: options.wakePollIntervalMs }
-          : {}),
-        timeoutMs: remainingWakeMs(),
-        ...(onProgress ? { onProgress } : {}),
-        ...(options.signal ? { signal: options.signal } : {}),
-      });
-    } catch (error) {
-      if (options.signal?.aborted && error === options.signal.reason) {
-        return cancellationReceipt();
+      if (options.signal?.aborted) {
+        if (!canCompensateAcceptedCreate) return cancellationReceipt();
+        return await compensateAcceptedCreate(
+          options.signal.reason ?? new DOMException("Cancelled", "AbortError"),
+        );
       }
-      throw error;
+      if (!selectionAuthorityIsCurrent()) {
+        if (!canCompensateAcceptedCreate) return cancellationReceipt();
+        return await compensateAcceptedCreate(cloudSelectionSupersededError());
+      }
     }
-  }
-  const apiBase = useSharedAdapter
-    ? buildCloudSharedAgentApiBase(resolvedCloudApiBase, agentId)
-    : resolveDedicatedCloudAgentApiBase({
+    // error-policy:J4 detail is an optimization probe (warm-pool fast path);
+    // on failure the standard dedicated subdomain is still the desired default.
+    if (!selectionAuthorityIsCurrent()) {
+      if (!canCompensateAcceptedCreate) return cancellationReceipt();
+      return await compensateAcceptedCreate(cloudSelectionSupersededError());
+    }
+    const detail = await this.getCloudCompatAgent(
+      agentId,
+      exactCloudAuthority,
+    ).catch(() => null);
+    if (options.signal?.aborted) {
+      if (!canCompensateAcceptedCreate) return cancellationReceipt();
+      return await compensateAcceptedCreate(
+        options.signal.reason ?? new DOMException("Cancelled", "AbortError"),
+      );
+    }
+    if (!selectionAuthorityIsCurrent()) {
+      if (!canCompensateAcceptedCreate) return cancellationReceipt();
+      return await compensateAcceptedCreate(cloudSelectionSupersededError());
+    }
+    let detailAgent = detail?.success ? detail.data : null;
+    const detailHasDedicatedBase = Boolean(
+      detailAgent?.bridge_url ||
+        detailAgent?.web_ui_url ||
+        detailAgent?.webUiUrl,
+    );
+    const useSharedAdapter = Boolean(
+      detailAgent?.execution_tier === "shared" ||
+        (!detailHasDedicatedBase &&
+          (preferSharedTier || preferStewardAgentAdapter)),
+    );
+    // A freshly-created dedicated agent's subdomain is populated immediately, but
+    // its container takes ~30-120s to boot. When the caller wants a dedicated
+    // runtime, wait here so the first chat request does not land on the shared
+    // adapter for a non-shared agent or race the container cold boot.
+    const initialDedicatedApiBase = resolveDedicatedCloudAgentApiBase({
+      bridgeUrl: detailAgent?.bridge_url ?? null,
+      webUiUrl: detailAgent?.web_ui_url ?? detailAgent?.webUiUrl,
+      agentId,
+      cloudApiBase: resolvedCloudApiBase,
+    });
+    if (
+      !useSharedAdapter &&
+      detailAgent &&
+      detailAgent.status !== "running" &&
+      isDedicatedCloudAgentBase(initialDedicatedApiBase)
+    ) {
+      try {
+        detailAgent = await waitForCloudAgentRunning(this, {
+          agentId,
+          ...(typeof options.wakePollIntervalMs === "number"
+            ? { pollIntervalMs: options.wakePollIntervalMs }
+            : {}),
+          timeoutMs: remainingWakeMs(),
+          ...(onProgress ? { onProgress } : {}),
+          ...(options.signal ? { signal: options.signal } : {}),
+          validateAuthority: selectionAuthorityIsCurrent,
+          authority: exactCloudAuthority,
+        });
+      } catch (error) {
+        if (!selectionAuthorityIsCurrent()) {
+          if (!canCompensateAcceptedCreate) return cancellationReceipt();
+          return await compensateAcceptedCreate(
+            cloudSelectionSupersededError(),
+          );
+        }
+        if (options.signal?.aborted) {
+          if (!canCompensateAcceptedCreate) return cancellationReceipt();
+          return await compensateAcceptedCreate(options.signal.reason ?? error);
+        }
+        throw error;
+      }
+      if (options.signal?.aborted) {
+        if (!canCompensateAcceptedCreate) return cancellationReceipt();
+        return await compensateAcceptedCreate(
+          options.signal.reason ?? new DOMException("Cancelled", "AbortError"),
+        );
+      }
+      if (!selectionAuthorityIsCurrent()) {
+        if (!canCompensateAcceptedCreate) return cancellationReceipt();
+        return await compensateAcceptedCreate(cloudSelectionSupersededError());
+      }
+    }
+    const apiBase = useSharedAdapter
+      ? buildCloudSharedAgentApiBase(resolvedCloudApiBase, agentId)
+      : resolveDedicatedCloudAgentApiBase({
+          bridgeUrl: detailAgent?.bridge_url ?? null,
+          webUiUrl: detailAgent?.web_ui_url ?? detailAgent?.webUiUrl,
+          agentId,
+          cloudApiBase: resolvedCloudApiBase,
+        });
+    onProgress?.("ready", "Cloud agent ready!");
+    if (options.signal?.aborted) {
+      if (!canCompensateAcceptedCreate) return cancellationReceipt();
+      return await compensateAcceptedCreate(
+        options.signal.reason ?? new DOMException("Cancelled", "AbortError"),
+      );
+    }
+    if (!selectionAuthorityIsCurrent()) {
+      if (!canCompensateAcceptedCreate) return cancellationReceipt();
+      return await compensateAcceptedCreate(cloudSelectionSupersededError());
+    }
+    const postReturnCompensation =
+      created.created === true && resultAuthorityBase
+        ? async () => {
+            const superseded = cloudSelectionSupersededError();
+            try {
+              await compensateFreshCloudAgentCreate({
+                client: this,
+                cloudApiBase: resolvedCloudApiBase,
+                authToken,
+                agentId,
+                cleanupReceipt,
+                reason: superseded,
+              });
+            } catch (error) {
+              if (error !== superseded) throw error;
+            }
+          }
+        : undefined;
+    return attachCloudSelectionAuthority(
+      {
+        agentId,
+        agentName: created.data.agentName || name,
+        apiBase,
         bridgeUrl: detailAgent?.bridge_url ?? null,
-        webUiUrl: detailAgent?.web_ui_url ?? detailAgent?.webUiUrl,
-        agentId,
-        cloudApiBase: resolvedCloudApiBase,
-      });
-  onProgress?.("ready", "Cloud agent ready!");
-  return {
-    agentId,
-    agentName: created.data.agentName || name,
-    apiBase,
-    bridgeUrl: detailAgent?.bridge_url ?? null,
-    // Preserve compatibility for non-forced callers. A force-create response
-    // must explicitly confirm `created: true` above because a "Create new"
-    // action may never bind an existing or ambiguous agent response.
-    created: created.created !== false,
-    requiresAgentPairing: false,
-    executionTier: detailAgent?.execution_tier ?? null,
-    ...(cleanupReceipt ? { cleanupReceipt } : {}),
-  };
+        // Preserve compatibility for non-forced callers. A force-create response
+        // must explicitly confirm `created: true` above because a "Create new"
+        // action may never bind an existing or ambiguous agent response.
+        created: created.created !== false,
+        requiresAgentPairing: false,
+        executionTier: detailAgent?.execution_tier ?? null,
+        ...(cleanupReceipt ? { cleanupReceipt } : {}),
+      },
+      createCloudSelectionResultAuthority(
+        resultAuthorityBase,
+        postReturnCompensation,
+      ),
+    );
+  } catch (error) {
+    if ((error as { code?: unknown })?.code === "STEWARD_SESSION_SUPERSEDED") {
+      try {
+        await cloudSelectionAuthority?.restoreIfCurrent();
+      } catch (rollbackError) {
+        throw new AggregateError(
+          [error, rollbackError],
+          "The superseded Cloud selection and its local authority rollback both failed.",
+        );
+      }
+    }
+    throw error;
+  }
 };
 
 ElizaClient.prototype.startCloudAgentHandoff = function (
@@ -5786,10 +6941,12 @@ ElizaClient.prototype.startCloudAgentHandoff = function (
     authToken,
     dedicatedAgentId,
     onSwitch,
+    validateAuthority,
     intervalMs,
     timeoutMs,
     log,
   } = options;
+  assertCloudSelectionAuthority(validateAuthority);
   const resolvedCloudApiBase = resolveDirectCloudAuthApiBase(cloudApiBase);
   // Migration TARGET. With the shared tier, the user chats on `agentId` (a
   // container-free shared agent that never gets a dedicated base), so the
@@ -5801,6 +6958,7 @@ ElizaClient.prototype.startCloudAgentHandoff = function (
   // dedicated container subdomain). Both accept the cloud session token —
   // the dedicated-agent proxy swaps it for the container's own token.
   const authedFetch: AuthedAgentFetch = async (base, path, init) => {
+    assertCloudSelectionAuthority(validateAuthority);
     const res = await directCloudFetch(`${base}${path}`, {
       method: init?.method ?? "GET",
       headers: {
@@ -5817,6 +6975,7 @@ ElizaClient.prototype.startCloudAgentHandoff = function (
     } catch {
       json = null;
     }
+    assertCloudSelectionAuthority(validateAuthority);
     return { status: res.status, json };
   };
 
@@ -5831,7 +6990,12 @@ ElizaClient.prototype.startCloudAgentHandoff = function (
       const detail = await authedFetch(
         resolvedCloudApiBase,
         `/api/v1/eliza/agents/${encodeURIComponent(readinessAgentId)}`,
-      ).catch(() => null);
+      ).catch(() => {
+        // Network/legacy-envelope failures may use the exact-authority proxy
+        // fallback below. A superseding login is not a compatibility failure.
+        assertCloudSelectionAuthority(validateAuthority);
+        return null;
+      });
       const detailBody = detail?.json as {
         success?: boolean;
         data?: DirectCloudAgent;
@@ -5841,12 +7005,25 @@ ElizaClient.prototype.startCloudAgentHandoff = function (
           ? toCloudCompatAgent(detailBody.data)
           : null;
       // Compatibility fallback for older app proxies and injected clients that
-      // do not implement the canonical direct detail envelope.
+      // do not implement the canonical direct detail envelope. Keep the same
+      // immutable base + bearer; never borrow the client's mutable B session.
       if (!agent) {
-        const compatDetail = await this.getCloudCompatAgent(
-          readinessAgentId,
-        ).catch(() => null);
-        agent = compatDetail?.success ? compatDetail.data : null;
+        assertCloudSelectionAuthority(validateAuthority);
+        const compatDetail = await authedFetch(
+          resolvedCloudApiBase,
+          `/api/cloud/compat/agents/${encodeURIComponent(readinessAgentId)}`,
+        ).catch(() => {
+          assertCloudSelectionAuthority(validateAuthority);
+          return null;
+        });
+        const compatBody = compatDetail?.json as {
+          success?: boolean;
+          data?: CloudCompatAgent;
+        } | null;
+        agent =
+          compatDetail?.status === 200 && compatBody?.success && compatBody.data
+            ? compatBody.data
+            : null;
       }
       if (!agent) return null;
       // The container is "ready" only once the record exposes a dedicated base
@@ -5893,6 +7070,7 @@ ElizaClient.prototype.startCloudAgentHandoff = function (
     readiness,
     authedFetch,
     onSwitch,
+    validateAuthority,
     ...(typeof intervalMs === "number" ? { intervalMs } : {}),
     ...(typeof timeoutMs === "number" ? { timeoutMs } : {}),
     ...(log ? { log } : {}),

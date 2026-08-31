@@ -8,11 +8,9 @@
  * card; this hook is the resting / recovery gate after that card is closed.
  */
 
-import {
-  STEWARD_SESSION_CHANGE_EVENT,
-  STEWARD_TOKEN_KEY,
-} from "@elizaos/shared/steward-session-client";
+import { STEWARD_SESSION_CHANGE_EVENT } from "@elizaos/shared/steward-session-client";
 import { useSyncExternalStore } from "react";
+import { STEWARD_SESSION_RECOVERY_CHANGE_EVENT } from "../../cloud/lib/steward-session-recovery-marker";
 import { useBranding } from "../../config/branding";
 import { useAuthStatus } from "../../hooks/useAuthStatus";
 import { hasUsableStoredStewardToken } from "../../state/cloud-steward-login";
@@ -22,13 +20,24 @@ function subscribeToStoredCloudSession(onStoreChange: () => void): () => void {
   if (typeof window === "undefined") return () => undefined;
 
   const onSessionChange = () => onStoreChange();
-  const onStorage = (event: StorageEvent) => {
-    if (event.key === STEWARD_TOKEN_KEY) onStoreChange();
+  const onStorage = (_event: StorageEvent) => {
+    // Recovery marker prefixes are deliberately private to their authority
+    // module. Re-read on any cross-tab storage mutation so planting login B
+    // immediately quarantines a still-readable token A in this shell.
+    onStoreChange();
   };
   window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, onSessionChange);
+  window.addEventListener(
+    STEWARD_SESSION_RECOVERY_CHANGE_EVENT,
+    onSessionChange,
+  );
   window.addEventListener("storage", onStorage);
   return () => {
     window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, onSessionChange);
+    window.removeEventListener(
+      STEWARD_SESSION_RECOVERY_CHANGE_EVENT,
+      onSessionChange,
+    );
     window.removeEventListener("storage", onStorage);
   };
 }

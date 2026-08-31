@@ -206,6 +206,7 @@ describe("account deletion staging canary", () => {
     expect(source).toContain("await steward.assertTenantAbsent(tenantId)");
     expect(source).toContain("await database.assertStewardIdentityAbsent");
     expect(source).toContain("await database.assertCloudEmailAbsent");
+    expect(source).toContain('"sec-fetch-site": "same-origin"');
     expect(source).not.toContain("DELETE FROM users");
   });
 });

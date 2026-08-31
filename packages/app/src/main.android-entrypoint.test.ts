@@ -173,8 +173,9 @@ describe("renderer Android local composition", () => {
     expect(main.isAndroid).toBe(true);
     expect(main.isNative).toBe(true);
     expect(getBootConfig()).toMatchObject({
-      preferSharedCloudTier: true,
-      autoUpgradeSharedToDedicated: true,
+      preferSharedCloudTier: false,
+      // Native composition follows the same explicit-consent boundary as web.
+      autoUpgradeSharedToDedicated: false,
     });
     expect(androidBoot.installAndroidFetch).toHaveBeenCalledOnce();
     expect(androidBoot.installDiarization).toHaveBeenCalledOnce();

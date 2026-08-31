@@ -59,6 +59,38 @@ describe("runCloudAgentHandoff", () => {
     expect(phases[1]).toMatchObject({ agentId: "a1", imported: 3 });
   });
 
+  it("publishes no stale terminal phase, cleanup hook, or retry after authority is superseded", async () => {
+    const { phases, stop } = collectPhases();
+    let authorityCurrent = true;
+    let resolveStart!: (value: ConversationHandoffResult) => void;
+    const start = vi.fn(
+      () =>
+        new Promise<ConversationHandoffResult>((resolve) => {
+          resolveStart = resolve;
+        }),
+    );
+    const onSwitchSucceeded = vi.fn();
+
+    runCloudAgentHandoff(
+      "stale-a",
+      start,
+      onSwitchSucceeded,
+      () => authorityCurrent,
+    );
+    expect(phases.map((phase) => phase.phase)).toEqual(["migrating"]);
+
+    authorityCurrent = false;
+    resolveStart({ status: "failed", imported: 0, error: "superseded" });
+    await flush();
+    dispatchCloudHandoffRetry({ agentId: "stale-a" });
+    await flush();
+    stop();
+
+    expect(phases.map((phase) => phase.phase)).toEqual(["migrating"]);
+    expect(onSwitchSucceeded).not.toHaveBeenCalled();
+    expect(start).toHaveBeenCalledTimes(1);
+  });
+
   it("maps a thrown 402 to the distinct insufficient-credits phase (not a generic failed)", async () => {
     const { phases, stop } = collectPhases();
     // The dedicated-agent create is refused by the credit gate; the direct-cloud

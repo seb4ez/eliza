@@ -286,19 +286,23 @@ function sharedCloudAgentIdFromBase(base: string): string | null {
  * cannot verify (no token / lookup error other than absence) — never strand the
  * user on an unprovable assumption.
  */
-async function dedicatedCloudAgentIsGone(base: string): Promise<boolean> {
+async function dedicatedCloudAgentIsGone(
+  base: string,
+  isRestoreCurrent: () => boolean = () => true,
+): Promise<boolean> {
+  if (!isRestoreCurrent()) return false;
   const agentId = dedicatedCloudAgentIdFromBase(base);
   if (!agentId) return false;
   if (!getCloudAuthToken(client)) return false;
 
-  const priorBaseUrl = client.getBaseUrl();
-  const priorToken = client.hasToken();
-  // getCloudCompatAgent resolves the control-plane via the client base, so point
-  // the client at the control-plane (the dedicated subdomain is not a direct
-  // cloud base and would route the lookup to the dead agent itself).
-  client.setBaseUrl(resolveStartupCloudControlPlaneBase(base));
   try {
+    if (!isRestoreCurrent()) return false;
+    // The Cloud client resolves a dedicated/shared agent base onto its trusted
+    // control plane without mutating the singleton target. Keeping the exact
+    // staged base+token pair installed is essential: a temporary setBaseUrl
+    // would invalidate restore authority and could restore A over login B.
     const res = await client.getCloudCompatAgent(agentId);
+    if (!isRestoreCurrent()) return false;
     // success:false => the control-plane has no such agent record (deleted). A
     // successful lookup always carries the agent id, so success alone proves it
     // still exists.
@@ -307,15 +311,14 @@ async function dedicatedCloudAgentIsGone(base: string): Promise<boolean> {
     // A 404 is the positive "agent is gone" signal. Any other failure
     // (network blip, 5xx) is inconclusive — do not strand the user.
     return asApiLikeError(err)?.status === 404;
-  } finally {
-    client.setBaseUrl(priorBaseUrl || null);
-    if (!priorToken) client.setToken(null);
   }
 }
 
 async function sharedCloudAgentIsMissingFromRunningSet(
   base: string,
+  isRestoreCurrent: () => boolean = () => true,
 ): Promise<boolean> {
+  if (!isRestoreCurrent()) return false;
   // A self-hosted server may expose the same path shape. Never forward a
   // Steward token from that origin to a hosted control plane.
   if (!isManagedCloudSharedAgentBase(base)) return false;
@@ -329,11 +332,12 @@ async function sharedCloudAgentIsMissingFromRunningSet(
   if (isPersonalSharedElizaId(agentId)) return false;
   if (!getCloudAuthToken(client)) return false;
 
-  const priorBaseUrl = client.getBaseUrl();
-  const priorToken = client.hasToken();
-  client.setBaseUrl(resolveStartupCloudControlPlaneBase(base));
   try {
+    if (!isRestoreCurrent()) return false;
+    // getCloudCompatAgents performs the same direct-control-plane resolution
+    // while leaving the restored target revision untouched.
     const res = await client.getCloudCompatAgents();
+    if (!isRestoreCurrent()) return false;
     if (!res.success) return false;
     return !res.data.some(
       (agent) => agent.agent_id === agentId && agent.status === "running",
@@ -342,9 +346,6 @@ async function sharedCloudAgentIsMissingFromRunningSet(
     // error-policy:J4 running-set verification is a recovery guard; an
     // inconclusive control-plane read must not clear a potentially valid agent.
     return false;
-  } finally {
-    client.setBaseUrl(priorBaseUrl || null);
-    if (!priorToken) client.setToken(null);
   }
 }
 
@@ -410,6 +411,20 @@ export async function runPollingBackend(
   tidRef: { current: ReturnType<typeof setTimeout> | null },
   target: RuntimeTarget = "embedded-local",
 ): Promise<void> {
+  const restoredConnectionAuthority = ctx?.restoredConnectionAuthority;
+  const isRestoredConnectionCurrent = (): boolean =>
+    restoredConnectionAuthority?.isCurrent() ?? true;
+  const stopForSupersededRestore = (): boolean => {
+    if (isRestoredConnectionCurrent()) return false;
+    // Exact staged authority makes this safe against a newer same-tab target:
+    // clear A only when A still owns the client, never B.
+    restoredConnectionAuthority?.clearIfCurrent();
+    return true;
+  };
+  // The recovery generation can change after restore's final check but before
+  // this effect starts. Refuse even the first request/state publication for A.
+  if (stopForSupersededRestore()) return;
+
   const describeBackendFailure = (
     err: unknown,
     timedOut: boolean,
@@ -767,6 +782,7 @@ export async function runPollingBackend(
   };
 
   while (!cancelled.current && effectRunRef.current === effectRunId) {
+    if (stopForSupersededRestore()) return;
     if (Date.now() >= deadline) {
       appendIosBootTrace("backend-deadline-exceeded", {
         baseUrl: client.getBaseUrl(),
@@ -804,9 +820,12 @@ export async function runPollingBackend(
     const probeAttemptStartedAt = Date.now();
     try {
       const auth = await traceIfStalled(
-        boundedProbe(client.getAuthStatus()),
+        boundedProbe(
+          client.getAuthStatus({ validate: isRestoredConnectionCurrent }),
+        ),
         "auth-status",
       );
+      if (stopForSupersededRestore()) return;
       latestAuth = auth;
       if (!tracedFirstSuccess) {
         tracedFirstSuccess = true;
@@ -912,6 +931,7 @@ export async function runPollingBackend(
         boundedProbe(client.getFirstRunStatus()),
         "first-run-status",
       );
+      if (stopForSupersededRestore()) return;
       const { complete, cloudProvisioned } = firstRunStatusRes;
       if (cancelled.current) return;
       deps.setFirstRunCloudProvisionedContainer(Boolean(cloudProvisioned));
@@ -958,6 +978,7 @@ export async function runPollingBackend(
                 unsupportedStatuses: [404],
               }),
             ]);
+            if (stopForSupersededRestore()) return;
             // The effect may have been torn down (unmount / re-run) while the
             // fetch was in flight — bail before mutating state or dispatching,
             // matching the guards after the auth/first-run awaits above.
@@ -987,6 +1008,7 @@ export async function runPollingBackend(
             });
             return;
           } catch (err) {
+            if (stopForSupersededRestore()) return;
             const ae = asApiLikeError(err);
             if (ae?.status === 401 && client.hasToken()) {
               if (
@@ -1004,15 +1026,18 @@ export async function runPollingBackend(
                   STARTUP_TIMING_POLICY.runtimePollIntervalMs,
                 );
               });
+              if (stopForSupersededRestore()) return;
               continue;
             }
             if (ae?.status === 404) {
               if (isDirectCloudSharedAgentBase(client.getBaseUrl())) {
-                if (
+                const sharedAgentMissing =
                   await sharedCloudAgentIsMissingFromRunningSet(
                     client.getBaseUrl(),
-                  )
-                ) {
+                    isRestoredConnectionCurrent,
+                  );
+                if (stopForSupersededRestore()) return;
+                if (sharedAgentMissing) {
                   recoverToAgentSelection(
                     "saved shared cloud agent is missing from the running set",
                   );
@@ -1044,7 +1069,12 @@ export async function runPollingBackend(
                 // control-plane: if it is gone, clear the dead saved server and
                 // route to agent selection instead of "Backend Unreachable"; if
                 // it still exists, treat the 404 as first-run-complete.
-                if (await dedicatedCloudAgentIsGone(client.getBaseUrl())) {
+                const dedicatedAgentGone = await dedicatedCloudAgentIsGone(
+                  client.getBaseUrl(),
+                  isRestoredConnectionCurrent,
+                );
+                if (stopForSupersededRestore()) return;
+                if (dedicatedAgentGone) {
                   recoverToAgentSelection(
                     "saved dedicated cloud agent is deleted / unreachable",
                   );
@@ -1073,6 +1103,7 @@ export async function runPollingBackend(
                 STARTUP_TIMING_POLICY.runtimePollIntervalMs,
               );
             });
+            if (stopForSupersededRestore()) return;
           }
         }
         return;
@@ -1080,6 +1111,7 @@ export async function runPollingBackend(
       dispatch({ type: "BACKEND_REACHED", firstRunComplete: true });
       return;
     } catch (err) {
+      if (stopForSupersededRestore()) return;
       const ae = asApiLikeError(err);
       tracedPollFailures += 1;
       if (tracedPollFailures <= 5 || tracedPollFailures % 10 === 0) {
@@ -1247,9 +1279,13 @@ export async function runPollingBackend(
       }
       if (ae?.status === 404) {
         if (isDirectCloudSharedAgentBase(client.getBaseUrl())) {
-          if (
-            await sharedCloudAgentIsMissingFromRunningSet(client.getBaseUrl())
-          ) {
+          const sharedAgentMissing =
+            await sharedCloudAgentIsMissingFromRunningSet(
+              client.getBaseUrl(),
+              isRestoredConnectionCurrent,
+            );
+          if (stopForSupersededRestore()) return;
+          if (sharedAgentMissing) {
             recoverToAgentSelection(
               "saved shared cloud agent is missing from the running set",
             );
@@ -1282,7 +1318,12 @@ export async function runPollingBackend(
           // persisted cloud mode) or clear the dead saved server and route to
           // agent selection instead of "Backend Unreachable"; if it still
           // exists, treat the 404 as first-run-complete.
-          if (await dedicatedCloudAgentIsGone(client.getBaseUrl())) {
+          const dedicatedAgentGone = await dedicatedCloudAgentIsGone(
+            client.getBaseUrl(),
+            isRestoredConnectionCurrent,
+          );
+          if (stopForSupersededRestore()) return;
+          if (dedicatedAgentGone) {
             if (canRecoverToOnDeviceLocalAgent()) {
               recoverToOnDeviceLocalAgent(
                 "saved dedicated cloud agent is deleted / unreachable",
@@ -1444,6 +1485,7 @@ export async function runPollingBackend(
         const androidBootState = androidLocalAgentIpc
           ? await getAndroidLocalAgentBootStateForUrl(client.getBaseUrl())
           : { state: "unknown" as const };
+        if (stopForSupersededRestore()) return;
         const androidNativeBootProgress =
           androidBootState.state === "booting" ||
           androidBootState.state === "restarting" ||
@@ -1509,6 +1551,7 @@ export async function runPollingBackend(
       await new Promise<void>((r) => {
         tidRef.current = setTimeout(r, delay);
       });
+      if (stopForSupersededRestore()) return;
     }
   }
 }

@@ -3,8 +3,10 @@
 
 import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { StrictMode } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { PreparedOidcResumeTarget } from "../../lib/oidc-continue";
 
 vi.mock("../../../shell/CloudI18nProvider", () => ({
   useCloudT: () => (_key: string, opts?: { defaultValue?: string }) =>
@@ -32,6 +34,36 @@ afterEach(() => {
 });
 
 describe("OidcContinuePage", () => {
+  it("reuses one deferred preparation through the StrictMode effect replay", async () => {
+    let resolvePreparation!: (target: PreparedOidcResumeTarget) => void;
+    const preparation = new Promise<PreparedOidcResumeTarget>((resolve) => {
+      resolvePreparation = resolve;
+    });
+    prepareOidcResumeTargetMock.mockReturnValue(preparation);
+
+    render(
+      <StrictMode>
+        <MemoryRouter
+          initialEntries={[`/oidc/continue?rid=eoq_${"a".repeat(64)}`]}
+        >
+          <OidcContinuePage />
+        </MemoryRouter>
+      </StrictMode>,
+    );
+
+    await vi.waitFor(() =>
+      expect(prepareOidcResumeTargetMock).toHaveBeenCalledOnce(),
+    );
+    resolvePreparation({ status: "session_sync_failed" });
+
+    expect(
+      await screen.findByText(
+        "Your Eliza session could not be securely transferred to the identity provider. Sign in again to continue.",
+      ),
+    ).toBeTruthy();
+    expect(prepareOidcResumeTargetMock).toHaveBeenCalledOnce();
+  });
+
   it.each(["/oidc/continue", "/oidc/continue?rid=%20"])(
     "offers a safe keyboard-reachable recovery action for %s",
     async (path) => {
@@ -87,6 +119,28 @@ describe("OidcContinuePage", () => {
       );
     },
   );
+
+  it("fails closed when the prepared issuer authority is superseded before navigation", async () => {
+    prepareOidcResumeTargetMock.mockResolvedValue({
+      status: "ok",
+      url: "https://api.eliza.app/api/oidc/authorize/resume?rid=stale",
+      authority: { isCurrent: () => false },
+    });
+
+    render(
+      <MemoryRouter
+        initialEntries={[`/oidc/continue?rid=eoq_${"a".repeat(64)}`]}
+      >
+        <OidcContinuePage />
+      </MemoryRouter>,
+    );
+
+    expect(
+      await screen.findByText(
+        "Your Eliza session could not be securely transferred to the identity provider. Sign in again to continue.",
+      ),
+    ).toBeTruthy();
+  });
 
   it("turns an unexpected preparation rejection into recoverable UI", async () => {
     prepareOidcResumeTargetMock.mockRejectedValue(

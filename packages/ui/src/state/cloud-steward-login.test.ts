@@ -11,6 +11,11 @@ import { registerStewardTokenRemoval } from "@elizaos/shared/steward-session-cli
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  beginStewardSessionRecovery,
+  rejectStewardSessionRecovery,
+} from "../cloud/lib/steward-session-recovery-marker";
+import {
+  captureStoredStewardLoginAuthority,
   hasStewardLoginLauncher,
   hasUsableStoredStewardToken,
   launchStewardLogin,
@@ -37,11 +42,11 @@ function makeJwt(expSecondsFromNow: number | null): string {
 
 describe("cloud-steward-login seam", () => {
   beforeEach(() => {
-    localStorage.removeItem(STEWARD_TOKEN_KEY);
+    localStorage.clear();
   });
 
   afterEach(() => {
-    localStorage.removeItem(STEWARD_TOKEN_KEY);
+    localStorage.clear();
     vi.restoreAllMocks();
   });
 
@@ -75,6 +80,78 @@ describe("cloud-steward-login seam", () => {
       expect(launcher).not.toHaveBeenCalled();
     } finally {
       unregister();
+    }
+  });
+
+  it("never returns local account A while login B has a durable recovery receipt", async () => {
+    const accountA = makeJwt(600);
+    localStorage.setItem(STEWARD_TOKEN_KEY, accountA);
+    const loginB = beginStewardSessionRecovery("elizacloud", "provider");
+    const accountBAuthority = { isCurrent: () => true };
+    const launcher = vi.fn(async () => ({
+      token: "account-b-token",
+      authority: accountBAuthority,
+    }));
+    const unregister = registerStewardLoginLauncher(launcher);
+    try {
+      const result = await launchStewardLogin();
+      expect(result.token).toBe("account-b-token");
+      expect(result.authority).toBe(accountBAuthority);
+      expect(launcher).toHaveBeenCalledTimes(1);
+      // The unresolved attempt, not this seam, owns account A's rollback.
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(accountA);
+    } finally {
+      unregister();
+      rejectStewardSessionRecovery(loginB);
+    }
+  });
+
+  it("reports local account A unusable while login B has a durable recovery receipt", () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, makeJwt(600));
+    const loginB = beginStewardSessionRecovery("elizacloud", "provider");
+    try {
+      expect(hasUsableStoredStewardToken()).toBe(false);
+    } finally {
+      rejectStewardSessionRecovery(loginB);
+    }
+  });
+
+  it("invalidates account A even when login B begins and retires between caller fences", () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, makeJwt(600));
+    const accountA = captureStoredStewardLoginAuthority();
+    expect(accountA?.isCurrent()).toBe(true);
+
+    const loginB = beginStewardSessionRecovery("elizacloud", "provider");
+    rejectStewardSessionRecovery(loginB);
+
+    expect(accountA?.isCurrent()).toBe(false);
+  });
+
+  it("reports a stored token unusable when recovery storage cannot be enumerated", () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, makeJwt(600));
+    const keySpy = vi
+      .spyOn(window.localStorage, "key")
+      .mockImplementation(() => {
+        throw new DOMException("Storage denied", "SecurityError");
+      });
+    try {
+      expect(hasUsableStoredStewardToken()).toBe(false);
+    } finally {
+      keySpy.mockRestore();
+    }
+  });
+
+  it("blocks local account A behind login B when no recovery surface is mounted", async () => {
+    const accountA = makeJwt(600);
+    localStorage.setItem(STEWARD_TOKEN_KEY, accountA);
+    const loginB = beginStewardSessionRecovery("elizacloud", "provider");
+    try {
+      await expect(launchStewardLogin()).rejects.toThrow(
+        /another sign-in is still being finalized/,
+      );
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(accountA);
+    } finally {
+      rejectStewardSessionRecovery(loginB);
     }
   });
 

@@ -10,11 +10,13 @@
 
 import {
   clearStoredStewardToken,
+  stewardAuthedCookieName,
   writeStoredStewardToken,
 } from "@elizaos/shared/steward-session-client";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { authMe } from "../api/auth-client";
+import type { ElectrobunRendererRpc } from "../bridge/electrobun-rpc";
 import * as storageBridge from "../bridge/storage-bridge";
 import { clearStaleStewardSession } from "../cloud/shell/StewardProviderShared";
 import { getBootConfig, setBootConfig } from "../config/boot-config-store";
@@ -26,6 +28,7 @@ import {
 import {
   __resetAuthStatusForTests,
   __setAuthStatusForTests,
+  getAuthStatusSnapshot,
   isAuthenticatedNow,
   primeAuthStatusProbe,
   subscribeAuthStatus,
@@ -63,10 +66,11 @@ function jsonResponse(
 }
 
 function setStewardAuthedCookie(present: boolean): void {
+  const markerName = stewardAuthedCookieName("local");
   // biome-ignore lint/suspicious/noDocumentCookie: jsdom has no Cookie Store API.
   document.cookie = present
-    ? "steward-authed=1; Path=/"
-    : "steward-authed=; Max-Age=0; Path=/";
+    ? `${markerName}=1; Path=/`
+    : `${markerName}=; Max-Age=0; Path=/`;
 }
 
 describe("primeAuthStatusProbe + activation reuse", () => {
@@ -76,6 +80,9 @@ describe("primeAuthStatusProbe + activation reuse", () => {
   beforeEach(() => {
     delete (window as Window & { __electrobunWindowId?: number })
       .__electrobunWindowId;
+    delete (
+      window as Window & { __ELIZA_ELECTROBUN_RPC__?: ElectrobunRendererRpc }
+    ).__ELIZA_ELECTROBUN_RPC__;
     localStorage.clear();
     setStewardAuthedCookie(false);
     setBootConfig({ branding: {} });
@@ -100,6 +107,9 @@ describe("primeAuthStatusProbe + activation reuse", () => {
     setStewardAuthedCookie(false);
     delete (window as Window & { __electrobunWindowId?: number })
       .__electrobunWindowId;
+    delete (
+      window as Window & { __ELIZA_ELECTROBUN_RPC__?: ElectrobunRendererRpc }
+    ).__ELIZA_ELECTROBUN_RPC__;
     vi.restoreAllMocks();
     __resetAuthStatusForTests();
   });
@@ -404,6 +414,75 @@ describe("primeAuthStatusProbe + activation reuse", () => {
     // shell on StartupScreen).
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(String(fetchMock.mock.calls[0][0])).toContain("/api/auth/me");
+  });
+
+  it("drops a deferred Electrobun prime A after target B supersedes its exact authority", async () => {
+    (
+      window as Window & { __electrobunWindowId?: number }
+    ).__electrobunWindowId = 1;
+    setBootConfig({
+      branding: {},
+      apiBase: "http://127.0.0.1:2138",
+      apiToken: "agent-a-bearer",
+    });
+
+    let resolveA!: (value: unknown) => void;
+    const getAuthMe = vi
+      .fn<ElectrobunRendererRpc["request"][string]>()
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveA = resolve;
+          }),
+      )
+      .mockResolvedValueOnce({
+        ...AUTH_ME_BODY,
+        identity: {
+          ...AUTH_ME_BODY.identity,
+          id: "owner-b",
+          displayName: "Owner B",
+        },
+      });
+    (
+      window as Window & { __ELIZA_ELECTROBUN_RPC__?: ElectrobunRendererRpc }
+    ).__ELIZA_ELECTROBUN_RPC__ = {
+      request: { getAuthMe },
+      onMessage: vi.fn(),
+      offMessage: vi.fn(),
+    };
+
+    let authorityACurrent = true;
+    act(() => {
+      primeAuthStatusProbe({ isCurrent: () => authorityACurrent });
+    });
+    await vi.waitFor(() => expect(getAuthMe).toHaveBeenCalledTimes(1));
+
+    // B starts without incrementing authStatusEpoch. Exact restore authority,
+    // not the legacy epoch, must retire A's result and reusable prime cache.
+    authorityACurrent = false;
+    act(() => {
+      primeAuthStatusProbe({ isCurrent: () => true });
+    });
+    await waitFor(() =>
+      expect(getAuthStatusSnapshot()).toMatchObject({
+        phase: "authenticated",
+        identity: { id: "owner-b" },
+      }),
+    );
+    expect(getAuthMe).toHaveBeenCalledTimes(2);
+
+    // A settles after B has already published. Its result and finally block
+    // own neither the snapshot nor B's reusable prime metadata.
+    await act(async () => {
+      resolveA(AUTH_ME_BODY);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(getAuthStatusSnapshot()).toMatchObject({
+      phase: "authenticated",
+      identity: { id: "owner-b" },
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("publishes an unauthenticated prime (401 is authoritative) and activation reuses it", async () => {

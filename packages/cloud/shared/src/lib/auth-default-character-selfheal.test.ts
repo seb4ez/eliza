@@ -46,6 +46,9 @@ mock.module("./auth/steward-client", () => ({
   verifyStewardTokenCached: async () => ({ userId: "steward-123" }),
   invalidateStewardTokenCache: async () => undefined,
 }));
+mock.module("./services/sso-bridge-codes", () => ({
+  isBlockedBySsoBridgeLogout: async () => false,
+}));
 mock.module("./auth/playwright-test-session", () => ({
   isPlaywrightTestAuthEnabled: () => false,
   verifyPlaywrightTestSessionToken: () => null,
@@ -148,7 +151,7 @@ beforeEach(() => {
 describe("session-resolution default-character self-heal", () => {
   test("cache miss for an existing user with a character-less org re-seeds the default Eliza", async () => {
     const request = new Request("http://localhost/api/anything", {
-      headers: { cookie: "steward-token=tok-abc" },
+      headers: { cookie: "__Host-steward-token-v2=tok-abc" },
     });
 
     const user = await getCurrentUserFromRequest(request);
@@ -166,7 +169,7 @@ describe("session-resolution default-character self-heal", () => {
   test("healthy cache miss uses the read probe without entering bootstrap", async () => {
     characterBootstrapHealthy = true;
     const request = new Request("http://localhost/api/anything", {
-      headers: { cookie: "steward-token=tok-abc" },
+      headers: { cookie: "__Host-steward-token-v2=tok-abc" },
     });
 
     const user = await getCurrentUserFromRequest(request);
@@ -181,7 +184,7 @@ describe("session-resolution default-character self-heal", () => {
     apiKeyHealSettled = false;
 
     const request = new Request("http://localhost/api/anything", {
-      headers: { cookie: "steward-token=tok-abc" },
+      headers: { cookie: "__Host-steward-token-v2=tok-abc" },
     });
 
     const user = await getCurrentUserFromRequest(request);
@@ -198,7 +201,7 @@ describe("session-resolution default-character self-heal", () => {
     apiKeyHealSettled = false;
     apiKeyHealError = new Error("default key unavailable");
     const request = new Request("http://localhost/api/anything", {
-      headers: { cookie: "steward-token=tok-abc" },
+      headers: { cookie: "__Host-steward-token-v2=tok-abc" },
     });
 
     await expect(getCurrentUserFromRequest(request)).resolves.toBeNull();

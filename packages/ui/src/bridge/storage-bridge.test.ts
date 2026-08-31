@@ -9,8 +9,10 @@
  * stand-ins for the native-only Capacitor/desktop boundaries.
  */
 import {
+  configureStoredStewardTokenScope,
   STEWARD_SESSION_CHANGE_EVENT,
   STEWARD_TOKEN_KEY,
+  STEWARD_TOKEN_SCOPE_KEY,
   writeStoredStewardToken,
 } from "@elizaos/shared/steward-session-client";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -34,6 +36,27 @@ const mockDesktopStore = new Map<string, string>();
 const mockDesktopSecure = {
   available: true,
   abortOnSet: null as AbortController | null,
+  connectionTransaction: null as null | {
+    before: Map<string, string | null>;
+    epoch: string;
+    id: string;
+    participants: Map<string, string>;
+    phase: "prepared" | "committed";
+    receipts?: Array<{ kind: string; rollbackReceipt: string }>;
+  },
+  completedConnectionTransaction: null as null | {
+    before: Map<string, string | null>;
+    epoch: string;
+    id: string;
+    participants: Map<string, string>;
+    receipts: Array<{ kind: string; rollbackReceipt: string }>;
+    status: "finished" | "aborted" | "compensated";
+  },
+  connectionTransactionCalls: [] as string[],
+  connectionBeginResponseLossesRemaining: 0,
+  connectionFinishResponseLossesRemaining: 0,
+  connectionAbortResponseLossesRemaining: 0,
+  connectionCompensateResponseLossesRemaining: 0,
   compareAndRestoreCalls: [] as Array<{
     kind: string;
     rollbackReceipt: string;
@@ -101,11 +124,17 @@ const mockDesktopSecure = {
   }>,
   commitJournal: new Map<
     string,
-    { ok: true; committed: boolean; revision: number }
+    {
+      ok: true;
+      committed: boolean;
+      revision: number;
+      value?: string;
+    }
   >(),
   commitResponseLossesRemaining: 0,
   changedListeners: new Set<(payload: unknown) => void>(),
   commitReceiptHook: null as null | ((kind: string) => Promise<void>),
+  commitReceiptSettledHook: null as null | ((kind: string) => Promise<void>),
   failNextSetAfterMutation: false,
   loseNextCommitResponse: false,
   loseNextSetResponse: false,
@@ -143,6 +172,23 @@ const mockDesktopSecure = {
   >(),
 };
 
+function mockDesktopStewardToken(): string | null {
+  const value = mockDesktopStore.get("session.steward_token");
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as { marker?: string; token?: string };
+    if (
+      parsed.marker === "eliza.steward-token.v1" &&
+      typeof parsed.token === "string"
+    ) {
+      return parsed.token;
+    }
+  } catch {
+    // Legacy fixtures intentionally remain plain strings.
+  }
+  return value;
+}
+
 vi.mock("@capacitor/core", () => ({
   Capacitor: {
     getPlatform: () => (mockRuntime.native ? "android" : "web"),
@@ -177,7 +223,19 @@ vi.mock("./electrobun-runtime", () => ({
 }));
 
 vi.mock("./electrobun-rpc", () => ({
-  desktopSecureStoreGet: async (kind: string) => {
+  desktopSecureStoreGet: async (
+    kind: string,
+    transactionId?: string,
+    transactionEpoch?: string,
+  ) => {
+    const activeTransaction = mockDesktopSecure.connectionTransaction;
+    if (
+      activeTransaction &&
+      (transactionId !== activeTransaction.id ||
+        transactionEpoch !== activeTransaction.epoch)
+    ) {
+      throw new Error("mock runtime connection transaction is in progress");
+    }
     const failure = mockDesktopSecure.nextGetFailure;
     mockDesktopSecure.nextGetFailure = null;
     if (failure === "throw") {
@@ -231,8 +289,24 @@ vi.mock("./electrobun-rpc", () => ({
     kind: string,
     value: string,
     mutationId: string,
+    transactionId?: string,
+    transactionEpoch?: string,
   ) => {
     mockDesktopSecure.setRequestCalls.push({ kind, mutationId, value });
+    const activeTransaction = mockDesktopSecure.connectionTransaction;
+    if (activeTransaction) {
+      if (
+        transactionId !== activeTransaction.id ||
+        transactionEpoch !== activeTransaction.epoch
+      ) {
+        throw new Error("mock runtime connection transaction is in progress");
+      }
+      if (activeTransaction.participants.get(kind) !== value) {
+        throw new Error("mock secure-store SET is not a prepared participant");
+      }
+    } else if (transactionId) {
+      throw new Error("mock runtime connection transaction is not active");
+    }
     const journalKey = `${kind}:${mutationId}`;
     const replay = mockDesktopSecure.mutationJournal.get(journalKey);
     if (replay) return replay;
@@ -242,10 +316,13 @@ vi.mock("./electrobun-rpc", () => ({
     const predecessor = mockDesktopStore.get(kind) ?? null;
     mockDesktopSecure.setBackendWrites += 1;
     mockDesktopStore.set(kind, value);
-    const revision = (mockDesktopSecure.revisions.get(kind) ?? 0) + 1;
+    const revision =
+      (mockDesktopSecure.revisions.get(kind) ?? 0) + (transactionId ? 0 : 1);
     mockDesktopSecure.revisions.set(kind, revision);
-    for (const listener of mockDesktopSecure.changedListeners) {
-      listener({ kind, revision });
+    if (!transactionId) {
+      for (const listener of mockDesktopSecure.changedListeners) {
+        listener({ kind, revision });
+      }
     }
     mockDesktopSecure.receiptSequence += 1;
     const rollbackReceipt = `mock-receipt-${mockDesktopSecure.receiptSequence}`;
@@ -303,7 +380,18 @@ vi.mock("./electrobun-rpc", () => ({
         mockDesktopSecure.compareAndDeleteResponseLossesRemaining -= 1;
         throw new Error("deterministic lost CAS DELETE response");
       }
-      return { ...replay, changed: false };
+      const currentRevision = mockDesktopSecure.revisions.get(kind) ?? 0;
+      const currentValue = mockDesktopStore.get(kind) ?? null;
+      return replay.revision === currentRevision &&
+        replay.value === currentValue
+        ? { ...replay, changed: false }
+        : {
+            ok: true as const,
+            deleted: false,
+            changed: false,
+            value: currentValue,
+            revision: currentRevision,
+          };
     }
     await mockDesktopSecure.compareAndDeleteHook?.();
     const currentValue = mockDesktopStore.get(kind) ?? null;
@@ -373,7 +461,18 @@ vi.mock("./electrobun-rpc", () => ({
         mockDesktopSecure.compareAndSetResponseLossesRemaining -= 1;
         throw new Error("lost compare-and-set replay response");
       }
-      return { ...replay, changed: false };
+      const currentRevision = mockDesktopSecure.revisions.get(kind) ?? 0;
+      const currentValue = mockDesktopStore.get(kind) ?? null;
+      return replay.revision === currentRevision &&
+        replay.value === currentValue
+        ? { ...replay, changed: false }
+        : {
+            ok: true as const,
+            applied: false,
+            changed: false,
+            value: currentValue,
+            revision: currentRevision,
+          };
     }
     await mockDesktopSecure.compareAndSetHook?.();
     const currentRevision = mockDesktopSecure.revisions.get(kind) ?? 0;
@@ -416,6 +515,7 @@ vi.mock("./electrobun-rpc", () => ({
   desktopSecureStoreCommitReceipt: async (
     kind: string,
     rollbackReceipt: string,
+    expectedRevision: number,
   ) => {
     mockDesktopSecure.commitReceiptCalls.push({ kind, rollbackReceipt });
     const journalKey = `${kind}:${rollbackReceipt}`;
@@ -425,12 +525,31 @@ vi.mock("./electrobun-rpc", () => ({
         mockDesktopSecure.commitResponseLossesRemaining -= 1;
         throw new Error("deterministic lost COMMIT response");
       }
-      return replay;
+      return replay.committed
+        ? {
+            ...replay,
+            publishable:
+              (mockDesktopSecure.revisions.get(kind) ?? 0) === expectedRevision,
+            revision:
+              (mockDesktopSecure.revisions.get(kind) ?? 0) === expectedRevision
+                ? expectedRevision
+                : replay.revision,
+          }
+        : replay;
     }
     await mockDesktopSecure.commitReceiptHook?.(kind);
     const rollback = mockDesktopSecure.rollbacks.get(kind);
-    let response: { ok: true; committed: boolean; revision: number };
-    if (!rollback || rollback.receipt !== rollbackReceipt) {
+    let response: {
+      ok: true;
+      committed: boolean;
+      revision: number;
+      value?: string;
+    };
+    if (
+      !rollback ||
+      rollback.receipt !== rollbackReceipt ||
+      (mockDesktopSecure.revisions.get(kind) ?? 0) !== expectedRevision
+    ) {
       response = {
         ok: true as const,
         committed: false,
@@ -447,9 +566,11 @@ vi.mock("./electrobun-rpc", () => ({
         ok: true as const,
         committed: true,
         revision: mockDesktopSecure.revisions.get(kind) ?? 0,
+        value: mockDesktopStore.get(kind) ?? "",
       };
     }
     mockDesktopSecure.commitJournal.set(journalKey, response);
+    await mockDesktopSecure.commitReceiptSettledHook?.(kind);
     if (mockDesktopSecure.commitResponseLossesRemaining > 0) {
       mockDesktopSecure.commitResponseLossesRemaining -= 1;
       throw new Error("deterministic lost COMMIT response");
@@ -474,7 +595,18 @@ vi.mock("./electrobun-rpc", () => ({
     const compensation =
       mockDesktopSecure.committedCompensations.get(journalKey);
     if (compensation?.result) {
-      return { ...compensation.result, changed: false };
+      const currentRevision = mockDesktopSecure.revisions.get(kind) ?? 0;
+      const currentValue = mockDesktopStore.get(kind) ?? null;
+      return compensation.result.revision === currentRevision &&
+        compensation.result.value === currentValue
+        ? { ...compensation.result, changed: false }
+        : {
+            ok: true as const,
+            restored: false,
+            changed: false,
+            value: currentValue,
+            revision: currentRevision,
+          };
     }
     const currentValue = mockDesktopStore.get(kind) ?? null;
     if (
@@ -556,6 +688,313 @@ vi.mock("./electrobun-rpc", () => ({
       revision,
     };
   },
+  desktopConnectionTransactionBegin: async (
+    transactionId: string,
+    participants: Array<{ kind: string; value: string }>,
+  ) => {
+    mockDesktopSecure.connectionTransactionCalls.push("begin");
+    const existing = mockDesktopSecure.connectionTransaction;
+    if (existing && existing.id !== transactionId) {
+      throw new Error("mock transaction is already active");
+    }
+    mockDesktopSecure.connectionTransaction ??= {
+      before: new Map(
+        participants.map(({ kind }) => [
+          kind,
+          mockDesktopStore.get(kind) ?? null,
+        ]),
+      ),
+      epoch: "mock-epoch",
+      id: transactionId,
+      participants: new Map(
+        participants.map(({ kind, value }) => [kind, value]),
+      ),
+      phase: "prepared",
+    };
+    if (mockDesktopSecure.connectionBeginResponseLossesRemaining > 0) {
+      mockDesktopSecure.connectionBeginResponseLossesRemaining -= 1;
+      throw new Error("deterministic lost BEGIN response");
+    }
+    return { ok: true as const, epoch: "mock-epoch" };
+  },
+  desktopConnectionTransactionStage: async (
+    transactionId: string,
+    epoch: string,
+    participant: { kind: string; value: string },
+  ) => {
+    const transaction = mockDesktopSecure.connectionTransaction;
+    if (
+      !transaction ||
+      transaction.id !== transactionId ||
+      transaction.epoch !== epoch
+    ) {
+      throw new Error("mock transaction is not active");
+    }
+    mockDesktopSecure.connectionTransactionCalls.push(
+      `stage:${participant.kind}`,
+    );
+    transaction.before.set(
+      participant.kind,
+      mockDesktopStore.get(participant.kind) ?? null,
+    );
+    transaction.participants.set(participant.kind, participant.value);
+    return { ok: true as const };
+  },
+  desktopConnectionTransactionDecide: async (
+    transactionId: string,
+    epoch: string,
+    receipts: Array<{ kind: string; rollbackReceipt: string }>,
+  ) => {
+    const transaction = mockDesktopSecure.connectionTransaction;
+    if (
+      !transaction ||
+      transaction.id !== transactionId ||
+      transaction.epoch !== epoch
+    ) {
+      throw new Error("mock transaction is not active");
+    }
+    mockDesktopSecure.connectionTransactionCalls.push("decide");
+    const revisions: Array<{ kind: string; revision: number }> = [];
+    for (const { kind, rollbackReceipt } of receipts) {
+      const rollback = mockDesktopSecure.rollbacks.get(kind);
+      if (!rollback || rollback.receipt !== rollbackReceipt) {
+        throw new Error("mock transaction receipt is invalid");
+      }
+      const journalKey = `${kind}:${rollbackReceipt}`;
+      const revision = (mockDesktopSecure.revisions.get(kind) ?? 0) + 1;
+      mockDesktopSecure.revisions.set(kind, revision);
+      mockDesktopSecure.committedCompensations.set(journalKey, {
+        predecessor: rollback.predecessor,
+        revision,
+        value: mockDesktopStore.get(kind) ?? "",
+      });
+      mockDesktopSecure.commitJournal.set(journalKey, {
+        ok: true,
+        committed: true,
+        revision,
+        value: mockDesktopStore.get(kind) ?? "",
+      });
+      mockDesktopSecure.rollbacks.delete(kind);
+      revisions.push({ kind, revision });
+      for (const listener of mockDesktopSecure.changedListeners) {
+        listener({ kind, revision });
+      }
+    }
+    transaction.phase = "committed";
+    transaction.receipts = receipts.map((receipt) => ({ ...receipt }));
+    return {
+      ok: true as const,
+      committed: true as const,
+      epoch: "mock-epoch",
+      revisions,
+    };
+  },
+  desktopConnectionTransactionFinish: async (
+    transactionId: string,
+    epoch: string,
+  ) => {
+    const transaction = mockDesktopSecure.connectionTransaction;
+    const completed = mockDesktopSecure.completedConnectionTransaction;
+    if (
+      !transaction &&
+      completed?.id === transactionId &&
+      completed.epoch === epoch &&
+      completed.status === "finished"
+    ) {
+      if (mockDesktopSecure.connectionFinishResponseLossesRemaining > 0) {
+        mockDesktopSecure.connectionFinishResponseLossesRemaining -= 1;
+        throw new Error("deterministic lost FINISH response");
+      }
+      return {
+        ok: true as const,
+        committed: true as const,
+        epoch: completed.epoch,
+      };
+    }
+    if (
+      !transaction ||
+      transaction.id !== transactionId ||
+      transaction.epoch !== epoch ||
+      transaction.phase !== "committed"
+    ) {
+      throw new Error("mock transaction is not committed");
+    }
+    mockDesktopSecure.connectionTransactionCalls.push("finish");
+    mockDesktopSecure.completedConnectionTransaction = {
+      before: new Map(transaction.before),
+      epoch: transaction.epoch,
+      id: transaction.id,
+      participants: new Map(transaction.participants),
+      receipts: transaction.receipts?.map((receipt) => ({ ...receipt })) ?? [],
+      status: "finished",
+    };
+    mockDesktopSecure.connectionTransaction = null;
+    if (mockDesktopSecure.connectionFinishResponseLossesRemaining > 0) {
+      mockDesktopSecure.connectionFinishResponseLossesRemaining -= 1;
+      throw new Error("deterministic lost FINISH response");
+    }
+    return { ok: true as const, committed: true as const, epoch: "mock-epoch" };
+  },
+  desktopConnectionTransactionAbort: async (
+    transactionId: string,
+    epoch: string,
+    receipts: Array<{ kind: string; rollbackReceipt: string }>,
+  ) => {
+    const transaction = mockDesktopSecure.connectionTransaction;
+    const completed = mockDesktopSecure.completedConnectionTransaction;
+    if (
+      !transaction &&
+      completed?.id === transactionId &&
+      completed.epoch === epoch &&
+      completed.status === "aborted"
+    ) {
+      if (mockDesktopSecure.connectionAbortResponseLossesRemaining > 0) {
+        mockDesktopSecure.connectionAbortResponseLossesRemaining -= 1;
+        throw new Error("deterministic lost ABORT response");
+      }
+      return { ok: true as const, aborted: true, committed: false };
+    }
+    if (
+      !transaction ||
+      transaction.id !== transactionId ||
+      transaction.epoch !== epoch
+    ) {
+      throw new Error("mock transaction is not active");
+    }
+    mockDesktopSecure.connectionTransactionCalls.push("abort");
+    for (const [kind, before] of transaction.before) {
+      const current = mockDesktopStore.get(kind) ?? null;
+      if (before === null) mockDesktopStore.delete(kind);
+      else mockDesktopStore.set(kind, before);
+      const receipt = receipts.find((candidate) => candidate.kind === kind);
+      const rollback = mockDesktopSecure.rollbacks.get(kind);
+      if (receipt && rollback?.receipt === receipt.rollbackReceipt) {
+        mockDesktopSecure.rollbacks.delete(kind);
+      }
+      if (current !== before) {
+        const revision = (mockDesktopSecure.revisions.get(kind) ?? 0) + 1;
+        mockDesktopSecure.revisions.set(kind, revision);
+        for (const listener of mockDesktopSecure.changedListeners) {
+          listener({ kind, revision });
+        }
+      }
+    }
+    mockDesktopSecure.completedConnectionTransaction = {
+      before: new Map(transaction.before),
+      epoch: transaction.epoch,
+      id: transaction.id,
+      participants: new Map(transaction.participants),
+      receipts: receipts.map((receipt) => ({ ...receipt })),
+      status: "aborted",
+    };
+    mockDesktopSecure.connectionTransaction = null;
+    if (mockDesktopSecure.connectionAbortResponseLossesRemaining > 0) {
+      mockDesktopSecure.connectionAbortResponseLossesRemaining -= 1;
+      throw new Error("deterministic lost ABORT response");
+    }
+    return { ok: true as const, aborted: true, committed: false };
+  },
+  desktopConnectionTransactionStatus: async (
+    transactionId: string,
+    epoch?: string,
+  ) => {
+    const active = mockDesktopSecure.connectionTransaction;
+    if (
+      active?.id === transactionId &&
+      (epoch === undefined || active.epoch === epoch)
+    ) {
+      return {
+        ok: true as const,
+        epoch: active.epoch,
+        status: active.phase,
+      };
+    }
+    const completed = mockDesktopSecure.completedConnectionTransaction;
+    if (
+      completed?.id === transactionId &&
+      (epoch === undefined || completed.epoch === epoch)
+    ) {
+      return {
+        ok: true as const,
+        epoch: completed.epoch,
+        revisions: Array.from(completed.participants.keys(), (kind) => ({
+          kind,
+          revision: mockDesktopSecure.revisions.get(kind) ?? 0,
+        })),
+        status: completed.status,
+      };
+    }
+    throw new Error("mock transaction status is unavailable");
+  },
+  desktopConnectionTransactionCompensate: async (
+    transactionId: string,
+    epoch: string,
+    receipts: Array<{
+      expectedRevision: number;
+      kind: string;
+      rollbackReceipt: string;
+    }>,
+  ) => {
+    const completed = mockDesktopSecure.completedConnectionTransaction;
+    if (
+      !completed ||
+      completed.id !== transactionId ||
+      completed.epoch !== epoch ||
+      (completed.status !== "finished" && completed.status !== "compensated")
+    ) {
+      throw new Error("mock transaction cannot be compensated");
+    }
+    if (completed.status === "compensated") {
+      const replay = {
+        ok: true as const,
+        compensated: true as const,
+        revisions: receipts.map(({ kind }) => ({
+          kind,
+          revision: mockDesktopSecure.revisions.get(kind) ?? 0,
+        })),
+      };
+      if (mockDesktopSecure.connectionCompensateResponseLossesRemaining > 0) {
+        mockDesktopSecure.connectionCompensateResponseLossesRemaining -= 1;
+        throw new Error("deterministic lost COMPENSATE response");
+      }
+      return replay;
+    }
+    mockDesktopSecure.connectionTransactionCalls.push("compensate");
+    const revisions: Array<{ kind: string; revision: number }> = [];
+    for (const receipt of receipts) {
+      const expectedReceipt = completed.receipts.find(
+        (candidate) => candidate.kind === receipt.kind,
+      );
+      if (
+        expectedReceipt?.rollbackReceipt !== receipt.rollbackReceipt ||
+        mockDesktopSecure.revisions.get(receipt.kind) !==
+          receipt.expectedRevision
+      ) {
+        throw new Error("mock compensation receipt is stale");
+      }
+    }
+    for (const [kind, before] of completed.before) {
+      if (before === null) mockDesktopStore.delete(kind);
+      else mockDesktopStore.set(kind, before);
+      const revision = (mockDesktopSecure.revisions.get(kind) ?? 0) + 1;
+      mockDesktopSecure.revisions.set(kind, revision);
+      revisions.push({ kind, revision });
+      for (const listener of mockDesktopSecure.changedListeners) {
+        listener({ kind, revision });
+      }
+    }
+    completed.status = "compensated";
+    const result = {
+      ok: true as const,
+      compensated: true as const,
+      revisions,
+    };
+    if (mockDesktopSecure.connectionCompensateResponseLossesRemaining > 0) {
+      mockDesktopSecure.connectionCompensateResponseLossesRemaining -= 1;
+      throw new Error("deterministic lost COMPENSATE response");
+    }
+    return result;
+  },
   subscribeDesktopBridgeEvent: (options: {
     rpcMessage: string;
     listener: (payload: unknown) => void;
@@ -589,6 +1028,13 @@ beforeEach(() => {
   mockDesktopStore.clear();
   mockDesktopSecure.available = true;
   mockDesktopSecure.abortOnSet = null;
+  mockDesktopSecure.connectionTransaction = null;
+  mockDesktopSecure.completedConnectionTransaction = null;
+  mockDesktopSecure.connectionTransactionCalls.length = 0;
+  mockDesktopSecure.connectionBeginResponseLossesRemaining = 0;
+  mockDesktopSecure.connectionFinishResponseLossesRemaining = 0;
+  mockDesktopSecure.connectionAbortResponseLossesRemaining = 0;
+  mockDesktopSecure.connectionCompensateResponseLossesRemaining = 0;
   mockDesktopSecure.compareAndRestoreCalls.length = 0;
   mockDesktopSecure.compareAndDeleteCalls.length = 0;
   mockDesktopSecure.compareAndDeleteHook = null;
@@ -604,6 +1050,7 @@ beforeEach(() => {
   mockDesktopSecure.commitJournal.clear();
   mockDesktopSecure.commitResponseLossesRemaining = 0;
   mockDesktopSecure.commitReceiptHook = null;
+  mockDesktopSecure.commitReceiptSettledHook = null;
   mockDesktopSecure.failNextSetAfterMutation = false;
   mockDesktopSecure.loseNextCommitResponse = false;
   mockDesktopSecure.loseNextSetResponse = false;
@@ -684,11 +1131,391 @@ describe("storage bridge on the electrobun desktop runtime", () => {
     expect(bridge.isStorageBridgeInitialized()).toBe(true);
   });
 
+  it("makes the global WAL decision before Steward finalization and publishes the three caches together", async () => {
+    await bridge.setStorageValue("elizaos:agent-profiles", "registry-a");
+    await bridge.setStorageValue("elizaos:active-server", "server-a");
+    await bridge.setStorageValue(STEWARD_TOKEN_KEY, "token-a");
+    mockDesktopSecure.commitReceiptCalls.length = 0;
+    const transaction = await bridge.beginRuntimeConnectionStorageTransaction([
+      { key: "elizaos:agent-profiles", value: "registry-b" },
+      { key: "elizaos:active-server", value: "server-b" },
+    ]);
+    if (!transaction) throw new Error("transaction was not prepared");
+
+    await bridge.setStorageValueWithCompensation(
+      "elizaos:agent-profiles",
+      "registry-b",
+      { runtimeConnectionTransaction: transaction },
+    );
+    await bridge.setStorageValueWithCompensation(
+      "elizaos:active-server",
+      "server-b",
+      { runtimeConnectionTransaction: transaction },
+    );
+    // Participant SETs are host-private until the collective decision.
+    expect(window.localStorage.getItem("elizaos:agent-profiles")).toBe(
+      "registry-a",
+    );
+    expect(window.localStorage.getItem("elizaos:active-server")).toBe(
+      "server-a",
+    );
+
+    await writeStoredStewardToken("token-b", {
+      hostPersistenceContext: transaction,
+      finalizeBeforePublish: () => {
+        expect(mockDesktopSecure.connectionTransactionCalls).toEqual([
+          "begin",
+          "stage:session.steward_token",
+          "decide",
+        ]);
+        expect(window.localStorage.getItem("elizaos:agent-profiles")).toBe(
+          "registry-b",
+        );
+        expect(window.localStorage.getItem("elizaos:active-server")).toBe(
+          "server-b",
+        );
+        expect(window.localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("token-b");
+      },
+    });
+    await bridge.finishRuntimeConnectionStorageTransaction(transaction);
+
+    expect(mockDesktopSecure.connectionTransactionCalls).toEqual([
+      "begin",
+      "stage:session.steward_token",
+      "decide",
+      "finish",
+    ]);
+    expect(mockDesktopSecure.commitReceiptCalls).toEqual([]);
+  });
+
+  it("recovers the prepared epoch when every BEGIN response is lost", async () => {
+    mockDesktopSecure.connectionBeginResponseLossesRemaining = 3;
+    const transaction = await bridge.beginRuntimeConnectionStorageTransaction([
+      { key: "elizaos:active-server", value: "server-b" },
+    ]);
+    if (!transaction) throw new Error("transaction was not recovered");
+    expect(mockDesktopSecure.connectionTransaction?.phase).toBe("prepared");
+    await expect(
+      bridge.abortRuntimeConnectionStorageTransaction(transaction),
+    ).resolves.toBe(true);
+    expect(mockDesktopSecure.connectionTransaction).toBeNull();
+  });
+
+  it("uses status to settle an ABORT whose every response was lost", async () => {
+    const transaction = await bridge.beginRuntimeConnectionStorageTransaction([
+      { key: "elizaos:active-server", value: "server-b" },
+    ]);
+    if (!transaction) throw new Error("transaction was not prepared");
+    mockDesktopSecure.connectionAbortResponseLossesRemaining = 3;
+    await expect(
+      bridge.abortRuntimeConnectionStorageTransaction(transaction),
+    ).resolves.toBe(true);
+
+    const next = await bridge.beginRuntimeConnectionStorageTransaction([
+      { key: "elizaos:active-server", value: "server-c" },
+    ]);
+    if (!next) throw new Error("next transaction was blocked");
+    await bridge.abortRuntimeConnectionStorageTransaction(next);
+  });
+
+  it("treats a status-confirmed lost FINISH as globally sealed", async () => {
+    const key = "elizaos:active-server";
+    await bridge.setStorageValue(key, "server-a");
+    const transaction = await bridge.beginRuntimeConnectionStorageTransaction([
+      { key, value: "server-b" },
+    ]);
+    if (!transaction) throw new Error("transaction was not prepared");
+    const compensation = await bridge.setStorageValueWithCompensation(
+      key,
+      "server-b",
+      { runtimeConnectionTransaction: transaction },
+    );
+    if (!compensation) throw new Error("compensation was not captured");
+    await bridge.decideRuntimeConnectionStorageTransaction(transaction);
+    mockDesktopSecure.connectionFinishResponseLossesRemaining = 3;
+    await expect(
+      bridge.finishRuntimeConnectionStorageTransaction(transaction),
+    ).resolves.toBeUndefined();
+
+    await expect(compensation.compensate()).resolves.toBe(true);
+    expect(mockDesktopSecure.connectionTransactionCalls).toContain(
+      "compensate",
+    );
+    expect(mockDesktopStore.get("runtime.active_server")).toBe("server-a");
+  });
+
+  it("uses status to publish the predecessor after every COMPENSATE response is lost", async () => {
+    const key = "elizaos:active-server";
+    await bridge.setStorageValue(key, "server-a");
+    const transaction = await bridge.beginRuntimeConnectionStorageTransaction([
+      { key, value: "server-b" },
+    ]);
+    if (!transaction) throw new Error("transaction was not prepared");
+    const compensation = await bridge.setStorageValueWithCompensation(
+      key,
+      "server-b",
+      { runtimeConnectionTransaction: transaction },
+    );
+    if (!compensation) throw new Error("compensation was not captured");
+    await bridge.decideRuntimeConnectionStorageTransaction(transaction);
+    await bridge.finishRuntimeConnectionStorageTransaction(transaction);
+
+    mockDesktopSecure.connectionCompensateResponseLossesRemaining = 3;
+    await expect(compensation.compensate()).resolves.toBe(true);
+
+    expect(mockDesktopStore.get("runtime.active_server")).toBe("server-a");
+    await expect(bridge.getStorageValue(key)).resolves.toBe("server-a");
+    expect(window.localStorage.getItem(key)).toBe("server-a");
+  });
+
+  it("revokes reverse authority when a participant mutation starts after finish", async () => {
+    const key = "elizaos:active-server";
+    await bridge.setStorageValue(key, "server-a");
+    const transaction = await bridge.beginRuntimeConnectionStorageTransaction([
+      { key, value: "server-b" },
+    ]);
+    if (!transaction) throw new Error("transaction was not prepared");
+    const compensation = await bridge.setStorageValueWithCompensation(
+      key,
+      "server-b",
+      { runtimeConnectionTransaction: transaction },
+    );
+    if (!compensation) throw new Error("compensation was not captured");
+    await bridge.decideRuntimeConnectionStorageTransaction(transaction);
+    await bridge.finishRuntimeConnectionStorageTransaction(transaction);
+
+    await bridge.setStorageValue(key, "server-c");
+    await expect(compensation.compensate()).resolves.toBe(false);
+    expect(mockDesktopStore.get("runtime.active_server")).toBe("server-c");
+  });
+
+  it("records aborting and restores every participant when Steward finalization throws", async () => {
+    await bridge.setStorageValue("elizaos:agent-profiles", "registry-a");
+    await bridge.setStorageValue("elizaos:active-server", "server-a");
+    await bridge.setStorageValue(STEWARD_TOKEN_KEY, "token-a");
+    const transaction = await bridge.beginRuntimeConnectionStorageTransaction([
+      { key: "elizaos:agent-profiles", value: "registry-b" },
+      { key: "elizaos:active-server", value: "server-b" },
+    ]);
+    if (!transaction) throw new Error("transaction was not prepared");
+    await bridge.setStorageValueWithCompensation(
+      "elizaos:agent-profiles",
+      "registry-b",
+      { runtimeConnectionTransaction: transaction },
+    );
+    await bridge.setStorageValueWithCompensation(
+      "elizaos:active-server",
+      "server-b",
+      { runtimeConnectionTransaction: transaction },
+    );
+
+    await expect(
+      writeStoredStewardToken("token-b", {
+        hostPersistenceContext: transaction,
+        finalizeBeforePublish: () => {
+          expect(mockDesktopSecure.connectionTransactionCalls.at(-1)).toBe(
+            "decide",
+          );
+          throw new Error("injected finalizer failure");
+        },
+      }),
+    ).rejects.toThrow("injected finalizer failure");
+
+    expect(mockDesktopSecure.connectionTransactionCalls).toEqual([
+      "begin",
+      "stage:session.steward_token",
+      "decide",
+      "abort",
+    ]);
+    expect(mockDesktopSecure.compareAndRestoreCalls).toEqual([]);
+    expect(mockDesktopStore.get("runtime.agent_profiles")).toBe("registry-a");
+    expect(mockDesktopStore.get("runtime.active_server")).toBe("server-a");
+    expect(mockDesktopStewardToken()).toBe("token-a");
+    expect(window.localStorage.getItem("elizaos:agent-profiles")).toBe(
+      "registry-a",
+    );
+    expect(window.localStorage.getItem("elizaos:active-server")).toBe(
+      "server-a",
+    );
+    expect(window.localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("token-a");
+  });
+
+  it("pairs a legacy predecessor scope before committed abort can expose it", async () => {
+    configureStoredStewardTokenScope("https://api.eliza.app");
+    mockDesktopStore.set("session.steward_token", "legacy-token-a");
+    rawSetItem(STEWARD_TOKEN_SCOPE_KEY, "eliza-cloud:production");
+    await expect(bridge.getStorageValue(STEWARD_TOKEN_KEY)).resolves.toBe(
+      "legacy-token-a",
+    );
+    configureStoredStewardTokenScope("https://api-staging.eliza.app");
+
+    const transaction = await bridge.beginRuntimeConnectionStorageTransaction([
+      { key: "elizaos:agent-profiles", value: "registry-b" },
+      { key: "elizaos:active-server", value: "server-b" },
+    ]);
+    if (!transaction) throw new Error("transaction was not prepared");
+    await bridge.setStorageValueWithCompensation(
+      "elizaos:agent-profiles",
+      "registry-b",
+      { runtimeConnectionTransaction: transaction },
+    );
+    await bridge.setStorageValueWithCompensation(
+      "elizaos:active-server",
+      "server-b",
+      { runtimeConnectionTransaction: transaction },
+    );
+    await expect(
+      writeStoredStewardToken("staging-token-b", {
+        hostPersistenceContext: transaction,
+        finalizeBeforePublish: () => {
+          throw new Error("injected finalizer failure after decision");
+        },
+      }),
+    ).rejects.toThrow("injected finalizer failure after decision");
+
+    // Simulate a cold renderer cache: host restored raw legacy A, while the
+    // only scope available at restart is the value published before ABORT.
+    const revision =
+      (mockDesktopSecure.revisions.get("session.steward_token") ?? 0) + 1;
+    mockDesktopSecure.revisions.set("session.steward_token", revision);
+    for (const listener of mockDesktopSecure.changedListeners) {
+      listener({ kind: "session.steward_token", revision });
+    }
+    await expect(bridge.getStorageValue(STEWARD_TOKEN_KEY)).resolves.toBe(
+      "legacy-token-a",
+    );
+    expect(mockDesktopStore.get("session.steward_token")).toBe(
+      "legacy-token-a",
+    );
+    expect(window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY)).toBe(
+      "eliza-cloud:production",
+    );
+  });
+
+  it("does not let an unrelated Steward writer enlist in or decide the ambient WAL", async () => {
+    await bridge.setStorageValue("elizaos:agent-profiles", "registry-a");
+    await bridge.setStorageValue("elizaos:active-server", "server-a");
+    await bridge.setStorageValue(STEWARD_TOKEN_KEY, "token-a");
+    const transaction = await bridge.beginRuntimeConnectionStorageTransaction([
+      { key: "elizaos:agent-profiles", value: "registry-b" },
+      { key: "elizaos:active-server", value: "server-b" },
+    ]);
+    if (!transaction) throw new Error("transaction was not prepared");
+    await bridge.setStorageValueWithCompensation(
+      "elizaos:agent-profiles",
+      "registry-b",
+      { runtimeConnectionTransaction: transaction },
+    );
+    await bridge.setStorageValueWithCompensation(
+      "elizaos:active-server",
+      "server-b",
+      { runtimeConnectionTransaction: transaction },
+    );
+    const transitions: string[] = [];
+    const listener = (event: Event) => {
+      transitions.push((event as CustomEvent<{ state: string }>).detail.state);
+    };
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+
+    try {
+      await expect(writeStoredStewardToken("token-c")).rejects.toMatchObject({
+        name: "StewardTokenPersistenceError",
+      });
+      expect(mockDesktopSecure.connectionTransactionCalls).toEqual(["begin"]);
+      expect(transitions).toEqual([]);
+      expect(mockDesktopStewardToken()).toBe("token-a");
+      await expect(
+        bridge.abortRuntimeConnectionStorageTransaction(transaction),
+      ).resolves.toBe(true);
+      expect(mockDesktopSecure.connectionTransactionCalls).toEqual([
+        "begin",
+        "abort",
+      ]);
+      expect(window.localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("token-a");
+    } finally {
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+    }
+  });
+
+  it("rejects a non-participant device credential without hiding a revision or cache change", async () => {
+    await bridge.setStorageValue("eliza.device.auth", "device-a");
+    const revision = mockDesktopSecure.revisions.get("session.device_auth");
+    const transaction = await bridge.beginRuntimeConnectionStorageTransaction([
+      { key: "elizaos:agent-profiles", value: "registry-b" },
+      { key: "elizaos:active-server", value: "server-b" },
+    ]);
+    if (!transaction) throw new Error("transaction was not prepared");
+
+    await expect(
+      bridge.setStorageValue("eliza.device.auth", "device-b"),
+    ).rejects.toThrow("runtime connection transaction is in progress");
+    expect(mockDesktopStore.get("session.device_auth")).toBe("device-a");
+    expect(mockDesktopSecure.revisions.get("session.device_auth")).toBe(
+      revision,
+    );
+    expect(window.localStorage.getItem("eliza.device.auth")).toBe("device-a");
+    await bridge.abortRuntimeConnectionStorageTransaction(transaction);
+  });
+
+  it("hydrates the token/scope bundle coherently after prepared rollback and committed roll-forward", async () => {
+    configureStoredStewardTokenScope("https://api.eliza.app");
+    await writeStoredStewardToken("token-a");
+    expect(window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY)).toBe(
+      "eliza-cloud:production",
+    );
+
+    const publishHostSnapshot = (value: string, staleScope: string) => {
+      mockDesktopStore.set("session.steward_token", value);
+      rawSetItem(STEWARD_TOKEN_SCOPE_KEY, staleScope);
+      const revision =
+        (mockDesktopSecure.revisions.get("session.steward_token") ?? 0) + 1;
+      mockDesktopSecure.revisions.set("session.steward_token", revision);
+      for (const listener of mockDesktopSecure.changedListeners) {
+        listener({ kind: "session.steward_token", revision });
+      }
+    };
+
+    // Recovery of a prepared WAL has restored the predecessor bundle. Even if
+    // the renderer-local scope survived as B, hydration publishes token A
+    // first and then repairs its paired production scope.
+    publishHostSnapshot(
+      JSON.stringify({
+        marker: "eliza.steward-token.v1",
+        scope: "eliza-cloud:production",
+        token: "token-a",
+      }),
+      "eliza-cloud:staging",
+    );
+    await expect(bridge.getStorageValue(STEWARD_TOKEN_KEY)).resolves.toBe(
+      "token-a",
+    );
+    expect(window.localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("token-a");
+    expect(window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY)).toBe(
+      "eliza-cloud:production",
+    );
+
+    // Recovery of a committed WAL rolls the same participant forward as one
+    // bundle, so a stale A scope is repaired to B after token B is cached.
+    publishHostSnapshot(
+      JSON.stringify({
+        marker: "eliza.steward-token.v1",
+        scope: "eliza-cloud:staging",
+        token: "token-b",
+      }),
+      "eliza-cloud:production",
+    );
+    await expect(bridge.getStorageValue(STEWARD_TOKEN_KEY)).resolves.toBe(
+      "token-b",
+    );
+    expect(window.localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("token-b");
+    expect(window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY)).toBe(
+      "eliza-cloud:staging",
+    );
+  });
+
   it("persists session credentials only in the desktop secure store", async () => {
     await bridge.setStorageValue(STEWARD_TOKEN_KEY, "desktop-secret");
-    expect(mockDesktopStore.get("session.steward_token")).toBe(
-      "desktop-secret",
-    );
+    expect(mockDesktopStewardToken()).toBe("desktop-secret");
     expect(rawGetItem(STEWARD_TOKEN_KEY)).toBeNull();
     // The installed proxy serves the live credential from its in-memory
     // cache; plaintext must only be absent from the RAW store above.
@@ -755,7 +1582,7 @@ describe("storage bridge on the electrobun desktop runtime", () => {
         rollbackReceipt: "mock-receipt-2",
       },
     ]);
-    expect(mockDesktopStore.get("session.steward_token")).toBe("prior-token");
+    expect(mockDesktopStewardToken()).toBe("prior-token");
   });
 
   it("retries a lost COMMIT response with the same receipt and authoritative readback", async () => {
@@ -771,6 +1598,94 @@ describe("storage bridge on the electrobun desktop runtime", () => {
     expect(await bridge.getStorageValue("eliza.device.auth")).toBe(
       "commit-retry-token",
     );
+  });
+
+  it("replays an atomic COMMIT snapshot when a prepared WAL starts after the lost response", async () => {
+    await bridge.setStorageValue("elizaos:active-server", "server-a");
+    let concurrentTransaction: Awaited<
+      ReturnType<typeof bridge.beginRuntimeConnectionStorageTransaction>
+    > = null;
+    mockDesktopSecure.loseNextCommitResponse = true;
+    mockDesktopSecure.commitReceiptSettledHook = async (kind) => {
+      if (kind !== "session.device_auth") return;
+      mockDesktopSecure.commitReceiptSettledHook = null;
+      concurrentTransaction =
+        await bridge.beginRuntimeConnectionStorageTransaction([
+          { key: "elizaos:active-server", value: "server-b" },
+        ]);
+    };
+
+    await expect(
+      bridge.setStorageValue("eliza.device.auth", "committed-before-wal"),
+    ).resolves.toBeUndefined();
+    expect(mockDesktopSecure.commitReceiptCalls.slice(-2)).toEqual([
+      mockDesktopSecure.commitReceiptCalls.at(-1),
+      mockDesktopSecure.commitReceiptCalls.at(-1),
+    ]);
+    expect(window.localStorage.getItem("eliza.device.auth")).toBe(
+      "committed-before-wal",
+    );
+    if (!concurrentTransaction) throw new Error("WAL did not start");
+    await bridge.abortRuntimeConnectionStorageTransaction(
+      concurrentTransaction,
+    );
+  });
+
+  it("does not publish an old COMMIT snapshot after a WAL commits a successor", async () => {
+    const key = "elizaos:active-server";
+    const kind = "runtime.active_server";
+    await bridge.setStorageValue(key, "server-a");
+    let concurrentTransaction: Awaited<
+      ReturnType<typeof bridge.beginRuntimeConnectionStorageTransaction>
+    > = null;
+    mockDesktopSecure.loseNextCommitResponse = true;
+    mockDesktopSecure.commitReceiptSettledHook = async (settledKind) => {
+      if (settledKind !== kind) return;
+      mockDesktopSecure.commitReceiptSettledHook = null;
+      concurrentTransaction =
+        await bridge.beginRuntimeConnectionStorageTransaction([
+          { key, value: "server-c" },
+        ]);
+      if (!concurrentTransaction) throw new Error("WAL did not start");
+      await bridge.setStorageValueWithCompensation(key, "server-c", {
+        runtimeConnectionTransaction: concurrentTransaction,
+      });
+      await bridge.decideRuntimeConnectionStorageTransaction(
+        concurrentTransaction,
+      );
+    };
+
+    await expect(bridge.setStorageValue(key, "server-b")).rejects.toThrow(
+      "superseded",
+    );
+    if (!concurrentTransaction) throw new Error("WAL did not commit");
+    await bridge.finishRuntimeConnectionStorageTransaction(
+      concurrentTransaction,
+    );
+    expect(mockDesktopStore.get(kind)).toBe("server-c");
+    expect(window.localStorage.getItem(key)).toBe("server-c");
+  });
+
+  it("keeps a transaction compensation valid at the final decision revision", async () => {
+    const key = "elizaos:active-server";
+    const kind = "runtime.active_server";
+    await bridge.setStorageValue(key, "server-a");
+    const transaction = await bridge.beginRuntimeConnectionStorageTransaction([
+      { key, value: "server-b" },
+    ]);
+    if (!transaction) throw new Error("WAL did not start");
+    const compensation = await bridge.setStorageValueWithCompensation(
+      key,
+      "server-b",
+      { runtimeConnectionTransaction: transaction },
+    );
+    if (!compensation) throw new Error("compensation was not captured");
+    await bridge.decideRuntimeConnectionStorageTransaction(transaction);
+    await bridge.finishRuntimeConnectionStorageTransaction(transaction);
+
+    await expect(compensation.compensate()).resolves.toBe(true);
+    expect(mockDesktopStore.get(kind)).toBe("server-a");
+    expect(window.localStorage.getItem(key)).toBe("server-a");
   });
 
   it("restores an active-server predecessor when every COMMIT response is lost", async () => {
@@ -810,8 +1725,10 @@ describe("storage bridge on the electrobun desktop runtime", () => {
       ).rejects.toMatchObject({ name: "StewardTokenPersistenceError" });
 
       expect(mockDesktopSecure.commitReceiptCalls).toHaveLength(3);
-      expect(mockDesktopSecure.compensateCommittedCalls).toHaveLength(1);
-      expect(mockDesktopStore.get("session.steward_token")).toBe("prior-token");
+      // Reconcile once after the lost COMMIT replies, then replay the durable
+      // compensation tombstone from Shared's outer restoration closure.
+      expect(mockDesktopSecure.compensateCommittedCalls).toHaveLength(2);
+      expect(mockDesktopStewardToken()).toBe("prior-token");
       expect(window.localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(
         "prior-token",
       );
@@ -977,7 +1894,7 @@ describe("storage bridge on the electrobun desktop runtime", () => {
           rollbackReceipt: "mock-receipt-2",
         },
       ]);
-      expect(mockDesktopStore.get("session.steward_token")).toBe("prior-token");
+      expect(mockDesktopStewardToken()).toBe("prior-token");
       expect(window.localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(
         "prior-token",
       );
@@ -1225,7 +2142,7 @@ describe("storage bridge on the electrobun desktop runtime", () => {
         rollbackReceipt: "mock-receipt-2",
       },
     ]);
-    expect(mockDesktopStore.get("session.steward_token")).toBe("prior-token");
+    expect(mockDesktopStewardToken()).toBe("prior-token");
     expect(window.localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("prior-token");
   });
 
@@ -1255,7 +2172,7 @@ describe("storage bridge on the electrobun desktop runtime", () => {
           rollbackReceipt: "mock-receipt-2",
         },
       ]);
-      expect(mockDesktopStore.get("session.steward_token")).toBe("prior-token");
+      expect(mockDesktopStewardToken()).toBe("prior-token");
       expect(window.localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(
         "prior-token",
       );
@@ -1315,9 +2232,7 @@ describe("storage bridge on the electrobun desktop runtime", () => {
         writeStoredStewardToken("same-bytes-superseded-token"),
       ).rejects.toMatchObject({ name: "StewardTokenPersistenceError" });
       expect(transitions).toEqual([]);
-      expect(mockDesktopStore.get("session.steward_token")).toBe(
-        "same-bytes-superseded-token",
-      );
+      expect(mockDesktopStewardToken()).toBe("same-bytes-superseded-token");
       expect(window.localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
     } finally {
       window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);

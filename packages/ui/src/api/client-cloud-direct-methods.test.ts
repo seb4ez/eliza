@@ -15,11 +15,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@capacitor/core", () => ({
-  Capacitor: { isNativePlatform: () => false },
+  Capacitor: {
+    isNativePlatform: () => false,
+    registerPlugin: vi.fn(() => ({})),
+  },
   CapacitorHttp: { get: vi.fn(), post: vi.fn(), request: vi.fn() },
 }));
 
 import { ElizaClient } from "./client-base";
+import {
+  cleanupFreshCloudCompatAgentCreate,
+  type ExactCloudAccountAuthority,
+} from "./client-cloud";
 // Side-effect import: patches the direct-cloud methods onto the prototype.
 import "./client-cloud";
 
@@ -203,6 +210,64 @@ describe("direct-cloud prototype methods (Steward session bound)", () => {
     });
   });
 
+  it("does not enter an ambient fallback when authority changes after a direct miss", async () => {
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+    let validations = 0;
+    const authority: ExactCloudAccountAuthority = {
+      apiBase: CLOUD_API_BASE,
+      // A malformed exact capability is a direct miss; it must never borrow
+      // the stored Steward token or the client's REST token for its fallback.
+      token: "",
+      validateAuthority: () => ++validations < 3,
+    };
+
+    await expect(
+      client.updateCloudCompatAgent(
+        "agent-1",
+        { agentName: "Must not dispatch" },
+        authority,
+      ),
+    ).rejects.toMatchObject({ code: "STEWARD_SESSION_SUPERSEDED" });
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("does not dispatch a fallback after login authority changes during the direct PATCH", async () => {
+    let resolveFetch!: (response: Response) => void;
+    const fetchSpy = vi.fn(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveFetch = resolve;
+        }),
+    );
+    vi.stubGlobal("fetch", fetchSpy);
+    let current = true;
+    const authority: ExactCloudAccountAuthority = {
+      apiBase: CLOUD_API_BASE,
+      token: "account-a",
+      validateAuthority: () => current,
+    };
+
+    const rename = client.updateCloudCompatAgent(
+      "agent-1",
+      { agentName: "Account A" },
+      authority,
+    );
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(1));
+    current = false;
+    resolveFetch(
+      jsonResponse(200, {
+        success: true,
+        data: { agentId: "agent-1", agentName: "Account A" },
+      }),
+    );
+
+    await expect(rename).rejects.toMatchObject({
+      code: "STEWARD_SESSION_SUPERSEDED",
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
   it("deleteCloudCompatAgent: normalizes an async (jobId) delete response", async () => {
     const request = vi.fn((_url: string, _init?: RequestInit) =>
       jsonResponse(202, { success: true, data: { jobId: "job-1" } }),
@@ -234,6 +299,123 @@ describe("direct-cloud prototype methods (Steward session bound)", () => {
         }),
       }),
     );
+  });
+
+  it("conditionally cleans up with exact account A through queued to completed while ambient B is stored", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, "account-b");
+    let jobReads = 0;
+    const fetchSpy = routeFetch({
+      "/api/v1/eliza/agents/agent-a": () =>
+        jsonResponse(202, {
+          success: true,
+          data: { jobId: "cleanup-job", status: "queued" },
+        }),
+      "/api/v1/jobs/cleanup-job": () => {
+        jobReads += 1;
+        return jsonResponse(200, {
+          success: true,
+          data: {
+            id: "cleanup-job",
+            status: jobReads === 1 ? "queued" : "completed",
+          },
+        });
+      },
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+
+    await cleanupFreshCloudCompatAgentCreate({
+      client,
+      cloudApiBase: CLOUD_API_BASE,
+      authToken: "account-a",
+      agentId: "agent-a",
+      cleanupReceipt: {
+        deleteCondition: {
+          expectedAgentName: "Agent A",
+          expectedCreatedAt: "2026-08-31T00:00:00.000Z",
+          expectedExecutionTier: "dedicated-always",
+        },
+      },
+      pollIntervalMs: 0,
+    });
+
+    expect(jobReads).toBe(2);
+    for (const [, init] of fetchSpy.mock.calls) {
+      expect(new Headers(init?.headers).get("authorization")).toBe(
+        "Bearer account-a",
+      );
+    }
+  });
+
+  it("rejects a failed conditional cleanup job instead of treating DELETE acceptance as terminal", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, "account-b");
+    const fetchSpy = routeFetch({
+      "/api/v1/eliza/agents/agent-a": () =>
+        jsonResponse(202, {
+          success: true,
+          data: { jobId: "cleanup-job", status: "queued" },
+        }),
+      "/api/v1/jobs/cleanup-job": () =>
+        jsonResponse(200, {
+          success: true,
+          data: {
+            id: "cleanup-job",
+            status: "failed",
+            error: "conditional identity no longer matches",
+          },
+        }),
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+
+    await expect(
+      cleanupFreshCloudCompatAgentCreate({
+        client,
+        cloudApiBase: CLOUD_API_BASE,
+        authToken: "account-a",
+        agentId: "agent-a",
+        cleanupReceipt: {
+          deleteCondition: {
+            expectedAgentName: "Agent A",
+            expectedCreatedAt: "2026-08-31T00:00:00.000Z",
+            expectedExecutionTier: "dedicated-always",
+          },
+        },
+        pollIntervalMs: 0,
+      }),
+    ).rejects.toThrow("conditional identity no longer matches");
+    for (const [, init] of fetchSpy.mock.calls) {
+      expect(new Headers(init?.headers).get("authorization")).toBe(
+        "Bearer account-a",
+      );
+    }
+  });
+
+  it("rejects when an accepted conditional cleanup job misses its bounded deadline", async () => {
+    const fetchSpy = routeFetch({
+      "/api/v1/eliza/agents/agent-a": () =>
+        jsonResponse(202, {
+          success: true,
+          data: { jobId: "cleanup-job", status: "queued" },
+        }),
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+
+    await expect(
+      cleanupFreshCloudCompatAgentCreate({
+        client,
+        cloudApiBase: CLOUD_API_BASE,
+        authToken: "account-a",
+        agentId: "agent-a",
+        cleanupReceipt: {
+          deleteCondition: {
+            expectedAgentName: "Agent A",
+            expectedCreatedAt: "2026-08-31T00:00:00.000Z",
+            expectedExecutionTier: "dedicated-always",
+          },
+        },
+        timeoutMs: 0,
+      }),
+    ).rejects.toThrow("Timed out waiting for conditional cleanup job");
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 
   it("provisionCloudCompatAgent: normalizes a direct provision response", async () => {

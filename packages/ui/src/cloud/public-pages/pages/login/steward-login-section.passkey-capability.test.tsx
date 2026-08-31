@@ -21,6 +21,7 @@ import {
   beginStewardSessionRecovery,
   completeStewardSessionLogout,
   readStewardSessionLogoutIntents,
+  readStewardSessionRecovery,
   rejectStewardSessionRecovery,
 } from "../../../lib/steward-session-recovery-marker";
 
@@ -144,7 +145,10 @@ vi.mock("../../lib/login-return-to", () => ({
   storePendingOAuthReturnTo: () => undefined,
 }));
 
-import { STEWARD_TOKEN_KEY } from "@elizaos/shared/steward-session-client";
+import {
+  STEWARD_TOKEN_KEY,
+  StewardSessionError,
+} from "@elizaos/shared/steward-session-client";
 import { StewardApiError } from "@stwd/sdk";
 import StewardLoginSection from "./steward-login-section";
 
@@ -412,6 +416,7 @@ describe("StewardLoginSection passkey capability gating", () => {
   it("offers recovery without sending mail, then enrolls only after explicit setup intent", async () => {
     capabilityRef.usable = true;
     capabilityRef.reason = "available";
+    sessionSpies.hasCookie = true;
     stewardAuthSpies.signInWithPasskey.mockRejectedValue(
       new StewardApiError(
         "WebAuthn authentication cancelled or failed: NotAllowedError",
@@ -443,6 +448,7 @@ describe("StewardLoginSection passkey capability gating", () => {
     expect(setupButton).toBeTruthy();
     expect(stewardAuthSpies.sendEmailOtp).not.toHaveBeenCalled();
     expect(emailLoginSpies.start).not.toHaveBeenCalled();
+    expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([]);
 
     fireEvent.click(setupButton);
 
@@ -499,6 +505,91 @@ describe("StewardLoginSection passkey capability gating", () => {
     expect(screen.queryByText("Passkey not completed")).toBeNull();
     expect(screen.queryByRole("button", { name: "Use Magic Link" })).toBeNull();
     expect(emailLoginSpies.start).not.toHaveBeenCalled();
+  });
+
+  it("keeps a tab-closed pre-cookie passkey reservation block-only and never restores stale cookie A", async () => {
+    capabilityRef.usable = true;
+    capabilityRef.reason = "available";
+    stewardAuthSpies.signInWithPasskey.mockImplementation(
+      () => new Promise(() => {}),
+    );
+
+    const firstMount = renderSection();
+    const input = await screen.findByPlaceholderText("you@example.com");
+    fireEvent.change(input, { target: { value: "account-b@example.com" } });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Use an existing passkey" }),
+    );
+    await waitFor(() =>
+      expect(stewardAuthSpies.signInWithPasskey).toHaveBeenCalledOnce(),
+    );
+    expect(readStewardSessionRecovery("elizacloud")).toMatchObject({
+      receipts: [expect.any(String)],
+      currentReceiptPhase: "reserved",
+      expectedIdentity: null,
+    });
+
+    firstMount.unmount();
+    await act(async () => {
+      await Promise.resolve();
+    });
+    sessionSpies.hasCookie = true;
+    sessionSpies.recover.mockResolvedValue({
+      ok: true,
+      token: "stale-cookie-account-a",
+    });
+    renderSection();
+
+    await waitFor(() =>
+      expect(screen.getByPlaceholderText("you@example.com")).toBeTruthy(),
+    );
+    expect(sessionSpies.recover).not.toHaveBeenCalled();
+    expect(sessionSpies.sync).not.toHaveBeenCalled();
+    expect(window.localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(readStewardSessionRecovery("elizacloud")).toMatchObject({
+      receipts: [expect.any(String)],
+      currentReceiptPhase: "reserved",
+      expectedIdentity: null,
+    });
+  });
+
+  it("keeps a pre-cookie passkey reservation block-only across BFCache restore", async () => {
+    capabilityRef.usable = true;
+    capabilityRef.reason = "available";
+    stewardAuthSpies.signInWithPasskey.mockImplementation(
+      () => new Promise(() => {}),
+    );
+
+    renderSection();
+    const input = await screen.findByPlaceholderText("you@example.com");
+    fireEvent.change(input, { target: { value: "account-b@example.com" } });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Use an existing passkey" }),
+    );
+    await waitFor(() =>
+      expect(stewardAuthSpies.signInWithPasskey).toHaveBeenCalledOnce(),
+    );
+    sessionSpies.hasCookie = true;
+    sessionSpies.recover.mockResolvedValue({
+      ok: true,
+      token: "stale-cookie-account-a",
+    });
+
+    const historyRestore = new Event("pageshow");
+    Object.defineProperty(historyRestore, "persisted", { value: true });
+    fireEvent(window, historyRestore);
+
+    await waitFor(() =>
+      expect(screen.getByPlaceholderText("you@example.com")).toBeTruthy(),
+    );
+    expect(sessionSpies.recover).not.toHaveBeenCalled();
+    expect(sessionSpies.sync).not.toHaveBeenCalled();
+    expect(window.localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(readStewardSessionRecovery("elizacloud")).toMatchObject({
+      receipts: [expect.any(String)],
+      currentReceiptPhase: "reserved",
+      expectedIdentity: null,
+    });
   });
 
   it("keeps a complete email focused after cancelled-passkey recovery", async () => {
@@ -581,6 +672,7 @@ describe("StewardLoginSection passkey capability gating", () => {
     async (passkeyError) => {
       capabilityRef.usable = true;
       capabilityRef.reason = "available";
+      sessionSpies.hasCookie = true;
       stewardAuthSpies.signInWithPasskey.mockRejectedValue(passkeyError);
 
       renderSection();
@@ -597,8 +689,59 @@ describe("StewardLoginSection passkey capability gating", () => {
       expect(stewardAuthSpies.sendEmailOtp).not.toHaveBeenCalled();
       expect(emailLoginSpies.start).not.toHaveBeenCalled();
       expect(passkeyHintSpies.remember).not.toHaveBeenCalled();
+      expect(sessionSpies.sync).not.toHaveBeenCalled();
+      expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([]);
     },
   );
+
+  it("keeps recovery only when transport fails during the steward-session POST", async () => {
+    capabilityRef.usable = true;
+    capabilityRef.reason = "available";
+    sessionSpies.hasCookie = true;
+    sessionSpies.sync.mockRejectedValueOnce(
+      new TypeError("response lost after cookie commit"),
+    );
+
+    renderSection();
+
+    const input = await screen.findByPlaceholderText("you@example.com");
+    fireEvent.change(input, { target: { value: "person@example.com" } });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Use an existing passkey" }),
+    );
+
+    expect(
+      await screen.findByText("response lost after cookie commit"),
+    ).toBeTruthy();
+    expect(sessionSpies.sync).toHaveBeenCalledTimes(1);
+    expect(window.localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(readStewardSessionRecovery("elizacloud").receipts).toHaveLength(1);
+  });
+
+  it("shows an explicit re-auth instruction and publishes nothing during logout cooldown", async () => {
+    capabilityRef.usable = true;
+    capabilityRef.reason = "available";
+    sessionSpies.sync.mockRejectedValueOnce(
+      new StewardSessionError("cooldown", 409, "logout_cooldown", {
+        retryAfterSeconds: 4,
+      }),
+    );
+
+    renderSection();
+    const input = await screen.findByPlaceholderText("you@example.com");
+    fireEvent.change(input, { target: { value: "person@example.com" } });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Use an existing passkey" }),
+    );
+
+    expect(
+      await screen.findByText(
+        "You just signed out. Wait 4 seconds, then start sign-in again to create a new session.",
+      ),
+    ).toBeTruthy();
+    expect(window.localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([]);
+  });
 
   it("clears recovery actions when a same-mount retry ends in a hard server failure", async () => {
     capabilityRef.usable = true;

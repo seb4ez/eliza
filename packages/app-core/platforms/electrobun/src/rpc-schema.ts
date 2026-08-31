@@ -505,6 +505,26 @@ export type RendererSecureStoreKind =
   | "runtime.active_server"
   | "runtime.agent_profiles";
 
+export type RendererConnectionTransactionKind = Extract<
+  RendererSecureStoreKind,
+  "session.steward_token" | "runtime.active_server" | "runtime.agent_profiles"
+>;
+
+export interface RendererConnectionTransactionParticipant {
+  kind: RendererConnectionTransactionKind;
+  value: string;
+}
+
+export interface RendererConnectionTransactionReceipt {
+  kind: RendererConnectionTransactionKind;
+  rollbackReceipt: string;
+}
+
+export interface RendererConnectionTransactionCompensationReceipt
+  extends RendererConnectionTransactionReceipt {
+  expectedRevision: number;
+}
+
 export type RendererSecureStoreResult =
   | { ok: true; value?: string; deleted?: boolean; revision?: number }
   | {
@@ -539,7 +559,16 @@ export type RendererSecureStoreSetResult =
     };
 
 export type RendererSecureStoreCommitReceiptResult =
-  | { ok: true; committed: boolean; revision?: number }
+  | {
+      ok: true;
+      committed: true;
+      /** Exact raw slot snapshot committed by this receipt. */
+      value: string;
+      /** False when a newer host revision already superseded the snapshot. */
+      publishable?: boolean;
+      revision?: number;
+    }
+  | { ok: true; committed: false; changed?: boolean; revision?: number }
   | {
       ok: false;
       reason: "not_found" | "denied" | "unavailable" | "error";
@@ -2282,6 +2311,8 @@ export type ElizaDesktopRPCSchema = {
         params: {
           documentCapability: string;
           kind: RendererSecureStoreKind;
+          transactionId?: string;
+          transactionEpoch?: string;
         };
         response: RendererSecureStoreResult;
       };
@@ -2289,6 +2320,8 @@ export type ElizaDesktopRPCSchema = {
         params: {
           documentCapability: string;
           kind: RendererSecureStoreKind;
+          transactionId?: string;
+          transactionEpoch?: string;
         };
         response: { ok: true; revision: number };
       };
@@ -2298,14 +2331,19 @@ export type ElizaDesktopRPCSchema = {
           kind: RendererSecureStoreKind;
           value: string;
           mutationId: string;
+          transactionId?: string;
+          transactionEpoch?: string;
         };
         response: RendererSecureStoreSetResult;
       };
       secureStoreCommitReceipt: {
         params: {
           documentCapability: string;
+          expectedRevision: number;
           kind: RendererSecureStoreKind;
           rollbackReceipt: string;
+          transactionId?: string;
+          transactionEpoch?: string;
         };
         response: RendererSecureStoreCommitReceiptResult;
       };
@@ -2315,6 +2353,8 @@ export type ElizaDesktopRPCSchema = {
           kind: RendererSecureStoreKind;
           rollbackReceipt: string;
           expectedRevision: number;
+          transactionId?: string;
+          transactionEpoch?: string;
         };
         response: RendererSecureStoreCompensateCommittedReceiptResult;
       };
@@ -2322,6 +2362,8 @@ export type ElizaDesktopRPCSchema = {
         params: {
           documentCapability: string;
           kind: RendererSecureStoreKind;
+          transactionId?: string;
+          transactionEpoch?: string;
         };
         response: RendererSecureStoreResult;
       };
@@ -2332,6 +2374,8 @@ export type ElizaDesktopRPCSchema = {
           expectedValue: string | null;
           expectedRevision: number;
           mutationId: string;
+          transactionId?: string;
+          transactionEpoch?: string;
         };
         response: RendererSecureStoreCompareAndDeleteResult;
       };
@@ -2343,6 +2387,8 @@ export type ElizaDesktopRPCSchema = {
           value: string;
           expectedRevision: number;
           mutationId: string;
+          transactionId?: string;
+          transactionEpoch?: string;
         };
         response: RendererSecureStoreCompareAndSetResult;
       };
@@ -2351,8 +2397,99 @@ export type ElizaDesktopRPCSchema = {
           documentCapability: string;
           kind: RendererSecureStoreKind;
           rollbackReceipt: string;
+          transactionId?: string;
+          transactionEpoch?: string;
         };
         response: RendererSecureStoreCompareAndRestoreResult;
+      };
+      secureStoreConnectionTransactionBegin: {
+        params: {
+          documentCapability: string;
+          transactionId: string;
+          participants: RendererConnectionTransactionParticipant[];
+        };
+        response: { ok: true; epoch: string };
+      };
+      secureStoreConnectionTransactionStage: {
+        params: {
+          documentCapability: string;
+          transactionId: string;
+          epoch: string;
+          participant: RendererConnectionTransactionParticipant;
+        };
+        response: { ok: true };
+      };
+      secureStoreConnectionTransactionDecide: {
+        params: {
+          documentCapability: string;
+          transactionId: string;
+          epoch: string;
+          receipts: RendererConnectionTransactionReceipt[];
+        };
+        response: {
+          ok: true;
+          committed: true;
+          epoch: string;
+          revisions: Array<{
+            kind: RendererConnectionTransactionKind;
+            revision: number;
+          }>;
+        };
+      };
+      secureStoreConnectionTransactionFinish: {
+        params: {
+          documentCapability: string;
+          transactionId: string;
+          epoch: string;
+        };
+        response: { ok: true; committed: true; epoch: string };
+      };
+      secureStoreConnectionTransactionAbort: {
+        params: {
+          documentCapability: string;
+          transactionId: string;
+          epoch: string;
+          receipts: RendererConnectionTransactionReceipt[];
+        };
+        response: { ok: true; aborted: boolean; committed: boolean };
+      };
+      secureStoreConnectionTransactionStatus: {
+        params: {
+          documentCapability: string;
+          transactionId: string;
+          epoch?: string;
+        };
+        response: {
+          ok: true;
+          epoch: string;
+          revisions?: Array<{
+            kind: RendererConnectionTransactionKind;
+            revision: number;
+          }>;
+          status:
+            | "prepared"
+            | "committed"
+            | "finished"
+            | "aborted"
+            | "compensating"
+            | "compensated";
+        };
+      };
+      secureStoreConnectionTransactionCompensate: {
+        params: {
+          documentCapability: string;
+          transactionId: string;
+          epoch: string;
+          receipts: RendererConnectionTransactionCompensationReceipt[];
+        };
+        response: {
+          ok: true;
+          compensated: true;
+          revisions: Array<{
+            kind: RendererConnectionTransactionKind;
+            revision: number;
+          }>;
+        };
       };
       secureStoreStatus: {
         params: undefined;
@@ -3209,6 +3346,20 @@ export const CHANNEL_TO_RPC_METHOD: Record<string, string> = {
   "secureStore:compareAndDelete": "secureStoreCompareAndDelete",
   "secureStore:compareAndSet": "secureStoreCompareAndSet",
   "secureStore:compareAndRestore": "secureStoreCompareAndRestore",
+  "secureStore:connectionTransactionBegin":
+    "secureStoreConnectionTransactionBegin",
+  "secureStore:connectionTransactionStage":
+    "secureStoreConnectionTransactionStage",
+  "secureStore:connectionTransactionDecide":
+    "secureStoreConnectionTransactionDecide",
+  "secureStore:connectionTransactionFinish":
+    "secureStoreConnectionTransactionFinish",
+  "secureStore:connectionTransactionAbort":
+    "secureStoreConnectionTransactionAbort",
+  "secureStore:connectionTransactionStatus":
+    "secureStoreConnectionTransactionStatus",
+  "secureStore:connectionTransactionCompensate":
+    "secureStoreConnectionTransactionCompensate",
   "secureStore:status": "secureStoreStatus",
   "runtimeCredential:store": "runtimeCredentialStore",
   "runtimeCredential:delete": "runtimeCredentialDelete",

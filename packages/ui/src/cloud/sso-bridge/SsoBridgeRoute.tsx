@@ -119,6 +119,105 @@ function referrerIsPairedAppOrigin(
   }
 }
 
+type MintLegOutcome =
+  | { kind: "not-initiated" }
+  | { kind: "redirect"; url: string };
+
+/**
+ * The whole mint leg is one component-lifetime transaction. React StrictMode
+ * may subscribe to it twice, but must not repeat its intent consumption, code
+ * mint, or terminal redirect.
+ */
+async function runMintLegOperation(
+  hostname: string,
+  state: string,
+  challenge: string,
+  returnTo: string,
+): Promise<MintLegOutcome> {
+  const appOrigin = pairedAppOrigin(hostname);
+  if (!appOrigin) return { kind: "not-initiated" };
+
+  const referrer = document.referrer;
+  const appInitiated = referrerIsPairedAppOrigin(appOrigin, referrer);
+  const remembered = hasRememberedMintIntent(state);
+  if (!appInitiated && !remembered) {
+    if (!referrer) {
+      // Referrer-stripping privacy settings make a legitimate app handoff
+      // indistinguishable from a direct visit. Keep minting fail-closed, but
+      // send the user to the app's ordinary login instead of stranding them
+      // on the public homepage.
+      return { kind: "redirect", url: appLoginUrl(appOrigin, returnTo) };
+    }
+    // Not a handshake the app origin initiated (direct visit, or a
+    // third-party page forcing a signed-in user here): mint nothing.
+    return { kind: "not-initiated" };
+  }
+
+  if (appInitiated && !remembered && !rememberMintIntent(state)) {
+    return { kind: "redirect", url: appLoginUrl(appOrigin, returnTo) };
+  }
+
+  if (!hasHydratableStewardToken()) {
+    // Login is owned by this public/auth origin. Preserve the exact bridge leg
+    // as a same-origin returnTo; once Steward succeeds, the remembered
+    // referrer-approved intent permits minting and sends the user back to the
+    // managed app. No credential is ever entered on the app host.
+    const bridgeReturnTo = `${SSO_BRIDGE_PATH}?state=${encodeURIComponent(state)}&challenge=${encodeURIComponent(challenge)}&returnTo=${encodeURIComponent(returnTo)}`;
+    return {
+      kind: "redirect",
+      url: `/login?returnTo=${encodeURIComponent(bridgeReturnTo)}`,
+    };
+  }
+
+  forgetMintIntent(state);
+  const result = await mintSsoCode(hostname, challenge);
+  if (result.ok && !result.authority.isCurrent()) {
+    burnSsoBridgeCode(result.code, hostname);
+    return { kind: "redirect", url: appLoginUrl(appOrigin, returnTo) };
+  }
+  const url = result.ok
+    ? buildBridgeExchangeUrl(hostname, result.code, state, returnTo)
+    : null;
+  if (result.ok && !result.authority.isCurrent()) {
+    burnSsoBridgeCode(result.code, hostname);
+    return { kind: "redirect", url: appLoginUrl(appOrigin, returnTo) };
+  }
+  return {
+    kind: "redirect",
+    url: url ?? appLoginUrl(appOrigin, returnTo),
+  };
+}
+
+type ExchangeLegOutcome =
+  | { kind: "refused" }
+  | {
+      kind: "result";
+      result: Awaited<ReturnType<typeof performSsoExchange>>;
+    };
+
+/** Consume the state/verifier and dispatch the one-time exchange exactly once. */
+async function runExchangeLegOperation(
+  hostname: string,
+  code: string | null,
+  state: string | null,
+): Promise<ExchangeLegOutcome> {
+  // State nonce first, before ANY network call: the stored value is consumed
+  // single-shot, and only an exact echo of what THIS origin created may
+  // proceed. A refused well-formed code is burned rather than left live.
+  const stored = consumeSsoBridgeState();
+  const verifier = consumeSsoBridgeVerifier();
+  const stateOk =
+    stored !== null && isWellFormedSsoState(state) && stored === state;
+  if (!stateOk || !isWellFormedSsoCode(code) || verifier === null) {
+    if (isWellFormedSsoCode(code)) burnSsoBridgeCode(code, hostname);
+    return { kind: "refused" };
+  }
+  return {
+    kind: "result",
+    result: await performSsoExchange(code, verifier, hostname),
+  };
+}
+
 function MintLeg({
   hostname,
   state,
@@ -130,57 +229,40 @@ function MintLeg({
   challenge: string;
   returnTo: string;
 }): React.JSX.Element {
-  const startedRef = useRef(false);
+  const operationRef = useRef<{
+    key: string;
+    promise: Promise<MintLegOutcome>;
+  } | null>(null);
+  const effectGenerationRef = useRef(0);
   const [notInitiated, setNotInitiated] = useState(false);
 
   useEffect(() => {
-    if (startedRef.current) return;
-    startedRef.current = true;
-    const appOrigin = pairedAppOrigin(hostname);
-    if (!appOrigin) return;
+    const effectGeneration = effectGenerationRef.current + 1;
+    effectGenerationRef.current = effectGeneration;
+    const effectIsCurrent = () =>
+      effectGenerationRef.current === effectGeneration;
+    const operationKey = JSON.stringify([hostname, state, challenge, returnTo]);
+    const operation =
+      operationRef.current?.key === operationKey
+        ? operationRef.current.promise
+        : runMintLegOperation(hostname, state, challenge, returnTo);
+    operationRef.current = { key: operationKey, promise: operation };
 
-    const referrer = document.referrer;
-    const appInitiated = referrerIsPairedAppOrigin(appOrigin, referrer);
-    const remembered = hasRememberedMintIntent(state);
-    if (!appInitiated && !remembered) {
-      if (!referrer) {
-        // Referrer-stripping privacy settings make a legitimate app handoff
-        // indistinguishable from a direct visit. Keep minting fail-closed, but
-        // send the user to the app's ordinary login instead of stranding them
-        // on the public homepage.
-        appModeNavigation.replace(appLoginUrl(appOrigin, returnTo));
+    void operation.then((outcome) => {
+      if (!effectIsCurrent()) return;
+      if (outcome.kind === "not-initiated") {
+        setNotInitiated(true);
         return;
       }
-      // Not a handshake the app origin initiated (direct visit, or a
-      // third-party page forcing a signed-in user here): mint nothing.
-      setNotInitiated(true);
-      return;
-    }
-
-    if (appInitiated && !remembered && !rememberMintIntent(state)) {
-      appModeNavigation.replace(appLoginUrl(appOrigin, returnTo));
-      return;
-    }
-
-    if (!hasHydratableStewardToken()) {
-      // Login is owned by this public/auth origin. Preserve the exact bridge
-      // leg as a same-origin returnTo; once Steward succeeds, the remembered
-      // referrer-approved intent permits minting and sends the user back to
-      // the managed app. No credential is ever entered on the app host.
-      const bridgeReturnTo = `${SSO_BRIDGE_PATH}?state=${encodeURIComponent(state)}&challenge=${encodeURIComponent(challenge)}&returnTo=${encodeURIComponent(returnTo)}`;
-      appModeNavigation.replace(
-        `/login?returnTo=${encodeURIComponent(bridgeReturnTo)}`,
-      );
-      return;
-    }
-
-    forgetMintIntent(state);
-    void mintSsoCode(hostname, challenge).then((result) => {
-      const url = result.ok
-        ? buildBridgeExchangeUrl(hostname, result.code, state, returnTo)
-        : null;
-      appModeNavigation.replace(url ?? appLoginUrl(appOrigin, returnTo));
+      if (outcome.kind === "redirect") {
+        appModeNavigation.replace(outcome.url);
+      }
     });
+    return () => {
+      if (effectIsCurrent()) {
+        effectGenerationRef.current = effectGeneration + 1;
+      }
+    };
   }, [hostname, state, challenge, returnTo]);
 
   if (notInitiated) {
@@ -200,37 +282,44 @@ function ExchangeLeg({
   state: string | null;
   returnTo: string;
 }): React.JSX.Element {
-  const startedRef = useRef(false);
+  const operationRef = useRef<{
+    key: string;
+    promise: Promise<ExchangeLegOutcome>;
+  } | null>(null);
+  const effectGenerationRef = useRef(0);
   const navigate = useNavigate();
   const [failed, setFailed] = useState(false);
 
   useEffect(() => {
-    if (startedRef.current) return;
-    startedRef.current = true;
+    const effectGeneration = effectGenerationRef.current + 1;
+    effectGenerationRef.current = effectGeneration;
+    const effectIsCurrent = () =>
+      effectGenerationRef.current === effectGeneration;
+    const operationKey = JSON.stringify([hostname, code, state]);
+    const operation =
+      operationRef.current?.key === operationKey
+        ? operationRef.current.promise
+        : runExchangeLegOperation(hostname, code, state);
+    operationRef.current = { key: operationKey, promise: operation };
 
-    // State nonce first, before ANY network call: the stored value is
-    // consumed single-shot, and only an exact echo of what THIS origin
-    // created may proceed. Missing/mismatched state (a handshake this origin
-    // never initiated — login CSRF) aborts to the local login; the code is
-    // never EXCHANGED, but a well-formed one is BURNED so it cannot sit live
-    // in the address bar and request logs for the rest of its TTL.
-    const stored = consumeSsoBridgeState();
-    const verifier = consumeSsoBridgeVerifier();
-    const stateOk =
-      stored !== null && isWellFormedSsoState(state) && stored === state;
-    if (!stateOk || !isWellFormedSsoCode(code) || verifier === null) {
-      if (isWellFormedSsoCode(code)) burnSsoBridgeCode(code, hostname);
-      setFailed(true);
-      return;
-    }
-
-    void performSsoExchange(code, verifier, hostname).then((result) => {
-      if (result.ok) {
+    void operation.then((outcome) => {
+      if (!effectIsCurrent()) return;
+      if (outcome.kind === "refused") {
+        setFailed(true);
+        return;
+      }
+      const { result } = outcome;
+      if (result.ok && result.authority.isCurrent()) {
         navigate(returnTo, { replace: true });
         return;
       }
       setFailed(true);
     });
+    return () => {
+      if (effectIsCurrent()) {
+        effectGenerationRef.current = effectGeneration + 1;
+      }
+    };
   }, [hostname, code, state, returnTo, navigate]);
 
   if (failed) {

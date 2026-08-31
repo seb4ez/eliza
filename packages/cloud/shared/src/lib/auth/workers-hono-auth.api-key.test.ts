@@ -32,6 +32,7 @@ let userBehavior: () => Promise<unknown> = async () => null;
 let stewardUserBehavior: () => Promise<unknown> = async () => null;
 const getWithOrganization = mock(() => userBehavior());
 const getByStewardId = mock(() => stewardUserBehavior());
+const getByStewardIdForWrite = mock(() => stewardUserBehavior());
 let stewardTokenBehavior: () => Promise<unknown> = async () => null;
 const verifyStewardTokenCached = mock(() => stewardTokenBehavior());
 let primaryUserBehavior: () => Promise<unknown> = async () => null;
@@ -62,6 +63,9 @@ let lifecycleBehavior: () => Promise<unknown> = async () => ({
   deletionRequestId: null,
 });
 const readOrganizationLifecycleAuthority = mock(() => lifecycleBehavior());
+const syncUserFromSteward = mock(async () => activeUser());
+let ssoLogoutBarrierBehavior: () => Promise<boolean> = async () => false;
+const isBlockedBySsoBridgeLogout = mock(() => ssoLogoutBarrierBehavior());
 
 mock.module("../services/api-keys", () => ({
   apiKeysService: {
@@ -74,6 +78,7 @@ mock.module("../services/users", () => ({
   usersService: {
     getWithOrganization,
     getByStewardId,
+    getByStewardIdForWrite,
   },
 }));
 
@@ -106,6 +111,14 @@ mock.module("./steward-client", () => ({
   verifyStewardTokenCached,
 }));
 
+mock.module("../steward-sync", () => ({
+  syncUserFromSteward,
+}));
+
+mock.module("../services/sso-bridge-codes", () => ({
+  isBlockedBySsoBridgeLogout,
+}));
+
 mock.module("./staging-session-binding", () => ({
   loadVerifiedStagingSessionUser: mock(async () => null),
 }));
@@ -126,7 +139,9 @@ mock.module("../utils/logger", () => ({
 const {
   apiKeyScopeHashPrefix,
   getCurrentUser,
+  getExistingUserForVerifiedStewardClaims,
   readStewardSessionToken,
+  revalidateSessionScope,
   requireAdmin,
   requireApiKeyCredential,
   requireCurrentBillingManagerSession,
@@ -202,21 +217,54 @@ beforeEach(() => {
     active: true,
     deletionRequestId: null,
   });
+  ssoLogoutBarrierBehavior = async () => false;
   validateApiKey.mockClear();
   getWithOrganization.mockClear();
   getByStewardId.mockClear();
+  getByStewardIdForWrite.mockClear();
   verifyStewardTokenCached.mockClear();
   findWithOrganizationForWrite.mockClear();
   verifyPlaywrightTestSessionToken.mockClear();
   getAdminStatusForUser.mockClear();
   readOrganizationLifecycleAuthority.mockClear();
+  syncUserFromSteward.mockClear();
+  isBlockedBySsoBridgeLogout.mockClear();
 });
 
 describe("Workers API-key auth", () => {
+  test("resolves a verified cleanup identity without JIT provisioning", async () => {
+    stewardUserBehavior = async () => activeUser();
+
+    const user = await getExistingUserForVerifiedStewardClaims(contextWithHeaders() as never, {
+      userId: "steward-1",
+      expiration: Math.floor(Date.now() / 1000) + 60,
+      issuedAt: Math.floor(Date.now() / 1000) - 60,
+    });
+
+    expect(user).toMatchObject({
+      id: "user-1",
+      organization_id: "org-1",
+      steward_id: "steward-1",
+    });
+    expect(getByStewardIdForWrite).toHaveBeenCalledWith("steward-1");
+    expect(getByStewardId).not.toHaveBeenCalled();
+    expect(syncUserFromSteward).not.toHaveBeenCalled();
+
+    stewardUserBehavior = async () => null;
+    expect(
+      await getExistingUserForVerifiedStewardClaims(contextWithHeaders() as never, {
+        userId: "unknown-steward",
+        expiration: Math.floor(Date.now() / 1000) + 60,
+        issuedAt: Math.floor(Date.now() / 1000) - 60,
+      }),
+    ).toBeNull();
+    expect(syncUserFromSteward).not.toHaveBeenCalled();
+  });
+
   test("selects a bearer Steward JWT for session teardown", () => {
     const context = contextWithHeaders({
       authorization: "Bearer header.payload.signature",
-      cookie: "steward-token=cookie.jwt.signature",
+      cookie: "__Host-steward-token-v2=cookie.jwt.signature",
     });
 
     expect(readStewardSessionToken(context as never)).toBe("header.payload.signature");
@@ -225,7 +273,7 @@ describe("Workers API-key auth", () => {
   test("does not mistake an API-key bearer for a Steward session", () => {
     const context = contextWithHeaders({
       authorization: "Bearer eliza_live_key",
-      cookie: "steward-token=cookie.jwt.signature",
+      cookie: "__Host-steward-token-v2=cookie.jwt.signature",
     });
 
     expect(readStewardSessionToken(context as never)).toBe("cookie.jwt.signature");
@@ -464,6 +512,41 @@ describe("Workers API-key auth", () => {
     expect(verifyStewardTokenCached).toHaveBeenCalledTimes(1);
   });
 
+  test("rejects an already-ended bridged bearer on every API auth path", async () => {
+    stewardTokenBehavior = async () => ({
+      userId: "steward-1",
+      issuedAt: 1_700_000_000,
+      expiration: 1_700_003_600,
+      bridged: true,
+    });
+    ssoLogoutBarrierBehavior = async () => true;
+    stewardUserBehavior = async () => activeUser();
+    const c = contextWithHeaders({ authorization: "Bearer a.b.c" });
+
+    await expect(getCurrentUser(c as never)).resolves.toBeNull();
+    expect(isBlockedBySsoBridgeLogout).toHaveBeenCalledWith("steward-1", 1_700_000_000);
+    expect(getByStewardId).not.toHaveBeenCalled();
+  });
+
+  test("fails bridged API auth closed when the logout-marker store is unavailable", async () => {
+    stewardTokenBehavior = async () => ({
+      userId: "steward-1",
+      issuedAt: 1_700_000_000,
+      expiration: 1_700_003_600,
+      bridged: true,
+    });
+    ssoLogoutBarrierBehavior = async () => {
+      throw new Error("primary unavailable");
+    };
+    const c = contextWithHeaders({ authorization: "Bearer a.b.c" });
+
+    await expect(getCurrentUser(c as never)).rejects.toMatchObject({
+      status: 503,
+      code: "service_unavailable",
+    });
+    expect(getByStewardId).not.toHaveBeenCalled();
+  });
+
   test("accepts a Playwright test session only when the cookie claims match the hydrated org", async () => {
     cookieBehavior = () => "test-session-token";
     playwrightTokenBehavior = () => ({ userId: "user-1", organizationId: "org-1" });
@@ -618,7 +701,7 @@ describe("Workers API-key auth", () => {
     stewardTokenBehavior = async () => ({ userId: "steward-1" });
 
     for (const role of ["owner", "admin"] as const) {
-      const c = contextWithHeaders({ cookie: "steward-token=steward-session" });
+      const c = contextWithHeaders({ cookie: "__Host-steward-token-v2=steward-session" });
       c.set("user", activeUser({ role, steward_id: "steward-1" }));
       c.set("authMethod", "session");
       primaryUserBehavior = async () => activeUser({ role });
@@ -640,7 +723,7 @@ describe("Workers API-key auth", () => {
 
     cookieBehavior = () => "steward-session";
     stewardTokenBehavior = async () => ({ userId: "steward-1" });
-    const staleOwner = contextWithHeaders({ cookie: "steward-token=steward-session" });
+    const staleOwner = contextWithHeaders({ cookie: "__Host-steward-token-v2=steward-session" });
     staleOwner.set("user", activeUser({ role: "owner", steward_id: "steward-1" }));
     staleOwner.set("authMethod", "session");
     primaryUserBehavior = async () => activeUser({ role: "member" });
@@ -648,7 +731,7 @@ describe("Workers API-key auth", () => {
       status: 403,
     });
 
-    const movedOwner = contextWithHeaders({ cookie: "steward-token=steward-session" });
+    const movedOwner = contextWithHeaders({ cookie: "__Host-steward-token-v2=steward-session" });
     movedOwner.set("user", activeUser({ role: "owner", steward_id: "steward-1" }));
     movedOwner.set("authMethod", "session");
     primaryUserBehavior = async () =>
@@ -661,7 +744,9 @@ describe("Workers API-key auth", () => {
       status: 403,
     });
 
-    const invalidSession = contextWithHeaders({ cookie: "steward-token=steward-session" });
+    const invalidSession = contextWithHeaders({
+      cookie: "__Host-steward-token-v2=steward-session",
+    });
     invalidSession.set("user", activeUser({ role: "owner", steward_id: "steward-1" }));
     invalidSession.set("authMethod", "session");
     stewardTokenBehavior = async () => null;
@@ -712,7 +797,7 @@ describe("Workers API-key auth", () => {
     ];
 
     for (const { current, status, message } of cases) {
-      const c = contextWithHeaders({ cookie: "steward-token=steward-session" });
+      const c = contextWithHeaders({ cookie: "__Host-steward-token-v2=steward-session" });
       c.set("user", activeUser({ role: "owner", steward_id: "steward-1" }));
       c.set("authMethod", "session");
       primaryUserBehavior = async () => current;
@@ -730,7 +815,7 @@ describe("Workers API-key auth", () => {
     primaryUserBehavior = async () => {
       throw new Error("primary unavailable");
     };
-    const c = contextWithHeaders({ cookie: "steward-token=steward-session" });
+    const c = contextWithHeaders({ cookie: "__Host-steward-token-v2=steward-session" });
     c.set("user", activeUser({ role: "owner", steward_id: "steward-1" }));
     c.set("authMethod", "session");
 
@@ -816,6 +901,47 @@ describe("Workers API-key auth", () => {
     );
   });
 
+  test("recent-auth revalidation cannot reuse a cached ordinary session after global logout", async () => {
+    const issuedAt = Math.floor(Date.now() / 1_000) - 30;
+    stewardTokenBehavior = async () => ({
+      userId: "steward-1",
+      issuedAt,
+      expiration: issuedAt + 3_600,
+      authMethod: "email",
+    });
+    ssoLogoutBarrierBehavior = async () => true;
+    const c = contextWithHeaders({ cookie: "__Host-steward-token-v2=steward-session" });
+    c.set("user", activeUser({ steward_id: "steward-1" }));
+    c.set("authMethod", "session");
+
+    await expect(requireRecentSessionUserWithOrg(c as never)).rejects.toMatchObject({
+      status: 401,
+      code: "authentication_required",
+    });
+    expect(isBlockedBySsoBridgeLogout).toHaveBeenCalledWith("steward-1", issuedAt);
+  });
+
+  test("recent-auth revalidation fails closed when logout-marker storage is unavailable", async () => {
+    const issuedAt = Math.floor(Date.now() / 1_000) - 30;
+    stewardTokenBehavior = async () => ({
+      userId: "steward-1",
+      issuedAt,
+      expiration: issuedAt + 3_600,
+      authMethod: "email",
+    });
+    ssoLogoutBarrierBehavior = async () => {
+      throw new Error("primary unavailable");
+    };
+    const c = contextWithHeaders({ cookie: "__Host-steward-token-v2=steward-session" });
+    c.set("user", activeUser({ steward_id: "steward-1" }));
+    c.set("authMethod", "session");
+
+    await expect(requireRecentSessionUserWithOrg(c as never)).rejects.toMatchObject({
+      status: 503,
+      code: "service_unavailable",
+    });
+  });
+
   test("getCurrentUser caches null when no Steward token is present", async () => {
     const c = contextWithHeaders({});
     await expect(getCurrentUser(c as never)).resolves.toBeNull();
@@ -883,6 +1009,62 @@ describe("apiKeyScopeHashPrefix (shared-agent scope cache key — COLDPATH-FIX-2
     expect(a).not.toBe(b);
     expect(a).toHaveLength(16);
     expect(b).toHaveLength(16);
+  });
+});
+
+describe("revalidateSessionScope logout authority", () => {
+  test("rejects a scope-cache hit after an ordinary Steward session was logged out", async () => {
+    stewardTokenBehavior = async () => ({
+      userId: "steward-1",
+      issuedAt: 1_700_000_000,
+      expiration: 1_700_003_600,
+    });
+    ssoLogoutBarrierBehavior = async () => true;
+
+    await expect(
+      revalidateSessionScope(
+        contextWithHeaders({ authorization: "Bearer a.b.c" }) as never,
+        "steward-1",
+        "org-1",
+      ),
+    ).resolves.toBe(false);
+    expect(isBlockedBySsoBridgeLogout).toHaveBeenCalledWith("steward-1", 1_700_000_000);
+  });
+
+  test("fails an ordinary scope-cache revalidation closed when marker storage is unavailable", async () => {
+    stewardTokenBehavior = async () => ({
+      userId: "steward-1",
+      issuedAt: 1_700_000_000,
+      expiration: 1_700_003_600,
+    });
+    ssoLogoutBarrierBehavior = async () => {
+      throw new Error("primary unavailable");
+    };
+
+    await expect(
+      revalidateSessionScope(
+        contextWithHeaders({ authorization: "Bearer a.b.c" }) as never,
+        "steward-1",
+        "org-1",
+      ),
+    ).rejects.toMatchObject({ status: 503, code: "service_unavailable" });
+  });
+
+  test("accepts an ordinary Steward scope-cache hit when no logout marker blocks it", async () => {
+    stewardTokenBehavior = async () => ({
+      userId: "steward-1",
+      issuedAt: 1_700_000_000,
+      expiration: 1_700_003_600,
+    });
+
+    await expect(
+      revalidateSessionScope(
+        contextWithHeaders({ authorization: "Bearer a.b.c" }) as never,
+        "steward-1",
+        "org-1",
+      ),
+    ).resolves.toBe(true);
+    expect(isBlockedBySsoBridgeLogout).toHaveBeenCalledWith("steward-1", 1_700_000_000);
   });
 });
 

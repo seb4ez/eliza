@@ -1,7 +1,11 @@
-/** Verifies Cloud first-run binds the account identity only after Dedicated activation. */
+/** Verifies Cloud first-run binds the current personal runtime without lifecycle mutation. */
 // @vitest-environment jsdom
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  beginStewardSessionRecovery,
+  rejectStewardSessionRecovery,
+} from "../cloud/lib/steward-session-recovery-marker";
 import type { FirstRunProfileDraft } from "./first-run";
 import type { FirstRunFinishPorts } from "./first-run-finish";
 import {
@@ -120,6 +124,18 @@ function storeStewardToken(token = "steward-jwt"): void {
   window.localStorage.setItem("steward_session_token", token);
 }
 
+function stewardJwt(expSecondsFromNow: number): string {
+  const encode = (value: object) =>
+    btoa(JSON.stringify(value))
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
+  return `${encode({ alg: "HS256", typ: "JWT" })}.${encode({
+    userId: "account-a",
+    exp: Math.floor(Date.now() / 1000) + expSecondsFromNow,
+  })}.sig`;
+}
+
 function stubSelection(): void {
   clientStub.selectOrProvisionCloudAgent.mockResolvedValue({
     agentId: SHARED_AGENT_ID,
@@ -182,7 +198,8 @@ describe("listOrAutoProvisionCloudAgent — rowless personal Eliza", () => {
     const outcome = await listOrAutoProvisionCloudAgent(draft(), p);
     expect(outcome.kind).toBe("done");
     expect(clientStub.getCloudStatus).not.toHaveBeenCalled();
-    expect(clientStub.ensurePersonalDedicatedEliza).toHaveBeenCalledTimes(1);
+    expect(clientStub.getPersonalSharedEliza).toHaveBeenCalledTimes(1);
+    expect(clientStub.ensurePersonalDedicatedEliza).not.toHaveBeenCalled();
     expect(clientStub.selectOrProvisionCloudAgent).not.toHaveBeenCalled();
   });
 
@@ -195,12 +212,13 @@ describe("listOrAutoProvisionCloudAgent — rowless personal Eliza", () => {
     expect(outcome.kind).toBe("done");
     expect(handleInteractiveCloudLogin).toHaveBeenCalledTimes(1);
     expect(clientStub.getCloudStatus).not.toHaveBeenCalled();
-    expect(clientStub.ensurePersonalDedicatedEliza).toHaveBeenCalledWith(
+    expect(clientStub.getPersonalSharedEliza).toHaveBeenCalledWith(
       expect.objectContaining({
         cloudApiBase: "https://staging.elizacloud.ai",
         authToken: "fresh-jwt",
       }),
     );
+    expect(clientStub.ensurePersonalDedicatedEliza).not.toHaveBeenCalled();
     expect(clientStub.selectOrProvisionCloudAgent).not.toHaveBeenCalled();
   });
 
@@ -210,12 +228,166 @@ describe("listOrAutoProvisionCloudAgent — rowless personal Eliza", () => {
     expect(outcome.kind).toBe("needs-cloud-login");
     expect(handleInteractiveCloudLogin).toHaveBeenCalledTimes(1);
     expect(clientStub.getCloudStatus).not.toHaveBeenCalled();
+    expect(clientStub.getPersonalSharedEliza).not.toHaveBeenCalled();
     expect(clientStub.ensurePersonalDedicatedEliza).not.toHaveBeenCalled();
     expect(clientStub.selectOrProvisionCloudAgent).not.toHaveBeenCalled();
+  });
+
+  it("retires an expired lineage token and requires interactive auth before personal resolution", async () => {
+    const expired = stewardJwt(-60);
+    storeStewardToken(expired);
+    const { ports: finishPorts, handleInteractiveCloudLogin } = ports();
+    handleInteractiveCloudLogin.mockImplementation(async () => {
+      expect(window.localStorage.getItem("steward_session_token")).toBeNull();
+      storeStewardToken("fresh-token");
+    });
+
+    const outcome = await listOrAutoProvisionCloudAgent(draft(), finishPorts);
+
+    expect(outcome.kind).toBe("done");
+    expect(handleInteractiveCloudLogin).toHaveBeenCalledTimes(1);
+    expect(clientStub.getPersonalSharedEliza).toHaveBeenCalledTimes(1);
+    expect(clientStub.getPersonalSharedEliza).toHaveBeenCalledWith(
+      expect.objectContaining({ authToken: "fresh-token" }),
+    );
+    expect(clientStub.getPersonalSharedEliza).not.toHaveBeenCalledWith(
+      expect.objectContaining({ authToken: expired }),
+    );
+  });
+
+  it("never resolves personal identity with an expired lineage when interactive auth lands no replacement", async () => {
+    const expired = stewardJwt(-60);
+    storeStewardToken(expired);
+    const { ports: finishPorts, handleInteractiveCloudLogin } = ports();
+
+    const outcome = await listOrAutoProvisionCloudAgent(draft(), finishPorts);
+
+    expect(outcome).toEqual({ kind: "needs-cloud-login" });
+    expect(handleInteractiveCloudLogin).toHaveBeenCalledTimes(1);
+    expect(clientStub.getPersonalSharedEliza).not.toHaveBeenCalled();
+  });
+
+  it("does not complete first-run for account A after account B replaces its bearer", async () => {
+    storeStewardToken("account-a-token");
+    clientStub.getPersonalSharedEliza.mockImplementationOnce(async () => {
+      storeStewardToken("account-b-token");
+      return {
+        personalElizaId: SHARED_AGENT_ID,
+        agentId: SHARED_AGENT_ID,
+        activeAgentId: SHARED_AGENT_ID,
+        agentName: "Eliza A",
+        apiBase: SHARED_AGENT_BASE,
+        runtime: "shared" as const,
+      };
+    });
+    const { ports: finishPorts } = ports();
+
+    await expect(
+      listOrAutoProvisionCloudAgent(draft(), finishPorts),
+    ).rejects.toMatchObject({ name: "AbortError" });
+
+    expect(addAgentProfileStub).not.toHaveBeenCalled();
+    expect(finishPorts.completeFirstRun).not.toHaveBeenCalled();
+    expect(clientStub.ensurePersonalDedicatedEliza).not.toHaveBeenCalled();
+  });
+
+  it("does not bind or complete account A when login B begins during personal resolution", async () => {
+    storeStewardToken("account-a-token");
+    let reportPersonalRequestStarted!: () => void;
+    const personalRequestStarted = new Promise<void>((resolve) => {
+      reportPersonalRequestStarted = resolve;
+    });
+    let releasePersonalResponse!: () => void;
+    const personalResponseReleased = new Promise<void>((resolve) => {
+      releasePersonalResponse = resolve;
+    });
+    clientStub.getPersonalSharedEliza.mockImplementationOnce(async () => {
+      reportPersonalRequestStarted();
+      await personalResponseReleased;
+      return {
+        personalElizaId: SHARED_AGENT_ID,
+        agentId: SHARED_AGENT_ID,
+        activeAgentId: SHARED_AGENT_ID,
+        agentName: "Eliza A",
+        apiBase: SHARED_AGENT_BASE,
+        runtime: "shared" as const,
+      };
+    });
+    const { ports: finishPorts } = ports();
+    const finish = listOrAutoProvisionCloudAgent(draft(), finishPorts);
+    const rejected = expect(finish).rejects.toMatchObject({
+      name: "AbortError",
+    });
+
+    await personalRequestStarted;
+    const loginB = beginStewardSessionRecovery("elizacloud", "provider");
+    try {
+      expect(window.localStorage.getItem("steward_session_token")).toBe(
+        "account-a-token",
+      );
+      releasePersonalResponse();
+      await rejected;
+
+      expect(persistAgentProfileConnectionDurablyStub).not.toHaveBeenCalled();
+      expect(addAgentProfileStub).not.toHaveBeenCalled();
+      expect(clientStub.stageSessionTarget).not.toHaveBeenCalled();
+      expect(savePersistedFirstRunCompleteStub).not.toHaveBeenCalled();
+      expect(finishPorts.completeFirstRun).not.toHaveBeenCalled();
+    } finally {
+      rejectStewardSessionRecovery(loginB);
+    }
   });
 });
 
 describe("bindCloudAgent — agent-base warm-up", () => {
+  it("does not bind callback A when ready queues a newer login before the caller resumes", async () => {
+    let selectionIsCurrent = true;
+    const compensateIfSuperseded = vi.fn(async () => {});
+    clientStub.selectOrProvisionCloudAgent.mockImplementationOnce(
+      async (options: {
+        onProgress?: (status: string, detail?: string) => void;
+      }) => {
+        options.onProgress?.("ready", "Cloud agent ready!");
+        queueMicrotask(() => {
+          selectionIsCurrent = false;
+        });
+        return {
+          agentId: SHARED_AGENT_ID,
+          agentName: "Eliza A",
+          apiBase: SHARED_AGENT_BASE,
+          bridgeUrl: null,
+          requiresAgentPairing: false,
+          created: true,
+          authority: {
+            isCurrent: () => selectionIsCurrent,
+            restoreIfCurrent: vi.fn(async () => {}),
+            compensateIfSuperseded,
+          },
+        };
+      },
+    );
+    const { ports: finishPorts } = ports();
+
+    const outcome = await bindCloudAgent(
+      draft(),
+      "account-a-token",
+      {},
+      finishPorts,
+    );
+
+    expect(outcome).toEqual({
+      kind: "error",
+      message: "Cloud agent setup was superseded by a newer login.",
+    });
+    expect(compensateIfSuperseded).toHaveBeenCalledTimes(1);
+    expect(persistAgentProfileConnectionDurablyStub).not.toHaveBeenCalled();
+    expect(addAgentProfileStub).not.toHaveBeenCalled();
+    expect(clientStub.stageSessionTarget).not.toHaveBeenCalled();
+    expect(clientStub.setBaseUrl).not.toHaveBeenCalled();
+    expect(clientStub.setToken).not.toHaveBeenCalled();
+    expect(finishPorts.completeFirstRun).not.toHaveBeenCalled();
+  });
+
   it("persists the authoritative Cloud agent owner with its profile credential", async () => {
     const outcome = await bindCloudAgent(
       draft(),

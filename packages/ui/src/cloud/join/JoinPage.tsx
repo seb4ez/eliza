@@ -18,10 +18,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Navigate } from "react-router-dom";
 import { client } from "../../api";
 import { Button } from "../../components/ui/button";
-import {
-  savePersistedActiveServer,
-  savePersistedFirstRunComplete,
-} from "../../state/persistence";
+import { bindDirectCloudLoginToPersonalAgent } from "../../state/bind-direct-cloud-login";
+import { captureStoredStewardLoginAuthority } from "../../state/cloud-steward-login";
+import { savePersistedFirstRunComplete } from "../../state/persistence";
 import { appModeNavigation } from "../app-mode/app-mode";
 import { publishPersonalEntryHandoff } from "../app-mode/use-personal-entry";
 import { useCloudT } from "../shell/CloudI18nProvider";
@@ -58,54 +57,75 @@ export default function JoinPage(): React.JSX.Element {
   const ssoDecisionRef = useRef(false);
   const [ssoBridging, setSsoBridging] = useState<boolean | null>(null);
   // Guard so React StrictMode's double-mount does not duplicate identity reads.
-  const startedRef = useRef(false);
+  const startedRef = useRef<string | null>(null);
   const activeAttemptRef = useRef<{
     controller: AbortController;
     promise: Promise<void>;
   } | null>(null);
 
-  const start = useCallback(async () => {
-    const authToken = resolveJoinAuthToken();
-    if (!authToken) {
-      // No session — the auth gate below redirects to login; bail quietly.
-      return;
-    }
-    setPhase("connecting");
-    setError(null);
+  const start = useCallback(async (requestedAuthToken: string) => {
     activeAttemptRef.current?.controller.abort(
       new DOMException("Join attempt superseded", "AbortError"),
     );
+    const authority = captureStoredStewardLoginAuthority();
+    if (!authority || authority.token !== requestedAuthToken) {
+      activeAttemptRef.current = null;
+      return;
+    }
+    const authToken = authority.token;
     const controller = new AbortController();
+    const attemptRecord = {
+      controller,
+      promise: Promise.resolve(),
+    };
+    activeAttemptRef.current = attemptRecord;
+    const validateAuthority = () =>
+      !controller.signal.aborted &&
+      activeAttemptRef.current === attemptRecord &&
+      authority.isCurrent();
+    if (!validateAuthority()) {
+      if (activeAttemptRef.current === attemptRecord) {
+        activeAttemptRef.current = null;
+      }
+      return;
+    }
+    setPhase("connecting");
+    setDetail("");
+    setError(null);
     const attempt = (async () => {
       try {
         const result = await runJoinFlow({
           client,
           effects: {
-            savePersistedActiveServer,
+            bindPersonalAgent: bindDirectCloudLoginToPersonalAgent,
             savePersistedFirstRunComplete,
           },
           cloudApiBase: resolveJoinCloudApiBase(),
           authToken,
           signal: controller.signal,
+          validateAuthority,
           onProgress: (_status, progressDetail) => {
-            if (progressDetail) setDetail(progressDetail);
+            if (validateAuthority() && progressDetail) {
+              setDetail(progressDetail);
+            }
           },
         });
-        controller.signal.throwIfAborted();
+        if (!validateAuthority()) return;
         publishPersonalEntryHandoff(authToken, result);
+        if (!validateAuthority()) return;
         setPhase("ready");
         // The flow has configured the in-memory client and persisted the exact
         // binding. Its session-bound handoff receipt lets app-mode consume the
         // same authoritative result without a duplicate identity request.
       } catch (err) {
-        if (controller.signal.aborted) return;
+        if (!validateAuthority()) return;
         setError(describeJoinError(err));
         setPhase("error");
       }
     })();
-    activeAttemptRef.current = { controller, promise: attempt };
+    attemptRecord.promise = attempt;
     await attempt;
-    if (activeAttemptRef.current?.controller === controller) {
+    if (activeAttemptRef.current === attemptRecord) {
       activeAttemptRef.current = null;
     }
   }, []);
@@ -116,7 +136,7 @@ export default function JoinPage(): React.JSX.Element {
       // cycle while preserving refs. Reset the launch guard before aborting so
       // the second setup can replace the intentionally cancelled request.
       // On a real unmount there is no second setup, so this remains inert.
-      startedRef.current = false;
+      startedRef.current = null;
       activeAttemptRef.current?.controller.abort(
         new DOMException("Join page unmounted", "AbortError"),
       );
@@ -127,6 +147,10 @@ export default function JoinPage(): React.JSX.Element {
   useEffect(() => {
     if (!session.ready) return;
     if (!session.authenticated) {
+      startedRef.current = null;
+      activeAttemptRef.current?.controller.abort(
+        new DOMException("Steward session ended during join", "AbortError"),
+      );
       if (ssoDecisionRef.current) return;
       ssoDecisionRef.current = true;
       if (!shouldAutoBridgeToSso()) {
@@ -145,14 +169,33 @@ export default function JoinPage(): React.JSX.Element {
       appModeNavigation.replace(appHandoff);
       return;
     }
-    if (startedRef.current) return;
-    startedRef.current = true;
-    void start();
-  }, [session.ready, session.authenticated, appHandoff, start]);
+    const authToken = session.authToken ?? resolveJoinAuthToken();
+    if (!authToken) {
+      startedRef.current = null;
+      activeAttemptRef.current?.controller.abort(
+        new DOMException(
+          "Steward bearer unavailable during join",
+          "AbortError",
+        ),
+      );
+      return;
+    }
+    if (startedRef.current === authToken) return;
+    startedRef.current = authToken;
+    void start(authToken);
+  }, [
+    session.ready,
+    session.authenticated,
+    session.authToken,
+    appHandoff,
+    start,
+  ]);
 
   const handleRetry = useCallback(() => {
-    startedRef.current = true;
-    void start();
+    const authToken = resolveJoinAuthToken();
+    if (!authToken) return;
+    startedRef.current = authToken;
+    void start(authToken);
   }, [start]);
 
   const handleSignOut = useCallback(async () => {

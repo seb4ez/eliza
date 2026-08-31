@@ -17,7 +17,10 @@ const platform = vi.hoisted(() => ({
 }));
 
 vi.mock("@capacitor/core", () => ({
-  Capacitor: { isNativePlatform: () => platform.native },
+  Capacitor: {
+    isNativePlatform: () => platform.native,
+    registerPlugin: vi.fn(() => ({})),
+  },
   CapacitorHttp: {
     get: vi.fn(),
     post: vi.fn(),

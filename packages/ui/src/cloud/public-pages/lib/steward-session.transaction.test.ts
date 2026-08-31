@@ -4,15 +4,15 @@ import {
   registerStewardTokenPersistence,
   STEWARD_SESSION_CHANGE_EVENT,
   STEWARD_TOKEN_KEY,
+  StewardSessionError,
   writeStoredStewardToken,
 } from "@elizaos/shared/steward-session-client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { enqueueStewardSessionMutation } from "../../lib/steward-session-mutation-queue";
 import {
   beginStewardSessionRecovery,
-  completeStewardSessionRecovery,
   completeStewardSessionRecoverySnapshot,
-  isStewardSessionRecoveryReceiptLive,
+  createStewardSessionRecoveryPublicationFence,
   readStewardSessionRecovery,
   type StewardSessionRecoveryReceipt,
 } from "../../lib/steward-session-recovery-marker";
@@ -52,6 +52,15 @@ function createMemoryStorage(): Storage {
 
 let storage: Storage;
 
+function publicationFence(recovery: StewardSessionRecoveryReceipt): {
+  validate(): boolean;
+  finalizeBeforePublish(): (durableRestored: boolean) => void;
+  isFinalized(): boolean;
+  publishChange(): boolean;
+} {
+  return createStewardSessionRecoveryPublicationFence(recovery);
+}
+
 beforeEach(() => {
   storage = createMemoryStorage();
   vi.stubGlobal("localStorage", storage);
@@ -74,14 +83,23 @@ async function runProviderTransaction(
   token: string,
 ): Promise<boolean> {
   return enqueueStewardSessionMutation(async (mutationLease) => {
-    if (!isStewardSessionRecoveryReceiptLive(recovery)) return false;
+    const fence = publicationFence(recovery);
+    if (!fence.validate()) return false;
     await syncStewardSessionCookie(token, null, {
       mutationLease,
-      validate: () => isStewardSessionRecoveryReceiptLive(recovery),
+      validate: fence.validate,
+      finalizeBeforePublish: fence.finalizeBeforePublish,
     });
-    if (!isStewardSessionRecoveryReceiptLive(recovery)) return false;
-    completeStewardSessionRecovery(recovery);
-    return true;
+    const published =
+      fence.isFinalized() &&
+      fence.publishChange() &&
+      fence.validate() &&
+      storage.getItem(STEWARD_TOKEN_KEY) === token;
+    if (!published) return false;
+    window.dispatchEvent(
+      new CustomEvent("steward-token-sync", { detail: { token } }),
+    );
+    return fence.validate() && storage.getItem(STEWARD_TOKEN_KEY) === token;
   });
 }
 
@@ -90,19 +108,81 @@ async function runOAuthTransaction(
   code: string,
 ): Promise<boolean> {
   return enqueueStewardSessionMutation(async (mutationLease) => {
-    if (!isStewardSessionRecoveryReceiptLive(recovery)) return false;
+    const fence = publicationFence(recovery);
+    if (!fence.validate()) return false;
     const result = await exchangeStewardCodeViaApi(code, { mutationLease });
-    if (!result.token || !isStewardSessionRecoveryReceiptLive(recovery)) {
+    if (!result.token || !fence.validate()) {
       return false;
     }
-    await writeStoredStewardToken(result.token, {
-      validate: () => isStewardSessionRecoveryReceiptLive(recovery),
+    const writeAuthority = await writeStoredStewardToken(result.token, {
+      validate: fence.validate,
+      finalizeBeforePublish: fence.finalizeBeforePublish,
     });
-    if (!isStewardSessionRecoveryReceiptLive(recovery)) return false;
-    completeStewardSessionRecovery(recovery);
-    return true;
+    return (
+      Boolean(writeAuthority) &&
+      fence.isFinalized() &&
+      fence.publishChange() &&
+      fence.validate() &&
+      storage.getItem(STEWARD_TOKEN_KEY) === result.token
+    );
   });
 }
+
+describe("logout cooldown session establishment", () => {
+  it("preserves the structured cooldown and never publishes a provider token", async () => {
+    globalThis.fetch = vi.fn(async () =>
+      Response.json(
+        {
+          error:
+            "You signed out moments ago. Wait 4 seconds, then sign in again to create a new session.",
+          code: "logout_cooldown",
+          retryAfterSeconds: 4,
+          retryAtEpochSeconds: 2_000_000_004,
+        },
+        { status: 409, headers: { "Retry-After": "4" } },
+      ),
+    ) as unknown as typeof fetch;
+
+    let failure: unknown;
+    try {
+      await syncStewardSessionCookie("ambiguous-provider-token");
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(StewardSessionError);
+    expect(failure).toMatchObject({
+      code: "logout_cooldown",
+      status: 409,
+      retryAfterSeconds: 4,
+      retryAtEpochSeconds: 2_000_000_004,
+    });
+    expect(storage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+  });
+
+  it("never returns an OAuth token when nonce establishment is in cooldown", async () => {
+    globalThis.fetch = vi.fn(async () =>
+      Response.json(
+        {
+          error:
+            "You signed out moments ago. Wait 3 seconds, then sign in again to create a new session.",
+          code: "logout_cooldown",
+          retryAfterSeconds: 3,
+        },
+        { status: 409, headers: { "Retry-After": "3" } },
+      ),
+    ) as unknown as typeof fetch;
+
+    await expect(
+      exchangeStewardCodeViaApi("consumed-oauth-code"),
+    ).rejects.toMatchObject({
+      code: "logout_cooldown",
+      status: 409,
+      retryAfterSeconds: 3,
+    });
+    expect(storage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+  });
+});
 
 describe("full Steward session transactions", () => {
   it("keeps provider C as server and local authority when provider B was already in flight", async () => {
@@ -215,5 +295,167 @@ describe("full Steward session transactions", () => {
       unregisterPersistence();
       window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, onAuthority);
     }
+  });
+
+  it("retires A before its authority event and preserves reentrant login B", async () => {
+    globalThis.fetch = vi.fn(async () =>
+      Response.json({ ok: true }),
+    ) as unknown as typeof fetch;
+    const recoveryA = beginStewardSessionRecovery(TENANT, "provider");
+    let recoveryB: StewardSessionRecoveryReceipt | undefined;
+    let receiptsAtPublication: readonly string[] | undefined;
+    const onAuthority = () => {
+      receiptsAtPublication = readStewardSessionRecovery(TENANT).receipts;
+      recoveryB = beginStewardSessionRecovery(TENANT, "provider");
+    };
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, onAuthority, {
+      once: true,
+    });
+
+    try {
+      await expect(
+        runProviderTransaction(recoveryA, "provider-token-a"),
+      ).resolves.toBe(false);
+    } finally {
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, onAuthority);
+    }
+
+    expect(receiptsAtPublication).toEqual([]);
+    expect(recoveryB).toBeDefined();
+    expect(readStewardSessionRecovery(TENANT).receipts).toEqual([
+      recoveryB?.receipt,
+    ]);
+    expect(storage.getItem(STEWARD_TOKEN_KEY)).toBe("provider-token-a");
+  });
+
+  it("suppresses token-sync when recovery publication reentrantly starts B", async () => {
+    globalThis.fetch = vi.fn(async () =>
+      Response.json({ ok: true }),
+    ) as unknown as typeof fetch;
+    const recoveryA = beginStewardSessionRecovery(TENANT, "provider");
+    let recoveryB: StewardSessionRecoveryReceipt | undefined;
+    const eventOrder: string[] = [];
+    const onAuthority = () => eventOrder.push("authority");
+    const onRecovery = () => {
+      eventOrder.push("recovery");
+      recoveryB = beginStewardSessionRecovery(TENANT, "provider");
+    };
+    const onTokenSync = () => eventOrder.push("token-sync");
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, onAuthority);
+    window.addEventListener(
+      "eliza-steward-session-recovery-change",
+      onRecovery,
+      { once: true },
+    );
+    window.addEventListener("steward-token-sync", onTokenSync);
+
+    try {
+      await expect(
+        runProviderTransaction(recoveryA, "provider-token-a"),
+      ).resolves.toBe(false);
+    } finally {
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, onAuthority);
+      window.removeEventListener(
+        "eliza-steward-session-recovery-change",
+        onRecovery,
+      );
+      window.removeEventListener("steward-token-sync", onTokenSync);
+    }
+
+    expect(eventOrder).toEqual(["authority", "recovery"]);
+    expect(recoveryB?.preexistingReceipts).toEqual([]);
+    expect(readStewardSessionRecovery(TENANT).receipts).toEqual([
+      recoveryB?.receipt,
+    ]);
+    expect(storage.getItem(STEWARD_TOKEN_KEY)).toBe("provider-token-a");
+  });
+
+  it("finishes fenced cleanup when the authority event aborts its signal", async () => {
+    globalThis.fetch = vi.fn(async () =>
+      Response.json({ ok: true }),
+    ) as unknown as typeof fetch;
+    const recovery = beginStewardSessionRecovery(TENANT, "provider");
+    const fence = publicationFence(recovery);
+    const controller = new AbortController();
+    const eventOrder: string[] = [];
+    const onAuthority = () => {
+      eventOrder.push("authority");
+      controller.abort();
+    };
+    const onRecovery = () => eventOrder.push("recovery");
+    const onTokenSync = () => eventOrder.push("token-sync");
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, onAuthority, {
+      once: true,
+    });
+    window.addEventListener(
+      "eliza-steward-session-recovery-change",
+      onRecovery,
+      { once: true },
+    );
+    window.addEventListener("steward-token-sync", onTokenSync, { once: true });
+
+    try {
+      await expect(
+        enqueueStewardSessionMutation(async (mutationLease) => {
+          await syncStewardSessionCookie("provider-token-a", null, {
+            signal: controller.signal,
+            mutationLease,
+            validate: () => !controller.signal.aborted && fence.validate(),
+            finalizeBeforePublish: fence.finalizeBeforePublish,
+          });
+          expect(fence.isFinalized()).toBe(true);
+          expect(storage.getItem(STEWARD_TOKEN_KEY)).toBe("provider-token-a");
+          expect(fence.publishChange()).toBe(true);
+          window.dispatchEvent(new CustomEvent("steward-token-sync"));
+        }),
+      ).resolves.toBeUndefined();
+    } finally {
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, onAuthority);
+      window.removeEventListener(
+        "eliza-steward-session-recovery-change",
+        onRecovery,
+      );
+      window.removeEventListener("steward-token-sync", onTokenSync);
+    }
+
+    expect(controller.signal.aborted).toBe(true);
+    expect(eventOrder).toEqual(["authority", "recovery", "token-sync"]);
+    expect(readStewardSessionRecovery(TENANT).receipts).toEqual([]);
+  });
+
+  it("suppresses unfenced A token-sync when its authority event starts B", async () => {
+    globalThis.fetch = vi.fn(async () =>
+      Response.json({ ok: true }),
+    ) as unknown as typeof fetch;
+    const recoveryA = beginStewardSessionRecovery(TENANT, "provider");
+    let recoveryB: StewardSessionRecoveryReceipt | undefined;
+    const tokenSync = vi.fn();
+    const onAuthority = () => {
+      recoveryB = beginStewardSessionRecovery(TENANT, "provider");
+    };
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, onAuthority, {
+      once: true,
+    });
+    window.addEventListener("steward-token-sync", tokenSync);
+
+    try {
+      await expect(
+        enqueueStewardSessionMutation((mutationLease) =>
+          syncStewardSessionCookie("provider-token-a", null, {
+            mutationLease,
+            validate: () =>
+              readStewardSessionRecovery(TENANT).generation ===
+              recoveryA.receipt,
+          }),
+        ),
+      ).resolves.toBeUndefined();
+    } finally {
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, onAuthority);
+      window.removeEventListener("steward-token-sync", tokenSync);
+    }
+
+    expect(recoveryB).toBeDefined();
+    expect(tokenSync).not.toHaveBeenCalled();
+    expect(storage.getItem(STEWARD_TOKEN_KEY)).toBe("provider-token-a");
   });
 });

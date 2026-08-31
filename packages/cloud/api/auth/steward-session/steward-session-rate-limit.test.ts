@@ -11,6 +11,7 @@
 import { beforeEach, describe, expect, mock, test } from "bun:test";
 import { STEWARD_SESSION_MUTATION_PROTOCOL_VALUE } from "@elizaos/shared/steward-session-client";
 import { Hono } from "hono";
+import { STEWARD_REFRESH_AUTHORITY_TTL_SECONDS } from "@/lib/auth/steward-cookies";
 
 const emitAudit = mock(async () => undefined);
 const verifyStewardTokenCached = mock(async (_env: unknown, token: string) =>
@@ -19,6 +20,7 @@ const verifyStewardTokenCached = mock(async (_env: unknown, token: string) =>
         userId: "steward-user-1",
         email: "person@example.test",
         expiration: Math.floor(Date.now() / 1000) + 900,
+        issuedAt: Math.floor(Date.now() / 1000) - 10,
       }
     : null,
 );
@@ -57,7 +59,13 @@ mock.module("@/api-app/services/audit-dispatcher-singleton", () => ({
 }));
 
 mock.module("@/lib/auth/steward-client", () => ({
+  STEWARD_VERIFY_CLOCK_SKEW_SECONDS: 300,
   verifyStewardTokenCached,
+}));
+
+mock.module("@/lib/services/sso-bridge-codes", () => ({
+  classifySsoBridgeLogout: mock(async () => ({ status: "allowed" as const })),
+  isBlockedBySsoBridgeLogout: mock(async () => false),
 }));
 
 mock.module("@/lib/steward-sync", () => ({
@@ -98,7 +106,8 @@ function postStewardSession(body: unknown, ip = "203.0.113.10") {
       headers: {
         "cf-connecting-ip": ip,
         "content-type": "application/json",
-        origin: "https://staging.elizacloud.ai",
+        origin: "https://staging.eliza.app",
+        "sec-fetch-site": "same-origin",
         "x-eliza-csrf": STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
       },
       body: JSON.stringify(body),
@@ -142,12 +151,53 @@ describe("POST /api/auth/steward-session — Redis outage fallback limiter", () 
       stewardUserId: "steward-user-1",
     });
     const setCookie = res.headers.get("set-cookie") ?? "";
-    expect(setCookie).toContain("steward-token-staging=valid-steward-token");
     expect(setCookie).toContain(
-      "steward-refresh-token-staging=valid-refresh-token",
+      "__Host-steward-token-v2-staging=valid-steward-token",
     );
+    expect(setCookie).toContain(
+      "__Host-steward-refresh-token-v2-staging=valid-refresh-token",
+    );
+    for (const cookieName of [
+      "__Host-steward-token-v2-staging",
+      "__Host-steward-refresh-token-v2-staging",
+    ]) {
+      expect(
+        res.headers
+          .getSetCookie()
+          .find((cookie) => cookie.startsWith(`${cookieName}=`)),
+      ).toContain(`Max-Age=${STEWARD_REFRESH_AUTHORITY_TTL_SECONDS}`);
+    }
     expect(verifyStewardTokenCached).toHaveBeenCalledTimes(1);
     expect(syncUserFromSteward).toHaveBeenCalledTimes(1);
+  });
+
+  test("a token admitted near exp plus verifier skew still installs a full 30-day refresh lineage", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    verifyStewardTokenCached.mockResolvedValueOnce({
+      userId: "steward-user-near-expiry",
+      email: "near-expiry@example.test",
+      // The normal verifier admits through exp + 299 seconds. Cookie lifetime
+      // begins here, so lineage must cover this late installation window.
+      expiration: now - 299,
+      issuedAt: now - 60 * 60 - 299,
+    });
+
+    const res = await postStewardSession({
+      token: "near-expiry-steward-token",
+      refreshToken: "near-expiry-refresh-token",
+    });
+
+    expect(res.status).toBe(200);
+    for (const cookieName of [
+      "__Host-steward-token-v2-staging",
+      "__Host-steward-refresh-token-v2-staging",
+    ]) {
+      expect(
+        res.headers
+          .getSetCookie()
+          .find((cookie) => cookie.startsWith(`${cookieName}=`)),
+      ).toContain(`Max-Age=${STEWARD_REFRESH_AUTHORITY_TTL_SECONDS}`);
+    }
   });
 
   test("invalid-token spray is still bounded by the local fallback bucket", async () => {

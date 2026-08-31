@@ -169,7 +169,11 @@ describe("StewardLoginSection local test account sign-in", () => {
     setCookie("eliza-test-auth=; Max-Age=0; Path=/");
     sessionSpies.sync.mockResolvedValue(undefined);
     sessionSpies.recover.mockResolvedValue({ ok: true });
-    sessionSpies.recoverEmail.mockResolvedValue({ ok: true });
+    sessionSpies.recoverEmail.mockResolvedValue({
+      ok: true,
+      token: "recovered-token",
+      isCurrent: () => true,
+    });
     sessionSpies.hasAuthedCookie.mockReturnValue(false);
   });
 

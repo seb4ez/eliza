@@ -130,7 +130,7 @@ describe("createCliSessionThinApp", () => {
       {
         method: "POST",
         headers: {
-          cookie: "steward-token-test=ambient",
+          cookie: "__Host-steward-token-v2-test=ambient",
           origin: "https://evil.example",
           "content-type": "application/json",
         },

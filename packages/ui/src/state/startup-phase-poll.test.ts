@@ -4,6 +4,8 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FirstRunOptions } from "../api";
+import "../api/client-agent";
+import { ElizaClient } from "../api/client-base";
 import { ANDROID_LOCAL_AGENT_IPC_BASE } from "../first-run/mobile-runtime-mode";
 import { clearPersistedActiveServer } from "./persistence";
 import {
@@ -203,6 +205,225 @@ describe("resolveStartupCloudControlPlaneBase", () => {
 });
 
 describe("runPollingBackend", () => {
+  it("does not issue the first poll when restored authority was superseded before the effect starts", async () => {
+    const deps = createDeps();
+    const dispatch = vi.fn();
+    const clearIfCurrent = vi.fn(() => false);
+    const ctx: RestoringSessionCtx = {
+      persistedActiveServer: null,
+      restoredActiveServer: {
+        id: "cloud:agent-a",
+        kind: "cloud",
+        label: "Eliza Cloud A",
+        apiBase: "https://agent-a.cloud.eliza.app",
+        accessToken: "agent-a-bearer",
+      },
+      shouldPreserveCompletedFirstRun: true,
+      hadPriorFirstRun: true,
+      restoredConnectionAuthority: {
+        isCurrent: () => false,
+        clearIfCurrent,
+      },
+    };
+
+    await runPollingBackend(
+      deps,
+      dispatch,
+      {
+        supportsLocalRuntime: false,
+        backendTimeoutMs: 1_000,
+        agentReadyTimeoutMs: 1_000,
+        probeForExistingInstall: false,
+        defaultTarget: "cloud-managed",
+      },
+      ctx,
+      1,
+      { current: 1 },
+      { current: false },
+      { current: null },
+      "cloud-managed",
+    );
+
+    expect(clearIfCurrent).toHaveBeenCalledTimes(1);
+    expect(clientMock.getAuthStatus).not.toHaveBeenCalled();
+    expect(clientMock.getFirstRunStatus).not.toHaveBeenCalled();
+    expect(clientMock.setBaseUrl).not.toHaveBeenCalled();
+    expect(clientMock.setToken).not.toHaveBeenCalled();
+    expect(clearPersistedActiveServer).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(deps.setFirstRunComplete).not.toHaveBeenCalled();
+    expect(deps.setFirstRunLoading).not.toHaveBeenCalled();
+  });
+
+  it("drops an auth probe result when restore authority changes during its await", async () => {
+    const deps = createDeps();
+    const dispatch = vi.fn();
+    let authorityCurrent = true;
+    const clearIfCurrent = vi.fn(() => false);
+    let resolveAuth!: (value: {
+      required: boolean;
+      pairingEnabled: boolean;
+      expiresAt: null;
+    }) => void;
+    clientMock.getAuthStatus.mockReturnValue(
+      new Promise((resolve) => {
+        resolveAuth = resolve;
+      }),
+    );
+    const ctx: RestoringSessionCtx = {
+      persistedActiveServer: null,
+      restoredActiveServer: {
+        id: "cloud:agent-a",
+        kind: "cloud",
+        label: "Eliza Cloud A",
+        apiBase: "https://agent-a.cloud.eliza.app",
+        accessToken: "agent-a-bearer",
+      },
+      shouldPreserveCompletedFirstRun: true,
+      hadPriorFirstRun: true,
+      restoredConnectionAuthority: {
+        isCurrent: () => authorityCurrent,
+        clearIfCurrent,
+      },
+    };
+
+    const run = runPollingBackend(
+      deps,
+      dispatch,
+      {
+        supportsLocalRuntime: false,
+        backendTimeoutMs: 1_000,
+        agentReadyTimeoutMs: 1_000,
+        probeForExistingInstall: false,
+        defaultTarget: "cloud-managed",
+      },
+      ctx,
+      1,
+      { current: 1 },
+      { current: false },
+      { current: null },
+      "cloud-managed",
+    );
+    await vi.waitFor(() => expect(clientMock.getAuthStatus).toHaveBeenCalled());
+    authorityCurrent = false;
+    resolveAuth({ required: false, pairingEnabled: false, expiresAt: null });
+    await run;
+
+    expect(clearIfCurrent).toHaveBeenCalledTimes(1);
+    expect(clientMock.getFirstRunStatus).not.toHaveBeenCalled();
+    expect(clearPersistedActiveServer).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(deps.setFirstRunComplete).not.toHaveBeenCalled();
+    expect(deps.setFirstRunLoading).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "202 resume",
+      () =>
+        new Response(JSON.stringify({ status: "starting" }), {
+          status: 202,
+          headers: {
+            "content-type": "application/json",
+            "retry-after": "1",
+          },
+        }),
+    ],
+    [
+      "feature_starting",
+      () =>
+        new Response(
+          JSON.stringify({
+            error: "feature_starting",
+            code: "feature_starting",
+            retryable: true,
+          }),
+          {
+            status: 503,
+            headers: {
+              "content-type": "application/json",
+              "retry-after": "1",
+            },
+          },
+        ),
+    ],
+  ])(
+    "stops the real %s transport retry after restore A is superseded during backoff",
+    async (_label, firstResponse) => {
+      vi.useFakeTimers();
+      const deps = createDeps();
+      const dispatch = vi.fn();
+      const baseA = "https://agent-a.cloud.eliza.app";
+      const realClient = new ElizaClient(baseA, "agent-a-bearer");
+      const transportA = vi.fn().mockResolvedValue(firstResponse());
+      realClient.setRequestTransport({ request: transportA });
+      clientMock.getBaseUrl.mockReturnValue(baseA);
+      clientMock.hasToken.mockReturnValue(true);
+      clientMock.getAuthStatus.mockImplementation((options) =>
+        realClient.getAuthStatus(options),
+      );
+
+      let authorityCurrent = true;
+      const clearIfCurrent = vi.fn(() => false);
+      const ctx: RestoringSessionCtx = {
+        persistedActiveServer: null,
+        restoredActiveServer: {
+          id: "cloud:agent-a",
+          kind: "cloud",
+          label: "Eliza Cloud A",
+          apiBase: baseA,
+          accessToken: "agent-a-bearer",
+        },
+        shouldPreserveCompletedFirstRun: true,
+        hadPriorFirstRun: true,
+        restoredConnectionAuthority: {
+          isCurrent: () => authorityCurrent,
+          clearIfCurrent,
+        },
+      };
+
+      const run = runPollingBackend(
+        deps,
+        dispatch,
+        {
+          supportsLocalRuntime: false,
+          backendTimeoutMs: 10_000,
+          agentReadyTimeoutMs: 10_000,
+          probeForExistingInstall: false,
+          defaultTarget: "cloud-managed",
+        },
+        ctx,
+        1,
+        { current: 1 },
+        { current: false },
+        { current: null },
+        "cloud-managed",
+      );
+
+      await vi.waitFor(() => expect(transportA).toHaveBeenCalledTimes(1));
+      expect(String(transportA.mock.calls[0]?.[0])).toBe(
+        `${baseA}/api/auth/status`,
+      );
+      expect(clientMock.getAuthStatus).toHaveBeenCalledWith({
+        validate: expect.any(Function),
+      });
+
+      // Login/recovery generation B begins while rawRequest is in its first
+      // server-directed retry backoff. No second A transport may dispatch.
+      authorityCurrent = false;
+      await vi.advanceTimersByTimeAsync(1_000);
+      await run;
+
+      expect(transportA).toHaveBeenCalledTimes(1);
+      expect(clearIfCurrent).toHaveBeenCalledTimes(1);
+      expect(clientMock.getFirstRunStatus).not.toHaveBeenCalled();
+      expect(clearPersistedActiveServer).not.toHaveBeenCalled();
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(deps.setFirstRunComplete).not.toHaveBeenCalled();
+      expect(deps.setFirstRunLoading).not.toHaveBeenCalled();
+    },
+  );
+
   it("does not let stale persisted first-run completion override an incomplete backend", async () => {
     const deps = createDeps();
     const dispatch = vi.fn();

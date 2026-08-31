@@ -80,7 +80,7 @@ afterEach(() => {
 
 function cookieContext(): AppContext {
   const headers: Record<string, string> = {
-    cookie: "steward-token-test=session-token",
+    cookie: "__Host-steward-token-v2=session-token",
     host: "cloud.test",
     origin: "https://cloud.test",
     "x-eliza-csrf": "csrf-proof",

@@ -24,6 +24,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Navigate, useNavigate, useSearchParams } from "react-router-dom";
 import { Button } from "../../components/ui/button";
 import { isSafeNavigationUrl } from "../lib/navigation-url";
+import type { StewardSessionRecoveryCommittedAuthority } from "../lib/steward-session-recovery-marker";
 import { confirmTelegramAccountClaim } from "../public-pages/lib/steward-session";
 import { useCloudT } from "../shell/CloudI18nProvider";
 import {
@@ -68,6 +69,8 @@ export default function GetStartedPage(): React.JSX.Element {
   const [error, setError] = useState<string | null>(null);
   const [platformIdentity, setPlatformIdentity] =
     useState<MessagingContinuationPreview | null>(null);
+  const [telegramClaimAuthority, setTelegramClaimAuthority] =
+    useState<StewardSessionRecoveryCommittedAuthority | null>(null);
   const [
     telegramClaimPersistenceRecovered,
     setTelegramClaimPersistenceRecovered,
@@ -138,7 +141,16 @@ export default function GetStartedPage(): React.JSX.Element {
       if (!stewardToken) {
         throw new Error("Sign in again to connect this Telegram chat.");
       }
-      await confirmTelegramAccountClaim(stewardToken, continuation);
+      const authority = await confirmTelegramAccountClaim(
+        stewardToken,
+        continuation,
+      );
+      if (!authority.isCurrent()) {
+        throw new Error(
+          "Another sign-in superseded this Telegram confirmation.",
+        );
+      }
+      setTelegramClaimAuthority(authority);
       setPhase("done");
     } catch (err) {
       // error-policy:J4 claim failures remain visible and retryable; the
@@ -197,6 +209,16 @@ export default function GetStartedPage(): React.JSX.Element {
     void preview(token);
   }, [session.ready, session.authenticated, telegramClaimToken, preview]);
 
+  useEffect(() => {
+    if (phase !== "done" || !telegramClaimToken) return;
+    if (!telegramClaimAuthority?.isCurrent()) {
+      setError("Another sign-in superseded this Telegram confirmation.");
+      setPhase("error");
+      return;
+    }
+    navigate("/join", { replace: true });
+  }, [navigate, phase, telegramClaimAuthority, telegramClaimToken]);
+
   if (
     session.ready &&
     !session.authenticated &&
@@ -209,10 +231,6 @@ export default function GetStartedPage(): React.JSX.Element {
 
   if (session.ready && session.authenticated && !pendingToken) {
     // Nothing to redeem — treat as a plain post-login entry.
-    return <Navigate to="/join" replace />;
-  }
-
-  if (phase === "done" && telegramClaimToken) {
     return <Navigate to="/join" replace />;
   }
 

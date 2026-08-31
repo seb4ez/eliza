@@ -15,22 +15,41 @@
 
 import { type UseQueryResult, useQuery } from "@tanstack/react-query";
 import { client } from "../../api";
+import { bindDirectCloudLoginToPersonalAgent } from "../../state/bind-direct-cloud-login";
 import {
-  savePersistedActiveServer,
-  savePersistedFirstRunComplete,
-} from "../../state/persistence";
-import {
-  resolveJoinAuthToken,
-  resolveJoinCloudApiBase,
-} from "../join/lib/resolve-cloud-connection";
+  captureStoredStewardLoginAuthority,
+  type StoredStewardLoginAuthority,
+} from "../../state/cloud-steward-login";
+import { savePersistedFirstRunComplete } from "../../state/persistence";
+import { resolveJoinCloudApiBase } from "../join/lib/resolve-cloud-connection";
 import { type JoinFlowResult, runJoinFlow } from "../join/lib/run-join-flow";
 
 interface PersonalEntryHandoff {
   authToken: string;
+  recoveryGeneration: string | null;
   result: JoinFlowResult;
 }
 
 let pendingPersonalEntryHandoff: PersonalEntryHandoff | null = null;
+let personalEntryTokenGeneration = 0;
+let personalEntryToken: string | null = null;
+let personalEntryRecoveryGeneration: string | null | undefined;
+
+function queryGenerationForAuthority(
+  authority: StoredStewardLoginAuthority | null,
+): number {
+  const token = authority?.token ?? null;
+  const recoveryGeneration = authority?.recoveryGeneration;
+  if (
+    personalEntryToken !== token ||
+    personalEntryRecoveryGeneration !== recoveryGeneration
+  ) {
+    personalEntryToken = token;
+    personalEntryRecoveryGeneration = recoveryGeneration;
+    personalEntryTokenGeneration += 1;
+  }
+  return personalEntryTokenGeneration;
+}
 
 /**
  * Carry the already-authoritative `/join` result across the public-to-full
@@ -41,13 +60,26 @@ export function publishPersonalEntryHandoff(
   authToken: string,
   result: JoinFlowResult,
 ): void {
-  pendingPersonalEntryHandoff = { authToken, result };
+  const authority = captureStoredStewardLoginAuthority();
+  pendingPersonalEntryHandoff =
+    authority?.token === authToken && authority.isCurrent()
+      ? {
+          authToken,
+          recoveryGeneration: authority.recoveryGeneration,
+          result,
+        }
+      : null;
 }
 
-function takePersonalEntryHandoff(authToken: string): JoinFlowResult | null {
+function takePersonalEntryHandoff(
+  authority: StoredStewardLoginAuthority,
+): JoinFlowResult | null {
   const pending = pendingPersonalEntryHandoff;
   pendingPersonalEntryHandoff = null;
-  return pending?.authToken === authToken ? pending.result : null;
+  return pending?.authToken === authority.token &&
+    pending.recoveryGeneration === authority.recoveryGeneration
+    ? pending.result
+    : null;
 }
 
 /** The persisted-active-server id a resolved personal Eliza binds under. */
@@ -63,23 +95,48 @@ export function personalEntryBindingId(result: JoinFlowResult): string {
 export function usePersonalEntry(
   enabled: boolean,
 ): UseQueryResult<JoinFlowResult> {
+  const authority = enabled ? captureStoredStewardLoginAuthority() : null;
+  const tokenGeneration = queryGenerationForAuthority(authority);
   return useQuery<JoinFlowResult>({
-    queryKey: ["app-mode", "personal-entry"],
-    queryFn: async () => {
-      const authToken = resolveJoinAuthToken();
-      if (!authToken) {
+    // The opaque generation changes for every exact bearer without retaining
+    // credentials in React Query's inspectable cache keys.
+    queryKey: ["app-mode", "personal-entry", tokenGeneration],
+    queryFn: async ({ signal }) => {
+      if (!authority) {
         throw new Error(
-          "PersonalEntry: no Steward session token for an authenticated entry.",
+          "PersonalEntry: no clean Steward session authority for an authenticated entry.",
         );
       }
-      const handedOff = takePersonalEntryHandoff(authToken);
-      if (handedOff) return handedOff;
-      return runJoinFlow({
+      const validateAuthority = () => !signal.aborted && authority.isCurrent();
+      const assertAuthority = () => {
+        signal.throwIfAborted();
+        if (!validateAuthority()) {
+          throw new DOMException(
+            "Personal entry was superseded by a newer login.",
+            "AbortError",
+          );
+        }
+      };
+      assertAuthority();
+      const handedOff = takePersonalEntryHandoff(authority);
+      if (handedOff) {
+        assertAuthority();
+        return handedOff;
+      }
+      assertAuthority();
+      const result = await runJoinFlow({
         client,
-        effects: { savePersistedActiveServer, savePersistedFirstRunComplete },
+        effects: {
+          bindPersonalAgent: bindDirectCloudLoginToPersonalAgent,
+          savePersistedFirstRunComplete,
+        },
         cloudApiBase: resolveJoinCloudApiBase(),
-        authToken,
+        authToken: authority.token,
+        signal,
+        validateAuthority,
       });
+      assertAuthority();
+      return result;
     },
     enabled,
     retry: false,

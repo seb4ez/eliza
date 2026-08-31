@@ -39,10 +39,12 @@ import {
 import { enqueueStewardSessionMutation } from "../../lib/steward-session-mutation-queue";
 import {
   beginStewardSessionRecovery,
-  completeStewardSessionRecoveryReceipt,
+  createStewardSessionRecoveryCommittedAuthority,
+  createStewardSessionRecoveryPublicationFence,
   hasStewardSessionRecovery,
-  isStewardSessionRecoveryReceiptLive,
+  markStewardSessionRecoveryCookiePending,
   rejectStewardSessionRecovery,
+  type StewardSessionRecoveryCommittedAuthority,
 } from "../../lib/steward-session-recovery-marker";
 import {
   configuredStewardTenantId,
@@ -76,7 +78,12 @@ export type OidcResumeTarget =
  * retrying the application request cannot repair a missing browser login.
  */
 export type PreparedOidcResumeTarget =
-  | OidcResumeTarget
+  | Exclude<OidcResumeTarget, { status: "ok" }>
+  | {
+      status: "ok";
+      url: string;
+      authority: StewardSessionRecoveryCommittedAuthority;
+    }
   | { status: "session_missing" }
   | { status: "session_sync_failed" };
 
@@ -193,13 +200,14 @@ export async function prepareOidcResumeTarget(
     return { status: "session_sync_failed" };
   }
   let recoveryReceipt: ReturnType<typeof beginStewardSessionRecovery>;
+  let sessionMutationDispatched = false;
   try {
     recoveryReceipt = beginStewardSessionRecovery(
       STEWARD_TENANT_ID,
       "provider",
     );
     if (recoveryReceipt.preexistingReceipts.length > 0) {
-      completeStewardSessionRecoveryReceipt(recoveryReceipt);
+      rejectStewardSessionRecovery(recoveryReceipt);
       return { status: "session_sync_failed" };
     }
   } catch {
@@ -208,39 +216,59 @@ export async function prepareOidcResumeTarget(
 
   try {
     const committed = await enqueueStewardSessionMutation(async () => {
-      if (!isStewardSessionRecoveryReceiptLive(recoveryReceipt)) return false;
+      const recoveryPublication =
+        createStewardSessionRecoveryPublicationFence(recoveryReceipt);
+      if (!recoveryPublication.validate()) return null;
       // The token was read before waiting for another tab's cookie mutation.
       // Only that exact bearer may be mirrored to the issuer once this lease is
       // acquired; a newer account must never inherit this parked request.
       if (readToken()?.trim() !== token) {
         rejectStewardSessionRecovery(recoveryReceipt);
-        return false;
+        return null;
       }
+      markStewardSessionRecoveryCookiePending(recoveryReceipt, token);
+      sessionMutationDispatched = true;
       await syncSession(token, endpoint);
-      if (
-        !isStewardSessionRecoveryReceiptLive(recoveryReceipt) ||
-        readToken()?.trim() !== token
-      ) {
+      if (!recoveryPublication.validate() || readToken()?.trim() !== token) {
         // The issuer POST may already have committed. Keep a still-live receipt
         // for cookie-first reconciliation rather than pretending the stale
         // continuation can prove which account now owns the browser.
-        return false;
+        return null;
       }
-      completeStewardSessionRecoveryReceipt(recoveryReceipt);
-      return true;
+      const rollback = recoveryPublication.finalizeBeforePublish();
+      if (!recoveryPublication.isFinalized() || readToken()?.trim() !== token) {
+        rollback(false);
+        return null;
+      }
+      if (!recoveryPublication.publishChange()) {
+        rollback(false);
+        return null;
+      }
+      return {
+        authority: createStewardSessionRecoveryCommittedAuthority(
+          recoveryReceipt,
+          token,
+          () => readToken()?.trim() || null,
+        ),
+        rollback,
+      };
     });
-    if (!committed) return { status: "session_sync_failed" };
+    if (!committed?.authority.isCurrent()) {
+      committed?.rollback(false);
+      return { status: "session_sync_failed" };
+    }
+    return Object.defineProperty(target, "authority", {
+      configurable: false,
+      enumerable: false,
+      value: committed.authority,
+      writable: false,
+    }) as PreparedOidcResumeTarget;
   } catch (error) {
     const status =
       error !== null && typeof error === "object" && "status" in error
         ? Reflect.get(error, "status")
         : undefined;
-    if (
-      typeof status === "number" &&
-      status >= 400 &&
-      status < 500 &&
-      status !== 408
-    ) {
+    if (!sessionMutationDispatched || typeof status === "number") {
       rejectStewardSessionRecovery(recoveryReceipt);
     }
     // error-policy:J4 user-facing degrade — a failed cross-origin session sync
@@ -248,6 +276,4 @@ export async function prepareOidcResumeTarget(
     // consumed without the issuer-host session required to authorize it.
     return { status: "session_sync_failed" };
   }
-
-  return target;
 }

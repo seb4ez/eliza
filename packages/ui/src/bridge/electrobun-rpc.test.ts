@@ -362,18 +362,21 @@ describe("desktopSecureStore helpers", () => {
     harness.handle("secureStoreCommitReceipt", () => ({
       ok: true,
       committed: true,
+      value: "tok",
     }));
 
     await expect(
       desktopSecureStoreCommitReceipt(
         "session.steward_token",
         "opaque-receipt",
+        7,
       ),
-    ).resolves.toEqual({ ok: true, committed: true });
+    ).resolves.toEqual({ ok: true, committed: true, value: "tok" });
     expect(harness.calls).toEqual([
       {
         method: "secureStoreCommitReceipt",
         params: {
+          expectedRevision: 7,
           kind: "session.steward_token",
           rollbackReceipt: "opaque-receipt",
         },
@@ -528,6 +531,7 @@ describe("desktopSecureStore helpers", () => {
       desktopSecureStoreCommitReceipt(
         "session.steward_token",
         "opaque-receipt",
+        0,
       ),
     ).resolves.toBeNull();
     await expect(

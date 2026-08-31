@@ -8,7 +8,12 @@
 import { logger } from "@elizaos/logger";
 import { STEWARD_TOKEN_KEY } from "@elizaos/shared/steward-session-client";
 import {
+  abortRuntimeConnectionStorageTransaction,
+  beginRuntimeConnectionStorageTransaction,
+  decideRuntimeConnectionStorageTransaction,
+  finishRuntimeConnectionStorageTransaction,
   getStorageValue,
+  type RuntimeConnectionStorageTransaction,
   removeStorageValueIfCurrent,
   type StorageWriteCompensation,
   type StorageWriteValidationOptions,
@@ -31,7 +36,9 @@ export type { AgentProfile, AgentProfileRegistry } from "./agent-profile-types";
 export interface AgentProfileConnectionPersistenceOptions
   extends StorageWriteValidationOptions {
   /** Final awaited authority step run while both record compensators are live. */
-  finalize?: () => Promise<boolean>;
+  finalize?: (
+    transaction: RuntimeConnectionStorageTransaction | null,
+  ) => Promise<boolean>;
   /** Roll back a partially/finally published authority before record rollback. */
   compensateFinalization?: () => Promise<void>;
   /** Capture the exact composite compensator after the transaction commits. */
@@ -44,6 +51,7 @@ export interface AgentProfileSelectionPersistenceOptions
   finalize?: (
     profile: AgentProfile,
     server: PersistedActiveServer,
+    transaction: RuntimeConnectionStorageTransaction | null,
   ) => Promise<boolean>;
 }
 
@@ -569,7 +577,13 @@ export async function persistAgentProfileSelectionDurably(
         ...(options.captureCompensation
           ? { captureCompensation: options.captureCompensation }
           : {}),
-        ...(finalize ? { finalize: () => finalize(profile, server) } : {}),
+        ...(finalize
+          ? {
+              finalize: (
+                transaction: RuntimeConnectionStorageTransaction | null,
+              ) => finalize(profile, server, transaction),
+            }
+          : {}),
       };
       const persisted = await persistRegistryAndServerDurably(
         nextRegistry,
@@ -601,49 +615,93 @@ async function persistRegistryAndServerDurably(
     );
     return false;
   }
+  const registryValue = JSON.stringify(registry);
+  const serverValue = JSON.stringify(server);
+  let storageTransaction: RuntimeConnectionStorageTransaction | null = null;
+  try {
+    storageTransaction = await beginRuntimeConnectionStorageTransaction([
+      { key: STORAGE_KEY, value: registryValue },
+      { key: ACTIVE_SERVER_KEY, value: serverValue },
+    ]);
+  } catch (cause) {
+    logger.warn(
+      `[agent-profiles] failed to prepare protected connection transaction: ${describePersistenceError(cause)}`,
+    );
+    return false;
+  }
   let registryWrite: Awaited<
     ReturnType<typeof setStorageValueWithCompensation>
   > = null;
   try {
     registryWrite = await setStorageValueWithCompensation(
       STORAGE_KEY,
-      JSON.stringify(registry),
-      options,
+      registryValue,
+      {
+        ...options,
+        ...(storageTransaction
+          ? { runtimeConnectionTransaction: storageTransaction }
+          : {}),
+      },
     );
   } catch (cause) {
+    if (storageTransaction) {
+      try {
+        await abortRuntimeConnectionStorageTransaction(storageTransaction);
+      } catch (rollbackError) {
+        throw new AggregateError(
+          [cause, rollbackError],
+          "Registry persistence and protected connection abort failed",
+        );
+      }
+    }
     logger.warn(
       `[agent-profiles] failed to durably save registry transaction: ${describePersistenceError(cause)}`,
     );
     return false;
   }
-  if (!registryWrite) return false;
+  if (!registryWrite) {
+    if (storageTransaction) {
+      await abortRuntimeConnectionStorageTransaction(storageTransaction);
+    }
+    return false;
+  }
 
   let serverWrite: Awaited<ReturnType<typeof setStorageValueWithCompensation>> =
     null;
   try {
     serverWrite = await setStorageValueWithCompensation(
       ACTIVE_SERVER_KEY,
-      JSON.stringify(server),
-      options,
+      serverValue,
+      {
+        ...options,
+        ...(storageTransaction
+          ? { runtimeConnectionTransaction: storageTransaction }
+          : {}),
+      },
     );
   } catch (cause) {
-    await compensateStorageWrites(registryWrite);
+    await compensateStorageWrites(storageTransaction, registryWrite);
     logger.warn(
       `[agent-profiles] failed to durably save active server: ${describePersistenceError(cause)}`,
     );
     return false;
   }
   if (!serverWrite) {
-    await compensateStorageWrites(registryWrite);
+    await compensateStorageWrites(storageTransaction, registryWrite);
     return false;
   }
   if (options.validate?.() === false) {
-    await compensateStorageWrites(serverWrite, registryWrite);
+    await compensateStorageWrites(
+      storageTransaction,
+      serverWrite,
+      registryWrite,
+    );
     return false;
   }
   let transactionCompensation: Promise<void> | null = null;
   const compensateTransaction = (): Promise<void> => {
     transactionCompensation ??= compensateConnectionWrites(
+      storageTransaction,
       options.compensateFinalization,
       serverWrite,
       registryWrite,
@@ -653,7 +711,7 @@ async function persistRegistryAndServerDurably(
   if (options.finalize) {
     let finalized: boolean;
     try {
-      finalized = await options.finalize();
+      finalized = await options.finalize(storageTransaction);
     } catch (cause) {
       try {
         await compensateTransaction();
@@ -670,22 +728,56 @@ async function persistRegistryAndServerDurably(
       return false;
     }
   }
+  if (storageTransaction) {
+    try {
+      // The Steward persistence adapter may already have made this decision
+      // before its publication finalizer. For connection flows without a new
+      // token, this is the first and only durable global decision point.
+      await decideRuntimeConnectionStorageTransaction(storageTransaction);
+      await finishRuntimeConnectionStorageTransaction(storageTransaction);
+    } catch (cause) {
+      try {
+        await compensateTransaction();
+      } catch (rollbackError) {
+        throw new AggregateError(
+          [cause, rollbackError],
+          "Protected connection commit and compensation both failed",
+        );
+      }
+      throw cause;
+    }
+  }
   options.captureCompensation?.(compensateTransaction);
   return true;
 }
 
 async function compensateStorageWrites(
+  storageTransaction: RuntimeConnectionStorageTransaction | null,
   ...writes: StorageWriteCompensation[]
 ): Promise<void> {
+  const failures: unknown[] = [];
+  if (storageTransaction) {
+    try {
+      await abortRuntimeConnectionStorageTransaction(storageTransaction);
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  // Run participant compensation only after the global transaction has
+  // settled. In a prepared/committed WAL each handle now observes `aborted`
+  // and succeeds without issuing competing per-slot rollback RPCs; after the
+  // WAL was finished, the ordinary revision-fenced commit journals apply.
   const outcomes = await Promise.allSettled(
     writes.map((write) => write.compensate()),
   );
-  const failures = outcomes.flatMap((outcome) =>
-    outcome.status === "rejected"
-      ? [outcome.reason]
-      : outcome.value
-        ? []
-        : [new Error("A protected connection rollback was superseded")],
+  failures.push(
+    ...outcomes.flatMap((outcome) =>
+      outcome.status === "rejected"
+        ? [outcome.reason]
+        : outcome.value
+          ? []
+          : [new Error("A protected connection rollback was superseded")],
+    ),
   );
   if (failures.length > 0) {
     throw new AggregateError(
@@ -696,6 +788,7 @@ async function compensateStorageWrites(
 }
 
 async function compensateConnectionWrites(
+  storageTransaction: RuntimeConnectionStorageTransaction | null,
   compensateFinalization: (() => Promise<void>) | undefined,
   ...writes: StorageWriteCompensation[]
 ): Promise<void> {
@@ -705,6 +798,13 @@ async function compensateConnectionWrites(
       // Durable token authority must settle before client/boot publication is
       // changed; the finalizer owns that dependency ordering internally.
       await compensateFinalization();
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (storageTransaction) {
+    try {
+      await abortRuntimeConnectionStorageTransaction(storageTransaction);
     } catch (error) {
       failures.push(error);
     }
@@ -1364,7 +1464,7 @@ export async function removeAgentProfileWithFallbackDurably(
         }
       } catch (cause) {
         try {
-          await compensateStorageWrites(registryWrite);
+          await compensateStorageWrites(null, registryWrite);
         } catch (rollbackError) {
           throw new AggregateError(
             [cause, rollbackError],
@@ -1374,7 +1474,7 @@ export async function removeAgentProfileWithFallbackDurably(
         throw cause;
       }
       if (!serverCleared) {
-        await compensateStorageWrites(registryWrite);
+        await compensateStorageWrites(null, registryWrite);
         return { ok: false, reason: "persistence-failed" };
       }
 

@@ -17,7 +17,7 @@
  */
 
 import { createHash } from "crypto";
-import { decodeProtectedHeader, type JWTPayload, jwtVerify, SignJWT } from "jose";
+import { compactVerify, decodeProtectedHeader, type JWTPayload, jwtVerify, SignJWT } from "jose";
 import { cache } from "../cache/client";
 import { InMemoryLRUCache } from "../cache/in-memory-lru-cache";
 import { CacheKeys, CacheTTL } from "../cache/keys";
@@ -33,6 +33,7 @@ import {
   StagingSessionConfigurationError,
   validateStagingSessionBinding,
 } from "./staging-session-binding";
+import { STEWARD_REFRESH_AUTHORITY_TTL_SECONDS } from "./steward-cookies";
 
 /**
  * Timeout for LOGIN-PATH calls to the Steward upstream: the OAuth code
@@ -71,9 +72,9 @@ export interface StewardTokenClaims {
    */
   telegramId?: string;
   /**
-   * True when the token was minted by the cross-host SSO bridge exchange
-   * (auth/sso-bridge). Bridge-issued tokens are subject to the fail-closed
-   * logout-marker gate on the session-sync endpoint; ordinary tokens are not.
+   * Provenance bit set when the token was minted by the cross-host SSO bridge
+   * exchange (`auth/sso-bridge`). The fail-closed logout-marker gate applies
+   * to every Steward token, independently of this provenance.
    */
   bridged?: boolean;
   /**
@@ -144,14 +145,25 @@ export interface StewardVerifyOptions {
 
 export const STEWARD_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
 
+/** Clock-skew allowance for expiry and not-before verification. */
+export const STEWARD_VERIFY_CLOCK_SKEW_SECONDS = 5 * 60;
+
 /**
- * Clock-skew allowance between the Steward issuer and this verifier. Steward
- * mints access tokens at exactly STEWARD_ACCESS_TOKEN_TTL_SECONDS, so the
- * acceptance ceiling below adds a small margin — a freshly minted token read
- * against a slightly-ahead issuer clock must not be rejected, while a token
- * claiming a materially longer lifetime still fails closed.
+ * Tightly bounded issuer-ahead allowance for `iat`. This is deliberately much
+ * smaller than the expiry grace because `iat` also orders logout revocation.
  */
-const STEWARD_VERIFY_CLOCK_SKEW_SECONDS = 5 * 60;
+export const STEWARD_FUTURE_ISSUED_AT_TOLERANCE_SECONDS = 5;
+
+/**
+ * Maximum age of an access JWT when it is used only as signed refresh/logout
+ * lineage. A valid access token can be installed as late as its one-hour
+ * issued lifetime plus verifier skew; the 30-day refresh cookie starts at that
+ * installation instant, not at the JWT's iat.
+ */
+export const STEWARD_REFRESH_LINEAGE_TTL_SECONDS =
+  STEWARD_REFRESH_AUTHORITY_TTL_SECONDS +
+  STEWARD_ACCESS_TOKEN_TTL_SECONDS +
+  STEWARD_VERIFY_CLOCK_SKEW_SECONDS;
 
 /**
  * Maximum issued lifetime a presented Steward token may claim. Clock skew is
@@ -447,6 +459,7 @@ function validateStewardLifetime(claims: StewardTokenClaims): boolean {
     {
       maxTtlSeconds: MAX_STEWARD_TOKEN_TTL_SECONDS,
       clockToleranceSeconds: STEWARD_VERIFY_CLOCK_SKEW_SECONDS,
+      futureIssuedAtToleranceSeconds: STEWARD_FUTURE_ISSUED_AT_TOLERANCE_SECONDS,
     },
   );
   if (!result.valid) {
@@ -455,13 +468,60 @@ function validateStewardLifetime(claims: StewardTokenClaims): boolean {
   return result.valid;
 }
 
-async function validateStewardClaims(
+/**
+ * Validate every temporal property of a Steward session JWT except whether its
+ * access authorization has expired. This lane exists only to bind an opaque
+ * refresh cookie (or a durable logout retry) to a signed identity and issuance
+ * generation; callers must never use its result to authorize an API request.
+ */
+function validateStewardRefreshLineageLifetime(claims: StewardTokenClaims): boolean {
+  const now = Math.floor(Date.now() / 1000);
+  const issuedLifetime = validateJwtLifetime(
+    { exp: claims.expiration, iat: claims.issuedAt, nbf: claims.notBefore },
+    {
+      maxTtlSeconds: MAX_STEWARD_TOKEN_TTL_SECONDS,
+      clockToleranceSeconds: STEWARD_VERIFY_CLOCK_SKEW_SECONDS,
+      futureIssuedAtToleranceSeconds: STEWARD_FUTURE_ISSUED_AT_TOLERANCE_SECONDS,
+      // Rewind only the expiration comparison. Shape, issued lifetime, and
+      // future-iat checks still run against a time that cannot make iat valid
+      // when the real clock would reject it.
+      nowSeconds: Math.min(now, claims.expiration - 1),
+    },
+  );
+  if (!issuedLifetime.valid) {
+    logger.warn(`[StewardClient] Rejected refresh lineage: ${issuedLifetime.reason}`);
+    return false;
+  }
+  if (claims.issuedAt > now + STEWARD_FUTURE_ISSUED_AT_TOLERANCE_SECONDS) {
+    logger.warn(
+      "[StewardClient] Rejected refresh lineage: iat is beyond the allowed future clock tolerance",
+    );
+    return false;
+  }
+  if (
+    claims.notBefore !== undefined &&
+    claims.notBefore > now + STEWARD_VERIFY_CLOCK_SKEW_SECONDS
+  ) {
+    logger.warn(
+      "[StewardClient] Rejected refresh lineage: nbf is outside the allowed clock tolerance",
+    );
+    return false;
+  }
+  if (now - claims.issuedAt > STEWARD_REFRESH_LINEAGE_TTL_SECONDS) {
+    logger.warn(
+      "[StewardClient] Rejected refresh lineage: issuance is outside the refresh authority horizon",
+    );
+    return false;
+  }
+  return true;
+}
+
+async function validateStewardClaimsShapeAndScope(
   env: StewardVerifyEnv,
   header: StagingTokenHeader,
   claims: StewardTokenClaims,
   tokenHash: string,
 ): Promise<boolean> {
-  if (!validateStewardLifetime(claims)) return false;
   if (!claims.userId || !claimsMatchTokenClass(header, claims)) return false;
   if (
     (claims.authMethod !== undefined && typeof claims.authMethod !== "string") ||
@@ -478,6 +538,16 @@ async function validateStewardClaims(
     return false;
   }
   return true;
+}
+
+async function validateStewardClaims(
+  env: StewardVerifyEnv,
+  header: StagingTokenHeader,
+  claims: StewardTokenClaims,
+  tokenHash: string,
+): Promise<boolean> {
+  if (!validateStewardLifetime(claims)) return false;
+  return validateStewardClaimsShapeAndScope(env, header, claims, tokenHash);
 }
 
 async function verifyStewardTokenWithoutCaches(input: {
@@ -519,6 +589,59 @@ async function verifyStewardTokenWithoutCaches(input: {
   return (await validateStewardClaims(input.env, input.stagingHeader, claims, input.tokenHash))
     ? claims
     : null;
+}
+
+/**
+ * Verify a signed Steward access JWT as refresh/logout identity lineage.
+ *
+ * This deliberately ignores only the access-token expiration instant. It still
+ * verifies the HS256 signature, protected token type, tenant, claim shape,
+ * not-before/future-iat bounds, maximum one-hour issued lifetime, optional QA
+ * binding, and a hard lineage age covering the 30-day refresh cookie plus its
+ * latest valid access-token installation window. The returned claims are not
+ * API auth authority; use {@link verifyStewardTokenCached} for authentication.
+ */
+export async function verifyStewardRefreshLineageToken(
+  env: StewardVerifyEnv,
+  token: string,
+): Promise<StewardTokenClaims | null> {
+  const stagingHeader = readStagingTokenHeader(token);
+  const secret = stagingHeader.isCandidate
+    ? resolveStagingTokenSecret(env, stagingHeader.keyId)
+    : resolveJwtSecret(env);
+  if (!secret) return null;
+
+  const tokenHash = hashToken(token);
+  try {
+    const verified = await compactVerify(token, secret, {
+      algorithms: ["HS256"],
+    });
+    const ordinaryTypeIsValid =
+      verified.protectedHeader.typ === undefined || verified.protectedHeader.typ === "JWT";
+    if (
+      (stagingHeader.isCandidate && verified.protectedHeader.typ !== STAGING_SESSION_TOKEN_TYP) ||
+      (!stagingHeader.isCandidate && !ordinaryTypeIsValid)
+    ) {
+      logger.warn("[StewardClient] Rejected refresh lineage with an invalid typ header");
+      return null;
+    }
+
+    const decoded = JSON.parse(new TextDecoder().decode(verified.payload)) as unknown;
+    if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) {
+      return null;
+    }
+    const claims = extractClaims(decoded as JWTPayload);
+    if (!validateStewardRefreshLineageLifetime(claims)) return null;
+    return (await validateStewardClaimsShapeAndScope(env, stagingHeader, claims, tokenHash))
+      ? claims
+      : null;
+  } catch (error) {
+    logger.warn("[StewardClient] Refresh lineage verification failed", {
+      tokenHash: tokenHash.substring(0, 8),
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
 }
 
 /**

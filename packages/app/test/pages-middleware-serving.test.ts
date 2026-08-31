@@ -319,7 +319,10 @@ describe("unified host migration", () => {
     ]) {
       const response = await proxyToApiWorker({
         request: new Request(`${origin}/steward/auth/nonce`, {
-          headers: { Accept: "application/json" },
+          headers: {
+            Accept: "application/json",
+            "Sec-Fetch-Site": "same-origin",
+          },
         }),
         env: { API_WORKER: apiWorker },
       });
@@ -330,23 +333,28 @@ describe("unified host migration", () => {
       requests.map((request) => ({
         requestOrigin: new URL(request.url).origin,
         browserOrigin: request.headers.get("Origin"),
+        fetchSite: request.headers.get("Sec-Fetch-Site"),
       })),
     ).toEqual([
       {
         requestOrigin: "https://api.eliza.app",
         browserOrigin: "https://eliza.app",
+        fetchSite: "same-origin",
       },
       {
         requestOrigin: "https://api.eliza.app",
         browserOrigin: "https://cloud.eliza.app",
+        fetchSite: "same-origin",
       },
       {
         requestOrigin: "https://api-staging.eliza.app",
         browserOrigin: "https://staging.eliza.app",
+        fetchSite: "same-origin",
       },
       {
         requestOrigin: "https://api-staging.eliza.app",
         browserOrigin: "https://cloud-staging.eliza.app",
+        fetchSite: "same-origin",
       },
     ]);
   });

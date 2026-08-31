@@ -880,7 +880,10 @@ function buildAppBootConfig(): AppBootConfig {
       (import.meta.env.VITE_ASSET_BASE_URL as string | undefined)?.trim() ||
       undefined,
     cloudApiBase: IOS_RUNTIME_ENV_CONFIG.cloudApiBase,
-    autoUpgradeSharedToDedicated: true,
+    // App composition must not authorize an implicit Shared→Dedicated cutover.
+    // Dedicated creation is a billable lifecycle mutation and must remain
+    // behind an explicit, persisted quote/consent flow.
+    autoUpgradeSharedToDedicated: false,
     vrmAssets: APP_VRM_ASSETS,
     firstRunStyles: APP_STYLE_PRESETS,
     codingAgentTasksPanel: CodingAgentTasksPanel,

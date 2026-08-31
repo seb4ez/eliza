@@ -19,6 +19,7 @@ import {
   beginStewardSessionRecovery,
   readStewardSessionRecovery,
   rejectStewardSessionRecovery,
+  STEWARD_SESSION_RECOVERY_CHANGE_EVENT,
 } from "../../lib/steward-session-recovery-marker";
 
 import {
@@ -36,6 +37,13 @@ function deferred<T>() {
     resolve = resolvePromise;
   });
   return { promise, resolve };
+}
+
+function setDocumentCookie(value: string): void {
+  Object.getOwnPropertyDescriptor(Document.prototype, "cookie")?.set?.call(
+    document,
+    value,
+  );
 }
 
 afterEach(() => {
@@ -227,6 +235,57 @@ describe("prepareOidcResumeTarget", () => {
       status: "ok",
       url: `https://api-staging.eliza.app/api/oidc/authorize/resume?rid=${RID}`,
     });
+    expect(target.status === "ok" && target.authority.isCurrent()).toBe(true);
+  });
+
+  it("does not return a stale resume when recovery publication queues login B", async () => {
+    withIssuer("https://api-staging.eliza.app");
+    let storedToken = "account-a";
+    let recoveryEvents = 0;
+    let newerLogin: ReturnType<typeof beginStewardSessionRecovery> | null =
+      null;
+    const readNewerLogin = () => newerLogin;
+    const beginNewerLoginAfterPublication = () => {
+      recoveryEvents += 1;
+      if (recoveryEvents !== 2) return;
+      queueMicrotask(() => {
+        newerLogin = beginStewardSessionRecovery("elizacloud", "provider");
+        storedToken = "account-b";
+      });
+    };
+    window.addEventListener(
+      STEWARD_SESSION_RECOVERY_CHANGE_EVENT,
+      beginNewerLoginAfterPublication,
+    );
+
+    try {
+      await expect(
+        prepareOidcResumeTarget(
+          RID,
+          "staging.eliza.app",
+          "https://staging.eliza.app",
+          {
+            readToken: () => storedToken,
+            syncSession: async () => undefined,
+          },
+        ),
+      ).resolves.toEqual({ status: "session_sync_failed" });
+      expect(storedToken).toBe("account-b");
+      const recordedNewerLogin = readNewerLogin();
+      expect(recordedNewerLogin).not.toBeNull();
+      expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([
+        recordedNewerLogin?.receipt,
+      ]);
+    } finally {
+      window.removeEventListener(
+        STEWARD_SESSION_RECOVERY_CHANGE_EVENT,
+        beginNewerLoginAfterPublication,
+      );
+      const recordedNewerLogin = readNewerLogin();
+      if (recordedNewerLogin) {
+        rejectStewardSessionRecovery(recordedNewerLogin);
+      }
+    }
   });
 
   it("keeps a durable receipt across tab-close until issuer sync is fully acknowledged", async () => {
@@ -364,5 +423,36 @@ describe("prepareOidcResumeTarget", () => {
         syncSession: () => Promise.reject(new Error("network unavailable")),
       }),
     ).resolves.toEqual({ status: "session_sync_failed" });
+    expect(readStewardSessionRecovery("elizacloud").receipts).toHaveLength(1);
+  });
+
+  it("retires issuer recovery on HTTP 500 without republishing a stale cookie account", async () => {
+    withIssuer("https://api-staging.eliza.app");
+    setDocumentCookie("steward-authed=1; path=/");
+    const syncEvents: Event[] = [];
+    const onSync = (event: Event) => syncEvents.push(event);
+    window.addEventListener("steward-token-sync", onSync);
+
+    try {
+      await expect(
+        prepareOidcResumeTarget(RID, "staging.eliza.app", undefined, {
+          // The attempted account B is injected while durable browser storage
+          // remains empty, matching a stale cookie-only account A document.
+          readToken: () => "attempted-account-b",
+          syncSession: () =>
+            Promise.reject(
+              Object.assign(new Error("Issuer session unavailable"), {
+                status: 500,
+              }),
+            ),
+        }),
+      ).resolves.toEqual({ status: "session_sync_failed" });
+      expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([]);
+      expect(localStorage.getItem("steward_session_token")).toBeNull();
+      expect(syncEvents).toEqual([]);
+    } finally {
+      window.removeEventListener("steward-token-sync", onSync);
+      setDocumentCookie("steward-authed=; Max-Age=0; path=/");
+    }
   });
 });

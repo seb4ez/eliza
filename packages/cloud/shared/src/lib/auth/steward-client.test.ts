@@ -7,7 +7,7 @@
  * staging-session binding module names dbRead at module scope).
  */
 
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, setSystemTime, test } from "bun:test";
 import { createHash } from "crypto";
 import { SignJWT } from "jose";
 
@@ -55,8 +55,14 @@ mock.module("../utils/logger", () => ({
   redact: { id: (v: string) => v, orgId: (v: string) => v, userId: (v: string) => v },
 }));
 
-const { mintStewardTokenFromClaims, STEWARD_ACCESS_TOKEN_TTL_SECONDS, verifyStewardTokenCached } =
-  await import("./steward-client");
+const {
+  mintStewardTokenFromClaims,
+  STEWARD_ACCESS_TOKEN_TTL_SECONDS,
+  STEWARD_FUTURE_ISSUED_AT_TOLERANCE_SECONDS,
+  STEWARD_REFRESH_LINEAGE_TTL_SECONDS,
+  verifyStewardRefreshLineageToken,
+  verifyStewardTokenCached,
+} = await import("./steward-client");
 
 function secretKey(): Uint8Array {
   return new TextEncoder().encode(SECRET);
@@ -85,6 +91,7 @@ describe("verifyStewardTokenCached — token lifecycle claims", () => {
   });
 
   afterEach(() => {
+    setSystemTime();
     memoryCache.clear();
     distributedCacheValue = null;
   });
@@ -199,15 +206,25 @@ describe("verifyStewardTokenCached — token lifecycle claims", () => {
     expect(await verify(token)).toBeNull();
   });
 
-  test("accepts a one-hour token whose issuer clock is just ahead", async () => {
-    const issuedAt = Math.floor(Date.now() / 1000) + 240;
-    const token = await new SignJWT({ sub: "steward-user-skew" })
+  test("accepts iat at five seconds ahead and rejects it at six seconds ahead", async () => {
+    const now = 1_788_086_400;
+    setSystemTime(new Date(now * 1000));
+    expect(STEWARD_FUTURE_ISSUED_AT_TOLERANCE_SECONDS).toBe(5);
+    const acceptedIssuedAt = now + 5;
+    const acceptedToken = await new SignJWT({ sub: "steward-user-skew-boundary" })
       .setProtectedHeader({ alg: "HS256", typ: "JWT" })
-      .setIssuedAt(issuedAt)
-      .setExpirationTime(issuedAt + STEWARD_ACCESS_TOKEN_TTL_SECONDS)
+      .setIssuedAt(acceptedIssuedAt)
+      .setExpirationTime(acceptedIssuedAt + STEWARD_ACCESS_TOKEN_TTL_SECONDS)
       .sign(secretKey());
-    const claims = await verify(token);
-    expect(claims?.userId).toBe("steward-user-skew");
+    const rejectedIssuedAt = now + 6;
+    const rejectedToken = await new SignJWT({ sub: "steward-user-skew-beyond-boundary" })
+      .setProtectedHeader({ alg: "HS256", typ: "JWT" })
+      .setIssuedAt(rejectedIssuedAt)
+      .setExpirationTime(rejectedIssuedAt + STEWARD_ACCESS_TOKEN_TTL_SECONDS)
+      .sign(secretKey());
+
+    expect((await verify(acceptedToken))?.userId).toBe("steward-user-skew-boundary");
+    expect(await verify(rejectedToken)).toBeNull();
   });
 
   test("rejects a 24-hour token presented during its final hour", async () => {
@@ -378,6 +395,109 @@ describe("verifyStewardTokenCached — token lifecycle claims", () => {
       .setExpirationTime(now - 301)
       .sign(secretKey());
     expect(await verify(token)).toBeNull();
+  });
+
+  test("accepts a cryptographically expired JWT only as recent signed refresh lineage", async () => {
+    const now = 1_788_086_400;
+    setSystemTime(new Date(now * 1000));
+    const issuedAt = now - 2 * 60 * 60;
+    const token = await new SignJWT({
+      sub: "steward-user-refresh-lineage",
+      tenantId: "elizacloud",
+    })
+      .setProtectedHeader({ alg: "HS256", typ: "JWT" })
+      .setIssuedAt(issuedAt)
+      .setExpirationTime(issuedAt + STEWARD_ACCESS_TOKEN_TTL_SECONDS)
+      .sign(secretKey());
+
+    await expect(
+      verifyStewardTokenCached({ ...ENV, STEWARD_TENANT_ID: "elizacloud" }, token),
+    ).resolves.toBeNull();
+    await expect(
+      verifyStewardRefreshLineageToken({ ...ENV, STEWARD_TENANT_ID: "elizacloud" }, token),
+    ).resolves.toMatchObject({
+      userId: "steward-user-refresh-lineage",
+      tenantId: "elizacloud",
+      issuedAt,
+    });
+  });
+
+  test("accepts the late-install lineage boundary and rejects it one second later", async () => {
+    const now = 1_788_086_400;
+    setSystemTime(new Date(now * 1000));
+    expect(STEWARD_REFRESH_LINEAGE_TTL_SECONDS).toBe(
+      30 * 24 * 60 * 60 + STEWARD_ACCESS_TOKEN_TTL_SECONDS + 5 * 60,
+    );
+
+    const mintLineageAtAge = async (ageSeconds: number) => {
+      const issuedAt = now - ageSeconds;
+      return new SignJWT({
+        sub: `steward-user-lineage-${ageSeconds}`,
+        tenantId: "elizacloud",
+      })
+        .setProtectedHeader({ alg: "HS256", typ: "JWT" })
+        .setIssuedAt(issuedAt)
+        .setExpirationTime(issuedAt + STEWARD_ACCESS_TOKEN_TTL_SECONDS)
+        .sign(secretKey());
+    };
+
+    const boundary = await mintLineageAtAge(STEWARD_REFRESH_LINEAGE_TTL_SECONDS);
+    const beyondBoundary = await mintLineageAtAge(STEWARD_REFRESH_LINEAGE_TTL_SECONDS + 1);
+
+    await expect(
+      verifyStewardRefreshLineageToken({ ...ENV, STEWARD_TENANT_ID: "elizacloud" }, boundary),
+    ).resolves.toMatchObject({
+      userId: `steward-user-lineage-${STEWARD_REFRESH_LINEAGE_TTL_SECONDS}`,
+    });
+    await expect(
+      verifyStewardRefreshLineageToken({ ...ENV, STEWARD_TENANT_ID: "elizacloud" }, beyondBoundary),
+    ).resolves.toBeNull();
+  });
+
+  test("keeps refresh lineage signature, type, tenant, and nbf checks fail-closed", async () => {
+    const now = 1_788_086_400;
+    setSystemTime(new Date(now * 1000));
+    const issuedAt = now - 2 * 60 * 60;
+    const expiration = issuedAt + STEWARD_ACCESS_TOKEN_TTL_SECONDS;
+    const wrongType = await new SignJWT({
+      sub: "steward-user-wrong-lineage-type",
+      tenantId: "elizacloud",
+      iat: issuedAt,
+      exp: expiration,
+    })
+      .setProtectedHeader({ alg: "HS256", typ: "not-a-steward-session" })
+      .sign(secretKey());
+    const wrongTenant = await new SignJWT({
+      sub: "steward-user-wrong-lineage-tenant",
+      tenantId: "other-tenant",
+      iat: issuedAt,
+      exp: expiration,
+    })
+      .setProtectedHeader({ alg: "HS256", typ: "JWT" })
+      .sign(secretKey());
+    const futureNbf = await new SignJWT({
+      sub: "steward-user-future-lineage-nbf",
+      tenantId: "elizacloud",
+      iat: issuedAt,
+      exp: expiration,
+      nbf: now + 301,
+    })
+      .setProtectedHeader({ alg: "HS256", typ: "JWT" })
+      .sign(secretKey());
+    const wrongSignature = await new SignJWT({
+      sub: "steward-user-wrong-lineage-signature",
+      tenantId: "elizacloud",
+      iat: issuedAt,
+      exp: expiration,
+    })
+      .setProtectedHeader({ alg: "HS256", typ: "JWT" })
+      .sign(new TextEncoder().encode("attacker-controlled-secret"));
+
+    for (const token of [wrongType, wrongTenant, futureNbf, wrongSignature]) {
+      expect(
+        await verifyStewardRefreshLineageToken({ ...ENV, STEWARD_TENANT_ID: "elizacloud" }, token),
+      ).toBeNull();
+    }
   });
 
   test("rejects a token signed with a different secret", async () => {

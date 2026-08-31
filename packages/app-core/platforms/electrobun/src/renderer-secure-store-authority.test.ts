@@ -24,6 +24,7 @@ class MemorySecureStore implements PlatformSecureStore {
   readonly backend = "none" as const;
   readonly operations: string[] = [];
   failNextDelete = false;
+  failNextGet = false;
   failNextSet = false;
   mutateThenFailNextSet = false;
 
@@ -33,6 +34,10 @@ class MemorySecureStore implements PlatformSecureStore {
     _vaultId: string,
     _kind: SecureStoreSecretKind,
   ): Promise<SecureStoreGetResult> {
+    if (this.failNextGet) {
+      this.failNextGet = false;
+      throw new Error("injected get failure");
+    }
     this.operations.push(`get:${this.value ?? "missing"}`);
     return this.value === null
       ? { ok: false, reason: "not_found" }
@@ -109,6 +114,65 @@ function pendingReceiptCount(authority: RendererSecureStoreAuthority): number {
 }
 
 describe("RendererSecureStoreAuthority", () => {
+  it("does not advance mutation visibility when a successor fails before writing", async () => {
+    const store = new MemorySecureStore();
+    const authority = createAuthority(store);
+    const owner = createRendererSecureStoreOwner("predecessor-read-failure");
+    const first = await authority.set(
+      VAULT_ID,
+      TOKEN_KIND,
+      "token-b",
+      owner,
+      "write-b",
+    );
+    if (!first.ok) throw new Error("first write failed");
+    store.failNextGet = true;
+
+    await expect(
+      authority.set(VAULT_ID, TOKEN_KIND, "token-c", owner, "write-c"),
+    ).resolves.toMatchObject({ ok: false, changed: false });
+    await expect(
+      authority.commitReceipt(
+        VAULT_ID,
+        TOKEN_KIND,
+        first.rollbackReceipt,
+        owner,
+      ),
+    ).resolves.toMatchObject({ ok: true, committed: true, value: "token-b" });
+    expect(store.value).toBe("token-b");
+    expect(pendingReceiptCount(authority)).toBe(0);
+  });
+
+  it("settles a current receipt when its revision fence no longer matches", async () => {
+    const store = new MemorySecureStore();
+    const authority = createAuthority(store);
+    const owner = createRendererSecureStoreOwner("revision-mismatch");
+    const write = await authority.set(
+      VAULT_ID,
+      TOKEN_KIND,
+      "token-b",
+      owner,
+      "revision-mismatch-write",
+    );
+    if (!write.ok) throw new Error("write failed");
+
+    await expect(
+      authority.commitReceipt(
+        VAULT_ID,
+        TOKEN_KIND,
+        write.rollbackReceipt,
+        owner,
+        false,
+      ),
+    ).resolves.toMatchObject({
+      ok: true,
+      committed: false,
+      changed: true,
+    });
+    expect(store.value).toBe("prior-token");
+    expect(pendingReceiptCount(authority)).toBe(0);
+  });
+
   it("turns a mutate-then-error backend acknowledgement into a receipt-bearing verified write", async () => {
     const store = new MemorySecureStore();
     const authority = createAuthority(store);
@@ -490,11 +554,19 @@ describe("RendererSecureStoreAuthority", () => {
 
     await expect(
       authority.commitReceipt(VAULT_ID, TOKEN_KIND, second.rollbackReceipt),
-    ).resolves.toEqual({ ok: true, committed: true });
+    ).resolves.toEqual({
+      ok: true,
+      committed: true,
+      value: "second-token",
+    });
     expect(pendingReceiptCount(authority)).toBe(0);
     await expect(
       authority.commitReceipt(VAULT_ID, TOKEN_KIND, second.rollbackReceipt),
-    ).resolves.toEqual({ ok: true, committed: true });
+    ).resolves.toEqual({
+      ok: true,
+      committed: true,
+      value: "second-token",
+    });
     await expect(
       authority.compareAndRestore(VAULT_ID, TOKEN_KIND, first.rollbackReceipt),
     ).resolves.toEqual({
@@ -502,6 +574,45 @@ describe("RendererSecureStoreAuthority", () => {
       restored: false,
       value: "second-token",
     });
+  });
+
+  it("cancels a stale-revision ancestor so the current receipt compensates to the real predecessor", async () => {
+    const store = new MemorySecureStore("account-a-token");
+    const authority = createAuthority(store);
+    const first = await authority.set(VAULT_ID, TOKEN_KIND, "account-b-token");
+    const second = await authority.set(VAULT_ID, TOKEN_KIND, "account-c-token");
+    if (!first.ok || !second.ok) throw new Error("renderer write failed");
+
+    await expect(
+      authority.commitReceipt(
+        VAULT_ID,
+        TOKEN_KIND,
+        first.rollbackReceipt,
+        undefined,
+        false,
+      ),
+    ).resolves.toEqual({ ok: true, committed: false });
+    await expect(
+      authority.commitReceipt(VAULT_ID, TOKEN_KIND, second.rollbackReceipt),
+    ).resolves.toEqual({
+      ok: true,
+      committed: true,
+      value: "account-c-token",
+    });
+    await expect(
+      authority.compensateCommittedReceipt(
+        VAULT_ID,
+        TOKEN_KIND,
+        second.rollbackReceipt,
+        2,
+        2,
+      ),
+    ).resolves.toMatchObject({
+      ok: true,
+      restored: true,
+      value: "account-a-token",
+    });
+    expect(store.value).toBe("account-a-token");
   });
 
   it("compensates a committed receipt at its exact SET revision and replays response loss", async () => {
@@ -554,7 +665,25 @@ describe("RendererSecureStoreAuthority", () => {
       changed: false,
       value: "prior-token",
     });
-    expect(store.value).toBe("prior-token");
+    // A later writer C invalidates the replay snapshot even if the original
+    // compensation response was lost and A retries the same receipt.
+    store.value = "renderer-c-token";
+    await expect(
+      authority.compensateCommittedReceipt(
+        VAULT_ID,
+        TOKEN_KIND,
+        write.rollbackReceipt,
+        1,
+        3,
+        owner,
+      ),
+    ).resolves.toEqual({
+      ok: true,
+      restored: false,
+      changed: false,
+      value: "renderer-c-token",
+    });
+    expect(store.value).toBe("renderer-c-token");
   });
 
   it("compensates a committed descendant past every cancelled ancestor", async () => {
@@ -583,7 +712,11 @@ describe("RendererSecureStoreAuthority", () => {
     ).resolves.toEqual({ ok: true, committed: false });
     await expect(
       authority.commitReceipt(VAULT_ID, TOKEN_KIND, b.rollbackReceipt, ownerB),
-    ).resolves.toEqual({ ok: true, committed: true });
+    ).resolves.toEqual({
+      ok: true,
+      committed: true,
+      value: "committed-b-token",
+    });
 
     await expect(
       authority.compensateCommittedReceipt(
@@ -780,7 +913,11 @@ describe("RendererSecureStoreAuthority", () => {
         write.rollbackReceipt,
         owner,
       ),
-    ).resolves.toEqual({ ok: true, committed: true });
+    ).resolves.toEqual({
+      ok: true,
+      committed: true,
+      value: "suspension-safe-token",
+    });
 
     // The first response is lost and the renderer remains suspended for the
     // exact ten-minute request ceiling before it can retry.
@@ -801,7 +938,11 @@ describe("RendererSecureStoreAuthority", () => {
         write.rollbackReceipt,
         owner,
       ),
-    ).resolves.toEqual({ ok: true, committed: true });
+    ).resolves.toEqual({
+      ok: true,
+      committed: true,
+      value: "suspension-safe-token",
+    });
     expect(
       store.operations.filter((operation) => operation.startsWith("set:")),
     ).toEqual(["set:suspension-safe-token"]);
@@ -826,7 +967,11 @@ describe("RendererSecureStoreAuthority", () => {
         write.rollbackReceipt,
         owner,
       ),
-    ).resolves.toEqual({ ok: true, committed: true });
+    ).resolves.toEqual({
+      ok: true,
+      committed: true,
+      value: "slot-bound-token",
+    });
 
     await expect(
       authority.commitReceipt(
@@ -1155,6 +1300,23 @@ describe("RendererSecureStoreAuthority", () => {
       changed: false,
       value: null,
     });
+    store.value = "renderer-c-token";
+    await expect(
+      authority.compareAndDelete(
+        VAULT_ID,
+        TOKEN_KIND,
+        "renderer-a-token",
+        8,
+        10,
+        owner,
+        "terminal-delete-a",
+      ),
+    ).resolves.toEqual({
+      ok: true,
+      deleted: false,
+      changed: false,
+      value: "renderer-c-token",
+    });
   });
 
   it("does not attribute renderer B's deletion to renderer A's mutation id", async () => {
@@ -1222,6 +1384,24 @@ describe("RendererSecureStoreAuthority", () => {
       value: "profile-a-scrubbed",
     });
     expect(replay).toEqual({ ...first, changed: false });
+    store.value = "profile-c-with-token";
+    await expect(
+      authority.compareAndSet(
+        VAULT_ID,
+        "runtime.agent_profiles",
+        "profile-a-with-token",
+        "profile-a-scrubbed",
+        7,
+        9,
+        owner,
+        "terminal-transform-a",
+      ),
+    ).resolves.toEqual({
+      ok: true,
+      applied: false,
+      changed: false,
+      value: "profile-c-with-token",
+    });
     expect(
       store.operations.filter(
         (operation) => operation === "set:profile-a-scrubbed",

@@ -13,6 +13,11 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { client } from "../api";
+import {
+  beginStewardSessionRecovery,
+  readStewardSessionRecovery,
+  rejectStewardSessionRecovery,
+} from "../cloud/lib/steward-session-recovery-marker";
 import { registerStewardLoginLauncher } from "./cloud-steward-login";
 import { useCloudState } from "./useCloudState";
 
@@ -238,6 +243,29 @@ describe("useCloudState — handleCloudLogin with a stale Steward token and no l
     expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(valid);
   });
 
+  it("preserves local account A and blocks legacy dispatch while recovery B is unresolved", async () => {
+    const accountA = makeJwt(3600);
+    localStorage.setItem(STEWARD_TOKEN_KEY, accountA);
+    const loginB = beginStewardSessionRecovery("elizacloud", "provider");
+    const { result, unmount } = renderHook(() => useCloudState(makeParams()));
+
+    try {
+      await act(async () => {
+        await result.current.handleCloudLogin();
+      });
+
+      expect(deviceCodeCalls()).toBe(0);
+      expect(result.current.elizaCloudLoginError).toBeNull();
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(accountA);
+      expect(readStewardSessionRecovery("elizacloud").receipts).toContain(
+        loginB.receipt,
+      );
+    } finally {
+      unmount();
+      rejectStewardSessionRecovery(loginB);
+    }
+  });
+
   it("reauthenticates on the same click when Cloud rejects a reused opaque token", async () => {
     localStorage.setItem(STEWARD_TOKEN_KEY, "revoked-opaque-token");
     getCloudStatusSpy
@@ -258,7 +286,11 @@ describe("useCloudState — handleCloudLogin with a stale Steward token and no l
       low: false,
       critical: false,
     } as Awaited<ReturnType<typeof client.getCloudCredits>>);
-    const launcher = vi.fn(async () => ({ token: makeJwt(3600) }));
+    const replacement = makeJwt(3600);
+    const launcher = vi.fn(async () => {
+      localStorage.setItem(STEWARD_TOKEN_KEY, replacement);
+      return { token: replacement };
+    });
     const unregister = registerStewardLoginLauncher(launcher);
     try {
       const { result } = renderHook(() => useCloudState(makeParams()));
@@ -299,7 +331,11 @@ describe("useCloudState — handleCloudLogin with a stale Steward token and no l
 
   it("a mounted launcher still owns the stale-token re-auth (no device-code call)", async () => {
     localStorage.setItem(STEWARD_TOKEN_KEY, makeJwt(-60));
-    const launcher = vi.fn(async () => ({ token: makeJwt(3600) }));
+    const replacement = makeJwt(3600);
+    const launcher = vi.fn(async () => {
+      localStorage.setItem(STEWARD_TOKEN_KEY, replacement);
+      return { token: replacement };
+    });
     const unregister = registerStewardLoginLauncher(launcher);
     try {
       const { result } = renderHook(() => useCloudState(makeParams()));

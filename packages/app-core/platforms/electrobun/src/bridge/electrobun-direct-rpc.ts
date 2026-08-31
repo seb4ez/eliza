@@ -39,6 +39,13 @@ const DOCUMENT_SCOPED_SECURE_STORE_REQUESTS = new Set([
   "secureStoreCompareAndDelete",
   "secureStoreCompareAndSet",
   "secureStoreCompareAndRestore",
+  "secureStoreConnectionTransactionBegin",
+  "secureStoreConnectionTransactionStage",
+  "secureStoreConnectionTransactionDecide",
+  "secureStoreConnectionTransactionFinish",
+  "secureStoreConnectionTransactionAbort",
+  "secureStoreConnectionTransactionStatus",
+  "secureStoreConnectionTransactionCompensate",
 ]);
 
 function readRecord(value: unknown): Record<string, unknown> {

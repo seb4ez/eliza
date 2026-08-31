@@ -39,12 +39,15 @@ import {
 } from "../../lib/steward-session-mutation-queue";
 import {
   beginStewardSessionRecovery,
-  completeStewardSessionRecovery,
-  completeStewardSessionRecoverySnapshot,
-  isStewardSessionRecoveryReceiptLive,
+  createStewardSessionRecoveryCommittedAuthority,
+  createStewardSessionRecoveryPublicationFence,
+  createStewardSessionRecoverySnapshotPublicationFence,
   isStewardSessionRecoverySnapshotLive,
+  markStewardSessionRecoveryCookiePending,
   readStewardSessionRecovery,
   rejectStewardSessionRecovery,
+  type StewardSessionRecoveryCommittedAuthority,
+  type StewardSessionRecoveryPublicationRollback,
   StewardSessionRecoveryStorageError,
 } from "../../lib/steward-session-recovery-marker";
 import { ELIZA_CLOUD_DIRECT_API_BY_HOST } from "../../shell/steward-url";
@@ -90,6 +93,8 @@ async function postAuthJson(
 async function readSessionError(response: Response): Promise<{
   error?: string;
   code?: string;
+  retryAfterSeconds?: number;
+  retryAtEpochSeconds?: number;
 }> {
   // error-policy:J3 best-effort parse of an error response body to extract a
   // structured {error,code}; a non-JSON error body yields {} and the caller
@@ -97,7 +102,30 @@ async function readSessionError(response: Response): Promise<{
   return ((await response.json().catch(() => null)) ?? {}) as {
     error?: string;
     code?: string;
+    retryAfterSeconds?: number;
+    retryAtEpochSeconds?: number;
   };
+}
+
+function sessionErrorFromResponse(
+  response: Response,
+  body: Awaited<ReturnType<typeof readSessionError>>,
+  fallback: string,
+): StewardSessionError {
+  const retryAfterHeader = Number(response.headers.get("retry-after"));
+  return new StewardSessionError(
+    body.error || fallback,
+    response.status,
+    body.code ?? null,
+    {
+      retryAfterSeconds:
+        body.retryAfterSeconds ??
+        (Number.isFinite(retryAfterHeader) && retryAfterHeader >= 0
+          ? retryAfterHeader
+          : null),
+      retryAtEpochSeconds: body.retryAtEpochSeconds,
+    },
+  );
 }
 
 /**
@@ -117,6 +145,8 @@ export async function syncStewardSessionCookie(
     mutationLease?: StewardSessionMutationLease;
     /** Exact caller authority that must remain live through local publish. */
     validate?: () => boolean;
+    /** Rollbackably retire recovery proof at the token publication boundary. */
+    finalizeBeforePublish?: () => StewardSessionRecoveryPublicationRollback;
   },
 ): Promise<void> {
   if (!options?.mutationLease) {
@@ -144,10 +174,10 @@ export async function syncStewardSessionCookie(
 
   if (!response.ok) {
     const body = await readSessionError(response);
-    throw new StewardSessionError(
-      body.error || "Could not establish an Eliza Cloud session.",
-      response.status,
-      body.code ?? null,
+    throw sessionErrorFromResponse(
+      response,
+      body,
+      "Could not establish an Eliza Cloud session.",
     );
   }
 
@@ -168,18 +198,42 @@ export async function syncStewardSessionCookie(
     // the login page already persisted the same token. Canonical storage is
     // idempotent, so both paths publish one authority transition in total.
     options?.signal?.throwIfAborted();
-    await writeStoredStewardToken(token, {
+    const writeAuthority = await writeStoredStewardToken(token, {
       signal: options?.signal,
       validate: options?.validate,
+      finalizeBeforePublish: options?.finalizeBeforePublish,
     });
-    options?.signal?.throwIfAborted();
-    if (options?.validate?.() === false || readStoredStewardToken() !== token) {
+    if (options?.finalizeBeforePublish && !writeAuthority) {
       invalidateStewardServerCookieSyncMarker();
       return;
     }
-    window.dispatchEvent(
-      new CustomEvent("steward-token-sync", { detail: { token } }),
-    );
+    // A fenced non-null authority means the canonical event already
+    // linearized. A listener may synchronously abort the originating React
+    // continuation at that event; the fenced caller must still finish its
+    // durable cleanup. Unfenced callers retain their late validator because it
+    // is their only defense against publishing token-sync after login B starts.
+    const fencedPublication = Boolean(options?.finalizeBeforePublish);
+    if (
+      readStoredStewardToken() !== token ||
+      (!fencedPublication && options?.validate?.() === false)
+    ) {
+      invalidateStewardServerCookieSyncMarker();
+      return;
+    }
+    // A fenced caller still has durable consumed-state/logout cleanup and the
+    // post-authority recovery wake-up to perform. It emits token-sync itself
+    // only after those synchronous boundaries remain live.
+    if (!fencedPublication) {
+      window.dispatchEvent(
+        new CustomEvent("steward-token-sync", { detail: { token } }),
+      );
+    }
+    if (
+      readStoredStewardToken() !== token ||
+      (!fencedPublication && options?.validate?.() === false)
+    ) {
+      invalidateStewardServerCookieSyncMarker();
+    }
   }
 }
 
@@ -191,7 +245,7 @@ export async function syncStewardSessionCookie(
 export async function confirmTelegramAccountClaim(
   token: string,
   continuation: string,
-): Promise<void> {
+): Promise<StewardSessionRecoveryCommittedAuthority> {
   const telegramContinuation =
     sanitizeTelegramAccountClaimContinuation(continuation);
   if (!telegramContinuation) {
@@ -208,88 +262,132 @@ export async function confirmTelegramAccountClaim(
     );
   }
 
-  return enqueueStewardSessionMutation(async (mutationLease) => {
-    if (!isStewardSessionRecoveryReceiptLive(recovery)) {
-      throw new Error("Telegram account confirmation was superseded.");
-    }
-    let currentToken: string | null = null;
-    try {
-      currentToken = readStoredStewardToken();
-    } catch (error) {
-      rejectStewardSessionRecovery(recovery);
-      throw error;
-    }
-    if (currentToken !== token) {
-      // No request has been dispatched, so this local mismatch is definitive.
-      rejectStewardSessionRecovery(recovery);
-      throw new Error(
-        "Your Eliza Cloud account changed before Telegram could be connected.",
-      );
-    }
+  let sessionMutationDispatched = false;
+  try {
+    const committedAuthority = await enqueueStewardSessionMutation(
+      async (mutationLease) => {
+        const publication =
+          createStewardSessionRecoveryPublicationFence(recovery);
+        const recoveryOwnsPublication = publication.validate;
 
-    const request: StewardTelegramClaimConfirmationRequest = {
-      token,
-      telegramContinuation,
-      telegramClaimConfirmation: "explicit",
-    };
-    const response = await postAuthJson(
-      STEWARD_SESSION_ENDPOINT,
-      request,
-      "POST",
-      undefined,
-      undefined,
-      mutationLease,
-    );
-    if (!response.ok) {
-      const body = await readSessionError(response);
-      if (
-        response.status >= 400 &&
-        response.status < 500 &&
-        response.status !== 408
-      ) {
-        rejectStewardSessionRecovery(recovery);
-      }
-      throw new StewardSessionError(
-        body.error || "Could not connect this Telegram account.",
-        response.status,
-        body.code ?? null,
-      );
-    }
-    if (
-      !isStewardSessionRecoveryReceiptLive(recovery) ||
-      readStoredStewardToken() !== token
-    ) {
-      // The response may have committed the link. Keep any live receipt and
-      // the continuation so reload recovery, not stale renderer A, reconciles.
-      throw new Error("Telegram account confirmation was superseded.");
-    }
+        if (!recoveryOwnsPublication()) {
+          throw new Error("Telegram account confirmation was superseded.");
+        }
+        let currentToken: string | null = null;
+        try {
+          currentToken = readStoredStewardToken();
+        } catch (error) {
+          rejectStewardSessionRecovery(recovery);
+          throw error;
+        }
+        if (currentToken !== token) {
+          // No request has been dispatched, so this local mismatch is definitive.
+          rejectStewardSessionRecovery(recovery);
+          throw new Error(
+            "Your Eliza Cloud account changed before Telegram could be connected.",
+          );
+        }
 
-    if (typeof window !== "undefined") {
-      await writeStoredStewardToken(token, {
-        validate: () =>
-          isStewardSessionRecoveryReceiptLive(recovery) &&
-          readStoredStewardToken() === token,
-      });
-      if (
-        !isStewardSessionRecoveryReceiptLive(recovery) ||
-        readStoredStewardToken() !== token
-      ) {
-        throw new Error("Telegram account confirmation was superseded.");
-      }
-      try {
-        window.dispatchEvent(
-          new CustomEvent("steward-token-sync", { detail: { token } }),
+        const request: StewardTelegramClaimConfirmationRequest = {
+          token,
+          telegramContinuation,
+          telegramClaimConfirmation: "explicit",
+        };
+        markStewardSessionRecoveryCookiePending(recovery, token);
+        sessionMutationDispatched = true;
+        const response = await postAuthJson(
+          STEWARD_SESSION_ENDPOINT,
+          request,
+          "POST",
+          undefined,
+          undefined,
+          mutationLease,
         );
-      } catch {
-        // Token persistence is authoritative; notification is best effort.
-      }
-    }
-    clearPendingOnboardingSessionIfMatches(
-      telegramContinuation,
-      TELEGRAM_ACCOUNT_CLAIM_PURPOSE,
+        if (!response.ok) {
+          // A received HTTP response is a definitive pre-commit rejection for
+          // this route. Only response loss after dispatch remains ambiguous.
+          rejectStewardSessionRecovery(recovery);
+          const body = await readSessionError(response);
+          throw sessionErrorFromResponse(
+            response,
+            body,
+            "Could not connect this Telegram account.",
+          );
+        }
+        if (!recoveryOwnsPublication() || readStoredStewardToken() !== token) {
+          // The response may have committed the link. Keep any live receipt and
+          // continuation as a distinct Telegram barrier: generic cookie recovery
+          // must not replay this irreversible mutation against stale renderer A.
+          throw new Error("Telegram account confirmation was superseded.");
+        }
+
+        if (typeof window !== "undefined") {
+          const writeAuthority = await writeStoredStewardToken(token, {
+            validate: () =>
+              recoveryOwnsPublication() && readStoredStewardToken() === token,
+            finalizeBeforePublish: publication.finalizeBeforePublish,
+          });
+          if (
+            !writeAuthority ||
+            !publication.isFinalized() ||
+            !recoveryOwnsPublication() ||
+            readStoredStewardToken() !== token
+          ) {
+            throw new Error("Telegram account confirmation was superseded.");
+          }
+          // The irreversible link is committed now. Retire its continuation before
+          // any recovery listener, because a reentrant account switch must never
+          // rediscover and replay the already-consumed claim against account B.
+          clearPendingOnboardingSessionIfMatches(
+            telegramContinuation,
+            TELEGRAM_ACCOUNT_CLAIM_PURPOSE,
+          );
+          if (
+            !publication.publishChange() ||
+            !recoveryOwnsPublication() ||
+            readStoredStewardToken() !== token
+          ) {
+            throw new Error("Telegram account confirmation was superseded.");
+          }
+          try {
+            window.dispatchEvent(
+              new CustomEvent("steward-token-sync", { detail: { token } }),
+            );
+          } catch {
+            // Token persistence is authoritative; notification is best effort.
+          }
+          if (
+            !createStewardSessionRecoveryCommittedAuthority(
+              recovery,
+              token,
+            ).isCurrent()
+          ) {
+            throw new Error("Telegram account confirmation was superseded.");
+          }
+          return createStewardSessionRecoveryCommittedAuthority(
+            recovery,
+            token,
+          );
+        }
+        clearPendingOnboardingSessionIfMatches(
+          telegramContinuation,
+          TELEGRAM_ACCOUNT_CLAIM_PURPOSE,
+        );
+        return createStewardSessionRecoveryCommittedAuthority(recovery, token);
+      },
     );
-    completeStewardSessionRecovery(recovery);
-  });
+    if (!committedAuthority.isCurrent()) {
+      throw new Error("Telegram account confirmation was superseded.");
+    }
+    return committedAuthority;
+  } catch (error) {
+    // A queue/lock failure cannot have reached Cloud, so this reservation must
+    // never survive as if the irreversible confirmation may have committed.
+    if (!sessionMutationDispatched) {
+      rejectStewardSessionRecovery(recovery);
+    }
+    throw error;
+  }
 }
 
 /**
@@ -477,10 +575,10 @@ export async function exchangeStewardCodeViaApi(
 
   if (!response.ok) {
     const body = await readSessionError(response);
-    throw new StewardSessionError(
-      body.error || "Could not complete Eliza Cloud sign-in.",
-      response.status,
-      body.code ?? null,
+    throw sessionErrorFromResponse(
+      response,
+      body,
+      "Could not complete Eliza Cloud sign-in.",
     );
   }
   return (await response.json()) as StewardNonceExchangeResponse;
@@ -510,10 +608,10 @@ export async function refreshStewardSessionViaCookie(options?: {
   );
   if (!response.ok) {
     const body = await readSessionError(response);
-    throw new StewardSessionError(
-      body.error || "Could not refresh Eliza Cloud sign-in.",
-      response.status,
-      body.code ?? null,
+    throw sessionErrorFromResponse(
+      response,
+      body,
+      "Could not refresh Eliza Cloud sign-in.",
     );
   }
   return (await response.json()) as {
@@ -527,6 +625,11 @@ export async function refreshStewardSessionViaCookie(options?: {
 type RefreshedStewardSession = Awaited<
   ReturnType<typeof refreshStewardSessionViaCookie>
 >;
+
+export type RecoveredStewardEmailSession = RefreshedStewardSession & {
+  /** Revalidate synchronously immediately before final UI/navigation effects. */
+  isCurrent(): boolean;
+};
 
 const EMAIL_SESSION_RECOVERY_INTERVAL_MS = 250;
 const EMAIL_SESSION_RECOVERY_TIMEOUT_MS = 10_000;
@@ -568,7 +671,7 @@ export async function recoverStewardEmailSessionViaCookie(
     timeoutMs?: number;
     tenantId?: string;
   } = {},
-): Promise<RefreshedStewardSession | null> {
+): Promise<RecoveredStewardEmailSession | null> {
   const expected = normalizedEmail(expectedEmail);
   if (!expected) return null;
 
@@ -585,6 +688,11 @@ export async function recoverStewardEmailSessionViaCookie(
       "Email session recovery is blocked because durable recovery storage cannot be read.",
     );
   }
+  // Email-cookie polling is a passive observation of the challenge's server
+  // session, not a new login intent. It must never adopt or retire a receipt
+  // which was already present when polling began: that receipt belongs to a
+  // different in-flight login and quarantines the still-canonical old token.
+  if (recoverySnapshot.receipts.length > 0) return null;
 
   // One composed controller bounds every network attempt: a caller abort or
   // the recovery deadline must cancel an in-flight fetch, not merely stop the
@@ -598,6 +706,10 @@ export async function recoverStewardEmailSessionViaCookie(
 
   const recoverAttempt = () =>
     enqueueStewardSessionMutation(async (mutationLease) => {
+      const publication =
+        createStewardSessionRecoverySnapshotPublicationFence(recoverySnapshot);
+      const snapshotOwnsPublication = () =>
+        !attempt.signal.aborted && publication.validate();
       if (!isStewardSessionRecoverySnapshotLive(recoverySnapshot)) return null;
       const session = await refreshStewardSessionViaCookie({
         signal: attempt.signal,
@@ -620,20 +732,25 @@ export async function recoverStewardEmailSessionViaCookie(
       // exact ambiguity reconciliation remain inside one origin-wide lease.
       // Callers receive an already-committed outcome and must never write the
       // raw token after this promise resolves.
-      await writeStoredStewardToken(session.token, {
+      const writeAuthority = await writeStoredStewardToken(session.token, {
         signal: attempt.signal,
-        validate: () => isStewardSessionRecoverySnapshotLive(recoverySnapshot),
+        validate: snapshotOwnsPublication,
+        finalizeBeforePublish: publication.finalizeBeforePublish,
       });
       if (
-        attempt.signal.aborted ||
-        !isStewardSessionRecoverySnapshotLive(recoverySnapshot)
+        !writeAuthority ||
+        !publication.isFinalized() ||
+        readStoredStewardToken() !== session.token
       ) {
+        return null;
+      }
+      if (!publication.publishChange() || !publication.validate()) {
         return null;
       }
       if (typeof window !== "undefined") {
         window.dispatchEvent(new CustomEvent("steward-token-sync"));
       }
-      completeStewardSessionRecoverySnapshot(recoverySnapshot);
+      if (!publication.validate()) return null;
       return session;
     });
 
@@ -645,7 +762,38 @@ export async function recoverStewardEmailSessionViaCookie(
         // after the caller aborted or the deadline passed must not surface a
         // session the caller already stopped waiting for.
         if (attempt.signal.aborted || Date.now() >= deadline) return null;
-        if (session) return session;
+        if (session) {
+          // Recovery/token-sync listeners can queue login B in a microtask.
+          // That microtask runs before this await continuation, so revalidate
+          // the original generation, empty receipt set, and exact canonical
+          // token here rather than returning an already-superseded A session.
+          const current = readStewardSessionRecovery(tenantId);
+          if (
+            !session.token ||
+            !current.storageAvailable ||
+            current.generation !== recoverySnapshot.generation ||
+            current.receipts.length !== 0 ||
+            readStoredStewardToken() !== session.token
+          ) {
+            return null;
+          }
+          const recovered = session as RecoveredStewardEmailSession;
+          Object.defineProperty(recovered, "isCurrent", {
+            configurable: false,
+            enumerable: false,
+            value: () => {
+              const latest = readStewardSessionRecovery(tenantId);
+              return (
+                latest.storageAvailable &&
+                latest.generation === recoverySnapshot.generation &&
+                latest.receipts.length === 0 &&
+                readStoredStewardToken() === session.token
+              );
+            },
+            writable: false,
+          });
+          return recovered;
+        }
         if (!isStewardSessionRecoverySnapshotLive(recoverySnapshot)) {
           return null;
         }
@@ -654,6 +802,7 @@ export async function recoverStewardEmailSessionViaCookie(
         // "not recovered" state and an expected 401 keeps polling until the
         // deadline; every other failure stays a typed error for the caller.
         if (attempt.signal.aborted || isAbortError(error)) return null;
+        if (error instanceof StewardSessionRecoveryStorageError) return null;
         if (!isRejectedCookieSession(error)) throw error;
       }
 
@@ -718,10 +867,10 @@ async function clearRejectedCookieSession(
   }
   if (!response.ok) {
     const body = await readSessionError(response);
-    throw new StewardSessionError(
-      body.error || "Could not reset the expired Eliza Cloud session.",
-      response.status,
-      body.code ?? null,
+    throw sessionErrorFromResponse(
+      response,
+      body,
+      "Could not reset the expired Eliza Cloud session.",
     );
   }
   // Do not consult the lifecycle signal after dispatch. A successful DELETE

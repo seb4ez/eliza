@@ -13,13 +13,26 @@ const harness = vi.hoisted(() => ({
   browserFinished: null as null | (() => void),
   cancel: vi.fn(async () => true),
   directCloudRequest: vi.fn(),
+  onSetToken: null as null | (() => void),
   sequence: 0,
   stewardToken: null as string | null,
   switchAccountPending: false,
   api: {
     getBaseUrl: vi.fn(() => ""),
-    setBaseUrl: vi.fn(),
-    setToken: vi.fn(),
+    setBaseUrl: vi.fn((_baseUrl: string) => {}),
+    setToken: vi.fn((_token: string | null) => {
+      harness.onSetToken?.();
+    }),
+    stageSessionTarget: vi.fn(
+      (target: { baseUrl: string; token: string | null }) => ({
+        publish: () => {
+          harness.api.setBaseUrl(target.baseUrl);
+          harness.api.setToken(target.token);
+          return true;
+        },
+        restoreIfCurrent: vi.fn(() => true),
+      }),
+    ),
     getCloudStatus: vi.fn(async () => ({
       connected: true,
       enabled: true,
@@ -95,6 +108,14 @@ vi.mock("../utils", async (importOriginal) => {
   };
 });
 
+import {
+  beginStewardSessionRecovery,
+  completeStewardSessionRecovery,
+} from "../cloud/lib/steward-session-recovery-marker";
+import {
+  configuredStewardTenantId,
+  DEFAULT_STEWARD_TENANT_ID,
+} from "../cloud/shell/steward-config";
 import { useCloudState } from "./useCloudState";
 
 const runtimeWithPinnedRemote = globalThis as typeof globalThis & {
@@ -112,7 +133,9 @@ function params() {
 describe("useCloudState Android hosted auth", () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    localStorage.clear();
     harness.browserFinished = null;
+    harness.onSetToken = null;
     harness.cancel.mockClear();
     harness.directCloudRequest.mockReset();
     harness.begin.mockReset();
@@ -130,6 +153,7 @@ describe("useCloudState Android hosted auth", () => {
   });
 
   afterEach(() => {
+    localStorage.clear();
     delete runtimeWithPinnedRemote.__ELIZA_BUILD_CONFIGURED_REMOTE_API_BASE__;
     vi.useRealTimers();
   });
@@ -245,6 +269,35 @@ describe("useCloudState Android hosted auth", () => {
     expect(result.current.elizaCloudConnected).toBe(true);
     expect(harness.api.setToken).toHaveBeenCalledWith("durable-steward-token");
     expect(harness.api.getCloudStatus).toHaveBeenCalled();
+  });
+
+  it("does not reconcile account A when publishing its client target starts login B", async () => {
+    harness.stewardToken = "account-a-token";
+    let newerLogin: ReturnType<typeof beginStewardSessionRecovery> | null =
+      null;
+    harness.onSetToken = () => {
+      harness.onSetToken = null;
+      newerLogin = beginStewardSessionRecovery(
+        configuredStewardTenantId(DEFAULT_STEWARD_TENANT_ID),
+        "provider",
+      );
+    };
+
+    try {
+      const { result } = renderHook(() => useCloudState(params()));
+      await act(async () => {
+        for (let index = 0; index < 10; index += 1) await Promise.resolve();
+      });
+
+      expect(newerLogin).not.toBeNull();
+      expect(harness.api.getCloudStatus).not.toHaveBeenCalled();
+      expect(harness.api.getCloudCredits).not.toHaveBeenCalled();
+      expect(result.current.elizaCloudConnected).toBe(false);
+      expect(result.current.elizaCloudUserId).toBeNull();
+      expect(result.current.elizaCloudLoginError).toBeNull();
+    } finally {
+      if (newerLogin) completeStewardSessionRecovery(newerLogin);
+    }
   });
 
   it("keeps the native Steward token when direct reconciliation is transient", async () => {

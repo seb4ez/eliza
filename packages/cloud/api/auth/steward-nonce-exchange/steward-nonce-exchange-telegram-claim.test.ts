@@ -16,6 +16,7 @@ const verifyStewardTokenCached = mock(async () => ({
   userId: "steward-user-1",
   tenantId: "elizacloud",
   expiration: Math.floor(Date.now() / 1000) + 900,
+  issuedAt: Math.floor(Date.now() / 1000),
 }));
 const syncUserFromSteward = mock(async () => ({
   id: "telegram-user-1",
@@ -24,7 +25,13 @@ const syncUserFromSteward = mock(async () => ({
 
 mock.module("@/lib/auth/steward-client", () => ({
   STEWARD_AUTH_UPSTREAM_TIMEOUT_MS: 5_000,
+  STEWARD_VERIFY_CLOCK_SKEW_SECONDS: 300,
   verifyStewardTokenCached,
+}));
+
+mock.module("@/lib/services/sso-bridge-codes", () => ({
+  classifySsoBridgeLogout: mock(async () => ({ status: "allowed" as const })),
+  isBlockedBySsoBridgeLogout: mock(async () => false),
 }));
 
 mock.module("@/lib/steward-sync", () => ({
@@ -62,7 +69,8 @@ async function post(body: unknown): Promise<Response> {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          origin: "https://staging.elizacloud.ai",
+          origin: "https://staging.eliza.app",
+          "sec-fetch-site": "same-origin",
           "x-eliza-csrf": STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
         },
         body: JSON.stringify(body),

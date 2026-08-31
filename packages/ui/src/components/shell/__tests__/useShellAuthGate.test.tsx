@@ -11,6 +11,10 @@ import {
 import { act, cleanup, renderHook } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, describe, expect, it } from "vitest";
+import {
+  beginStewardSessionRecovery,
+  rejectStewardSessionRecovery,
+} from "../../../cloud/lib/steward-session-recovery-marker";
 import type { BrandingConfig } from "../../../config/branding-base";
 import { DEFAULT_BRANDING } from "../../../config/branding-base";
 import { BrandingContext } from "../../../config/branding-react.hooks";
@@ -77,6 +81,28 @@ describe("useShellAuthGate", () => {
 
     await act(() => clearStoredStewardToken());
     expect(result.current).toEqual({ gated: true, phase: "needs-auth" });
+  });
+
+  it("quarantines stored account A as soon as recovery B begins", async () => {
+    __setAuthStatusForTests({ phase: "loading" });
+    await writeStoredStewardToken("account-a-token");
+    const { result } = renderHook(() => useShellAuthGate(), {
+      wrapper: wrapperFor(true),
+    });
+    expect(result.current).toEqual({ gated: true, phase: "checking" });
+
+    let loginB: ReturnType<typeof beginStewardSessionRecovery> | null = null;
+    try {
+      act(() => {
+        loginB = beginStewardSessionRecovery("elizacloud", "provider");
+      });
+      expect(result.current).toEqual({ gated: true, phase: "needs-auth" });
+    } finally {
+      if (loginB) {
+        const recovery = loginB;
+        act(() => rejectStewardSessionRecovery(recovery));
+      }
+    }
   });
 
   it("distinguishes an unavailable backend from an in-flight auth check", async () => {

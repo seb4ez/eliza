@@ -190,20 +190,53 @@ export async function exchangeAuthenticatedNativeCloudPairToken(
   return readCloudPairResponse(response);
 }
 
-function tryPersistBrowserStorage(
-  storage: Storage | undefined,
-  agentKey: string,
-  apiToken: string,
-): boolean {
-  if (!storage) return false;
-  try {
-    storage.setItem(agentKey, apiToken);
-    return true;
-  } catch (_storageError) {
-    // Browser storage can be disabled by hardened settings. Boot config still
-    // carries the token for this page load when at least one channel fails.
-    return false;
+interface CloudPairStorageMutation {
+  key: string;
+  storage: Storage;
+  /** Exact value installed by this transaction (`null` means a removal). */
+  installedValue: string | null;
+  previousValue: string | null;
+}
+
+export interface CloudPairApiTokenPersistenceOptions {
+  /** Exact account + recovery-generation + runtime-target authority. */
+  validate?: () => boolean;
+  /**
+   * Recovery transactions publish the client/boot authority only after the
+   * active-server/profile transaction has committed. Ordinary `/pair` callers
+   * retain the historical all-in-one behavior.
+   */
+  publishSession?: boolean;
+  /** Capture an exact CAS compensator until all sibling records commit. */
+  captureCompensation?: (compensate: () => Promise<void>) => void;
+}
+
+function restoreCloudPairStorageMutationIfCurrent(
+  mutation: CloudPairStorageMutation,
+): void {
+  if (mutation.storage.getItem(mutation.key) !== mutation.installedValue)
+    return;
+  if (mutation.previousValue === null) {
+    mutation.storage.removeItem(mutation.key);
+  } else {
+    mutation.storage.setItem(mutation.key, mutation.previousValue);
   }
+}
+
+function applyCloudPairStorageMutation(
+  storage: Storage,
+  key: string,
+  value: string | null,
+): CloudPairStorageMutation {
+  const mutation: CloudPairStorageMutation = {
+    key,
+    storage,
+    installedValue: value,
+    previousValue: storage.getItem(key),
+  };
+  if (value === null) storage.removeItem(key);
+  else storage.setItem(key, value);
+  return mutation;
 }
 
 /**
@@ -245,48 +278,151 @@ export function installCloudPairApiTokenForSession(apiToken: string): void {
 export async function persistCloudPairApiToken(
   apiToken: string,
   agentId: string,
+  options: CloudPairApiTokenPersistenceOptions = {},
 ): Promise<void> {
   const token = apiToken.trim();
   if (!token) throw new Error("Missing cloud pair API token.");
   const owner = agentId.trim();
   if (!owner) throw new Error("Missing cloud pair token owner agent id.");
 
+  if (options.validate?.() === false) {
+    throw new DOMException(
+      "Cloud pair credential publication was superseded.",
+      "AbortError",
+    );
+  }
+
   await withRuntimeConnectionPersistenceLock(async () => {
+    if (options.validate?.() === false) {
+      throw new DOMException(
+        "Cloud pair credential publication was superseded.",
+        "AbortError",
+      );
+    }
     const agentKey = cloudPairTokenKeyForAgent(owner);
-    const persistedInSession = tryPersistBrowserStorage(
-      typeof window === "undefined" ? undefined : window.sessionStorage,
-      agentKey,
-      token,
-    );
-    const persistedDurably = tryPersistBrowserStorage(
-      typeof window === "undefined" ? undefined : window.localStorage,
-      agentKey,
-      token,
-    );
+    const mutations: CloudPairStorageMutation[] = [];
+    let publishedBootConfig: ReturnType<typeof getBootConfig> | null = null;
+    let publishedLegacyBootConfig: unknown;
+    const previousBootConfig = getBootConfig();
+    const previousLegacyBootConfig = (globalThis as Record<string, unknown>)
+      .__ELIZA_APP_BOOT_CONFIG__;
 
-    installCloudPairApiTokenForSession(token);
-
-    if (persistedInSession || persistedDurably) {
-      // Legacy single-key format is now superseded by the per-agent key. Only
-      // remove it after the scoped write landed, so a failed storage channel
-      // never destroys the only credential the user has.
-      for (const storage of [
-        typeof window === "undefined" ? undefined : window.localStorage,
-        typeof window === "undefined" ? undefined : window.sessionStorage,
-      ]) {
+    const compensateInsideLock = () => {
+      const failures: unknown[] = [];
+      for (let index = mutations.length - 1; index >= 0; index -= 1) {
+        const mutation = mutations[index];
         try {
-          storage?.removeItem(CLOUD_PAIR_LOCAL_STORAGE_KEY);
-        } catch (_storageError) {
-          // error-policy:J3 best-effort legacy cleanup; the per-agent key is the
-          // authority now.
+          restoreCloudPairStorageMutationIfCurrent(mutation);
+        } catch (storageError) {
+          failures.push(storageError);
         }
       }
-    }
-
-    if (!(persistedInSession || persistedDurably)) {
-      throw new Error(
-        "Cloud pair API token could not be stored in this browser.",
+      try {
+        if (publishedBootConfig && getBootConfig() === publishedBootConfig) {
+          setBootConfig(previousBootConfig);
+        }
+      } catch (bootConfigError) {
+        failures.push(bootConfigError);
+      }
+      const globals = globalThis as Record<string, unknown>;
+      try {
+        if (
+          publishedBootConfig &&
+          globals.__ELIZA_APP_BOOT_CONFIG__ === publishedLegacyBootConfig
+        ) {
+          if (previousLegacyBootConfig === undefined) {
+            Reflect.deleteProperty(globals, "__ELIZA_APP_BOOT_CONFIG__");
+          } else {
+            globals.__ELIZA_APP_BOOT_CONFIG__ = previousLegacyBootConfig;
+          }
+        }
+      } catch (legacyBootConfigError) {
+        failures.push(legacyBootConfigError);
+      }
+      if (failures.length > 0) {
+        throw new AggregateError(
+          failures,
+          "Cloud pair credential compensation failed",
+        );
+      }
+    };
+    const assertCurrent = () => {
+      if (options.validate?.() !== false) return;
+      throw new DOMException(
+        "Cloud pair credential publication was superseded.",
+        "AbortError",
       );
+    };
+
+    try {
+      const storages =
+        typeof window === "undefined"
+          ? []
+          : [window.sessionStorage, window.localStorage];
+      for (const storage of storages) {
+        try {
+          mutations.push(
+            applyCloudPairStorageMutation(storage, agentKey, token),
+          );
+        } catch (_storageError) {
+          // Preserve the old degraded-storage contract: one successful channel
+          // is sufficient, but every successful channel remains compensatable.
+        }
+        assertCurrent();
+      }
+      if (!mutations.some((mutation) => mutation.key === agentKey)) {
+        throw new Error(
+          "Cloud pair API token could not be stored in this browser.",
+        );
+      }
+
+      // Legacy single-key format is superseded only after a scoped write lands.
+      for (const storage of storages) {
+        try {
+          if (storage.getItem(CLOUD_PAIR_LOCAL_STORAGE_KEY) !== null) {
+            // This is a terminal credential deletion, not a compensatable
+            // sibling write. If account A is superseded after deleting its
+            // legacy bearer, restoring A merely because B still leaves the key
+            // absent is an ABA credential resurrection.
+            applyCloudPairStorageMutation(
+              storage,
+              CLOUD_PAIR_LOCAL_STORAGE_KEY,
+              null,
+            );
+          }
+        } catch (_storageError) {
+          // error-policy:J3 best-effort legacy cleanup; the scoped key is now
+          // authoritative in at least one usable storage channel.
+        }
+        assertCurrent();
+      }
+
+      if (options.publishSession !== false) {
+        assertCurrent();
+        installCloudPairApiTokenForSession(token);
+        publishedBootConfig = getBootConfig();
+        publishedLegacyBootConfig = (globalThis as Record<string, unknown>)
+          .__ELIZA_APP_BOOT_CONFIG__;
+        assertCurrent();
+      }
+
+      let compensation: Promise<void> | null = null;
+      options.captureCompensation?.(() => {
+        compensation ??= withRuntimeConnectionPersistenceLock(async () => {
+          compensateInsideLock();
+        });
+        return compensation;
+      });
+    } catch (error) {
+      try {
+        compensateInsideLock();
+      } catch (rollbackError) {
+        throw new AggregateError(
+          [error, rollbackError],
+          "Cloud pair credential publication and compensation failed",
+        );
+      }
+      throw error;
     }
   });
 }
