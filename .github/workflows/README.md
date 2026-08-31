@@ -13,9 +13,9 @@ secrets, linting changed workflow definitions, performing a frozen install, and
 building plus linting and typechecking the affected workspace closure. When the
 Billing replay runtime workspace closure changes, it also runs the keyless,
 mock-backed payment replay Playwright proof and requires that job in the same
-aggregate. When the app/auth/session contract surface changes, a second keyless
-lane runs the shared-session, native secure-store authority/transaction/revision,
-and wallet-retry regressions,
+aggregate. When the app/auth/session runtime workspace closure or an explicit
+runner/configuration input changes, a second keyless lane runs the shared-session,
+native secure-store authority/transaction/revision, and wallet-retry regressions,
 then exercises the production-mode hosted-wallet boundary and the explicitly
 test-authenticated CLI completion flow against the exact candidate. A
 supplemental test-auth pass preserves the managed-login and Cloud Console route

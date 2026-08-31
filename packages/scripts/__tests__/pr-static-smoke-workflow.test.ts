@@ -176,23 +176,71 @@ describe("PR Static Smoke workflow", () => {
     expect(checkout?.with?.["persist-credentials"]).toBeFalse();
 
     const detect = requireStep(authJob, "Detect auth/session contract changes");
-    expect(detect.run).toContain('git merge-base "$BASE_SHA" "$HEAD_SHA"');
-    expect(detect.run).toContain(
-      'git diff --quiet "$merge_base"..."$HEAD_SHA"',
+    const workspaceSeeds = splitWords(
+      authJob.env?.AUTH_ADMISSION_WORKSPACE_SEEDS,
     );
-    expect(splitWords(authJob.env?.AUTH_ADMISSION_PATH_INPUTS)).toEqual(
+    expect(workspaceSeeds).toEqual([
+      "packages/app",
+      "packages/app-core",
+      "packages/shared",
+      "packages/ui",
+    ]);
+    const closure = workspaceClosure(workspaceSeeds);
+    expect([...closure]).toEqual(
       expect.arrayContaining([
         "packages/app",
         "packages/app-core",
         "packages/auth",
-        "packages/cloud",
+        "packages/cloud/routing",
+        "packages/core",
+        "packages/logger",
         "packages/shared",
         "packages/ui",
+        "plugins/plugin-native-secure-store",
+        "plugins/plugin-wallet",
+      ]),
+    );
+
+    const explicitInputs = splitWords(authJob.env?.AUTH_ADMISSION_PATH_INPUTS);
+    expect(explicitInputs).toEqual(
+      expect.arrayContaining([
+        "packages/auth",
+        "packages/cloud",
+        "packages/scripts",
         "patches",
         ".github/workflows/pr-static-smoke.yml",
         ".github/workflows/scenario-pr.yml",
       ]),
     );
+    const pathInputs = [...closure, ...explicitInputs];
+    for (const path of [
+      "packages/scripts/build-views.mjs",
+      "packages/scripts/run-turbo.mjs",
+      "packages/core/src/index.ts",
+      "packages/logger/src/index.ts",
+      "plugins/plugin-wallet/src/index.ts",
+      "patches/example.patch",
+    ]) {
+      expect(
+        pathInputs.some(
+          (input) => path === input || path.startsWith(`${input}/`),
+        ),
+        `auth admission must cover ${path}`,
+      ).toBeTrue();
+    }
+
+    expect(detect.run).toContain("listPackages");
+    expect(detect.run).toContain('git(["merge-base", baseSha, headSha], [0])');
+    expect(detect.run).toContain("...manifest.dependencies");
+    expect(detect.run).toContain("...manifest.optionalDependencies");
+    expect(detect.run).toContain("...manifest.peerDependencies");
+    expect(detect.run).toContain(
+      "if (byName.has(dependency)) pending.push(dependency)",
+    );
+    expect(detect.run).toContain('["diff", "--quiet"');
+    expect(detect.run).toContain("[0, 1]");
+    expect(detect.run).toContain('appendFileSync(requiredEnv("GITHUB_OUTPUT")');
+    expect(detect.run).toContain("diff.status === 1");
 
     expect(
       requireStep(authJob, "Run shared Steward session authority tests").run,
