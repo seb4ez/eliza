@@ -291,6 +291,26 @@ describe("PR Static Smoke workflow", () => {
       },
     );
 
+    const testDirRelative = passingReport("cli-auth-completion.spec.ts", 2);
+    expect(
+      assertUiSmokePlaywrightReport(testDirRelative, "cli-auth-completion"),
+    ).toEqual({
+      contract: "cli-auth-completion",
+      files: ["test/ui-smoke/cli-auth-completion.spec.ts"],
+      passed: 2,
+    });
+
+    const nestedBasenameCollision = passingReport(
+      "nested/cli-auth-completion.spec.ts",
+      2,
+    );
+    expect(() =>
+      assertUiSmokePlaywrightReport(
+        nestedBasenameCollision,
+        "cli-auth-completion",
+      ),
+    ).toThrow("unexpected spec file");
+
     const allSkipped = structuredClone(valid) as {
       stats: { expected: number; skipped: number };
     };

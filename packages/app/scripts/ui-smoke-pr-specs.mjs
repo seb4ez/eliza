@@ -162,6 +162,17 @@ function normalizedReportFile(file) {
   return typeof file === "string" ? file.replaceAll("\\", "/") : "";
 }
 
+function reportFileMatchesExpected(file, expectedFile) {
+  const normalized = normalizedReportFile(file);
+  return (
+    normalized === expectedFile ||
+    normalized.endsWith(`/${expectedFile}`) ||
+    // Playwright reports paths relative to testDir. This suite's testDir is
+    // test/ui-smoke, so a top-level spec is serialized as its basename only.
+    normalized === path.posix.basename(expectedFile)
+  );
+}
+
 /**
  * Validate the non-vacuous Playwright result consumed by the hosted auth lanes.
  * A Playwright process exits zero when every selected test is skipped, so the
@@ -207,8 +218,8 @@ export function assertUiSmokePlaywrightReport(report, contractName) {
   const unexpectedFiles = [];
   for (const spec of specs) {
     const file = normalizedReportFile(spec?.file);
-    const expectedFile = contract.expectedFiles.find(
-      (entry) => file === entry.file || file.endsWith(`/${entry.file}`),
+    const expectedFile = contract.expectedFiles.find((entry) =>
+      reportFileMatchesExpected(file, entry.file),
     );
     if (!expectedFile) {
       unexpectedFiles.push(file);
