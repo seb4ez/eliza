@@ -13,7 +13,15 @@ secrets, linting changed workflow definitions, performing a frozen install, and
 building plus linting and typechecking the affected workspace closure. When the
 Billing replay runtime workspace closure changes, it also runs the keyless,
 mock-backed payment replay Playwright proof and requires that job in the same
-aggregate. It does not run scenarios, live providers, devices, deployments, or
+aggregate. When the app/auth/session contract surface changes, a second keyless
+lane runs the shared-session, native secure-store, and wallet-retry regressions,
+then exercises the production-mode hosted-wallet boundary and the explicitly
+test-authenticated CLI completion flow against the exact candidate. A
+supplemental test-auth pass preserves the managed-login and Cloud Console route
+coverage that cannot execute against the production-auth renderer. Every
+targeted browser proof emits JSON that must contain its exact expected per-file
+pass count with zero skips; a Playwright exit that asserted nothing is rejected.
+The lane has no live provider credential and does not run scenarios, devices, deployments, or
 destructive effects. New commits cancel stale work for the same pull request or
 merge group.
 
@@ -127,7 +135,12 @@ Representative examples:
   for `main`-targeted PRs and post-merge pushes, including the single
   `packages/app` frontend artifact and embedded homepage source contracts.
 - `scenario-pr.yml` supplies the opt-in scenario-runner and browser matrix for
-  `main`-targeted PRs carrying the `ci:full` label.
+  `main`-targeted PRs carrying the `ci:full` label. Its directory-driven browser
+  catch-all runs with production auth behavior. The CLI completion spec is
+  removed from that set, while managed-login and Cloud Console routes also get
+  a supplemental authenticated pass in the same dedicated job with
+  `VITE_PLAYWRIGHT_TEST_AUTH=true`, exact per-file zero-skip report contracts,
+  and no provider credential.
 - `ui-e2e-gate.yml` and `ui-fixture-e2e.yml` run the packages/ui Chromium and
   WebKit fixture gates when `packages/ui/src/**` changes.
 - `device-e2e.yml` is the exact-head Android-emulator and iOS-simulator

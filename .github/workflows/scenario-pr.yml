@@ -493,8 +493,6 @@ jobs:
         run: .github/scripts/install-playwright-browsers.sh chromium
 
       - name: Actual app auto-discovered ui-smoke browser coverage
-        env:
-          VITE_PLAYWRIGHT_TEST_AUTH: "true"
         run: |
           set -euo pipefail
           specs="$(node packages/app/scripts/ui-smoke-pr-specs.mjs --list-auto)"
@@ -514,6 +512,91 @@ jobs:
             packages/app/playwright-report/
             packages/app/test-results/
           if-no-files-found: ignore
+          retention-days: 3
+
+  app-browser-cli-auth-completion:
+    name: Zero-Key CLI auth completion browser coverage
+    needs: changes
+    if: needs.changes.outputs.run_scenario_pr == 'true'
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || vars.HETZNER_FLEET_ONLINE != 'true' && '["ubuntu-24.04"]' || '["self-hosted","hetzner-robot"]') }}
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup workspace dependencies
+        uses: ./.github/actions/setup-bun-workspace
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+          install-command: bun install --frozen-lockfile --ignore-scripts
+          install-native-deps: "false"
+          skip-avatar-clone: "true"
+          no-vision-deps: "true"
+
+      - name: Ensure generated shared i18n data
+        run: node packages/app-core/scripts/ensure-shared-i18n-data.mjs
+
+      - name: Install Playwright browsers
+        run: .github/scripts/install-playwright-browsers.sh chromium
+
+      - name: Actual CLI auth completion browser coverage
+        env:
+          VITE_PLAYWRIGHT_TEST_AUTH: "true"
+          ELIZA_UI_SMOKE_DISABLE_VIDEO: "1"
+          PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ runner.temp }}/cli-auth-completion.json
+        run: >-
+          bun run --cwd packages/app test:e2e
+          test/ui-smoke/cli-auth-completion.spec.ts
+          --project=chromium --reporter=json
+
+      - name: Require two CLI auth completions with zero skipped
+        env:
+          PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ runner.temp }}/cli-auth-completion.json
+        run: >-
+          node packages/app/scripts/ui-smoke-pr-specs.mjs
+          --assert-report cli-auth-completion
+          "$PLAYWRIGHT_JSON_OUTPUT_FILE"
+
+      - name: Actual supplemental test-authenticated managed surfaces
+        env:
+          VITE_PLAYWRIGHT_TEST_AUTH: "true"
+          ELIZA_UI_SMOKE_DISABLE_VIDEO: "1"
+          ELIZA_UI_SMOKE_SKIP_VIEW_BUILD: "1"
+          PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ runner.temp }}/test-auth-supplemental.json
+        run: |
+          set -euo pipefail
+          specs="$(node packages/app/scripts/ui-smoke-pr-specs.mjs --list-test-auth-supplemental)"
+          test -n "$specs"
+          bun run --cwd packages/app test:e2e $specs \
+            --project=chromium \
+            --grep 'cloud console route wiring|authenticated login handoff|email callback reaches chat|messaging continuation opens chat' \
+            --reporter=json
+
+      - name: Require nine supplemental test-auth passes with zero skipped
+        env:
+          PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ runner.temp }}/test-auth-supplemental.json
+        run: >-
+          node packages/app/scripts/ui-smoke-pr-specs.mjs
+          --assert-report test-auth-supplemental
+          "$PLAYWRIGHT_JSON_OUTPUT_FILE"
+
+      - name: Upload CLI auth completion artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: scenario-pr-app-browser-cli-auth-completion
+          path: |
+            ${{ runner.temp }}/cli-auth-completion.json
+            ${{ runner.temp }}/test-auth-supplemental.json
+            packages/app/playwright-report/
+            packages/app/test-results/
+          if-no-files-found: warn
           retention-days: 3
 
   # The real-touch device matrix (#10104 Tier-2, descends from #9943/#9950):
@@ -884,6 +967,7 @@ jobs:
       - app-browser-extended
       - app-browser-perf-kpi
       - app-browser-auto-discovered
+      - app-browser-cli-auth-completion
       - app-browser-touch-dashboard
       - app-browser-touch-mobile
       - app-browser-webkit
@@ -909,6 +993,7 @@ jobs:
             "app-browser-extended:${{ needs.app-browser-extended.result }}" \
             "app-browser-perf-kpi:${{ needs.app-browser-perf-kpi.result }}" \
             "app-browser-auto-discovered:${{ needs.app-browser-auto-discovered.result }}" \
+            "app-browser-cli-auth-completion:${{ needs.app-browser-cli-auth-completion.result }}" \
             "app-browser-touch-dashboard:${{ needs.app-browser-touch-dashboard.result }}" \
             "app-browser-touch-mobile:${{ needs.app-browser-touch-mobile.result }}" \
             "app-browser-webkit:${{ needs.app-browser-webkit.result }}" \

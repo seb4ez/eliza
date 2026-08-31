@@ -2,6 +2,10 @@
 // @vitest-environment jsdom
 
 import {
+  readStoredStewardToken,
+  writeStoredStewardToken,
+} from "@elizaos/shared/steward-session-client";
+import {
   cleanup,
   fireEvent,
   render,
@@ -10,6 +14,7 @@ import {
 } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { readStewardSessionRecovery } from "../../../lib/steward-session-recovery-marker";
 
 const capabilityRef = vi.hoisted(() => ({
   usable: false,
@@ -38,6 +43,7 @@ const emailLoginSpies = vi.hoisted(() => ({
 
 const sessionSpies = vi.hoisted(() => ({
   recover: vi.fn(),
+  sync: vi.fn(),
   hasCookie: false,
 }));
 
@@ -123,7 +129,7 @@ vi.mock("../../lib/steward-session", () => ({
   exchangeStewardCodeViaApi: vi.fn(),
   recoverStewardSessionViaCookie: sessionSpies.recover,
   refreshStewardSessionViaCookie: vi.fn(),
-  syncStewardSessionCookie: vi.fn(() => Promise.resolve()),
+  syncStewardSessionCookie: sessionSpies.sync,
 }));
 
 vi.mock("../../lib/login-return-to", () => ({
@@ -156,13 +162,21 @@ vi.mock("./wallet-buttons", () => ({
     siwe,
     siws,
     onLoadingChange,
+    onSuccess,
+    onError,
   }: {
     siwe: boolean;
     siws: boolean;
     onLoadingChange: (kind: "ethereum" | "solana" | null) => void;
+    onSuccess: (result: {
+      token: string;
+      refreshToken: string | null;
+    }) => void | Promise<void>;
+    onError: (error: Error, kind: "ethereum" | "solana") => void;
   }) => {
     mountedWalletCapabilities.siwe = siwe;
     mountedWalletCapabilities.siws = siws;
+    const kind = siwe ? "ethereum" : "solana";
     return (
       <>
         <div data-testid="mounted-wallet-buttons">Mounted wallet stack</div>
@@ -171,6 +185,30 @@ vi.mock("./wallet-buttons", () => ({
           onClick={() => onLoadingChange(siwe ? "ethereum" : "solana")}
         >
           Simulate wallet loading
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            onLoadingChange(kind);
+            onError(new Error("Wallet signature rejected"), kind);
+            onLoadingChange(null);
+          }}
+        >
+          Simulate wallet error
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            onLoadingChange(kind);
+            void Promise.resolve(
+              onSuccess({
+                token: siwe ? "siwe-retry-token" : "siws-retry-token",
+                refreshToken: null,
+              }),
+            ).finally(() => onLoadingChange(null));
+          }}
+        >
+          Simulate wallet success
         </button>
       </>
     );
@@ -228,17 +266,28 @@ describe("StewardLoginSection wallet collapse (#19217)", () => {
       refreshToken: null,
     });
     sessionSpies.recover.mockResolvedValue(null);
+    sessionSpies.sync.mockImplementation(
+      async (
+        token: string,
+        _refreshToken?: string | null,
+        options?: Parameters<typeof writeStoredStewardToken>[1],
+      ) => {
+        await writeStoredStewardToken(token, options);
+      },
+    );
     sessionSpies.hasCookie = false;
     mountedWalletCapabilities.siwe = null;
     mountedWalletCapabilities.siws = null;
     mountedProviderCapabilities.enableEvm = null;
     mountedProviderCapabilities.enableSolana = null;
     walletBoundaryControl.suspend = false;
+    window.localStorage.clear();
     window.sessionStorage.removeItem(PROVIDERS_CACHE_KEY);
   });
 
   afterEach(() => {
     cleanup();
+    window.localStorage.clear();
     window.sessionStorage.removeItem(PROVIDERS_CACHE_KEY);
     vi.clearAllMocks();
   });
@@ -353,6 +402,67 @@ describe("StewardLoginSection wallet collapse (#19217)", () => {
     });
   });
 
+  it.each([
+    {
+      label: "SIWE",
+      intentName: /EVM wallet/i,
+      token: "siwe-retry-token",
+    },
+    {
+      label: "SIWS",
+      intentName: /Solana wallet/i,
+      token: "siws-retry-token",
+    },
+  ])(
+    "returns a failed $label attempt to an explicit choice and publishes the retry success",
+    async ({ intentName, token }) => {
+      await renderSection();
+
+      fireEvent.click(
+        await screen.findByRole("button", {
+          name: /Continue with a wallet/i,
+        }),
+      );
+      fireEvent.click(await screen.findByRole("button", { name: intentName }));
+
+      expect(await screen.findByTestId("mounted-wallet-buttons")).toBeTruthy();
+      expect(readStewardSessionRecovery("elizacloud").receipts).toHaveLength(1);
+
+      fireEvent.click(
+        screen.getByRole("button", { name: /Simulate wallet error/i }),
+      );
+
+      expect((await screen.findByRole("alert")).textContent).toContain(
+        "Wallet signature rejected",
+      );
+      expect(screen.queryByTestId("mounted-wallet-buttons")).toBeNull();
+      expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([]);
+
+      const retryChoice = screen.getByRole("button", { name: intentName });
+      await waitFor(() => expect(document.activeElement).toBe(retryChoice));
+      fireEvent.click(retryChoice);
+
+      expect(await screen.findByTestId("mounted-wallet-buttons")).toBeTruthy();
+      expect(readStewardSessionRecovery("elizacloud").receipts).toHaveLength(1);
+      fireEvent.click(
+        screen.getByRole("button", { name: /Simulate wallet success/i }),
+      );
+
+      await waitFor(() =>
+        expect(sessionSpies.sync).toHaveBeenCalledWith(
+          token,
+          null,
+          expect.objectContaining({
+            signal: expect.any(AbortSignal),
+            finalizeBeforePublish: expect.any(Function),
+          }),
+        ),
+      );
+      await waitFor(() => expect(readStoredStewardToken()).toBe(token));
+      expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([]);
+    },
+  );
+
   it("unmounts a cancelled chain before returning to the wallet choice", async () => {
     await renderSection();
 
@@ -368,6 +478,7 @@ describe("StewardLoginSection wallet collapse (#19217)", () => {
       enableEvm: true,
       enableSolana: false,
     });
+    expect(readStewardSessionRecovery("elizacloud").receipts).toHaveLength(1);
 
     fireEvent.click(
       screen.getByRole("button", { name: /Simulate wallet loading/i }),
@@ -379,6 +490,7 @@ describe("StewardLoginSection wallet collapse (#19217)", () => {
     fireEvent.click(chooseAnother);
 
     expect(screen.queryByTestId("mounted-wallet-buttons")).toBeNull();
+    expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([]);
     const evmChoice = screen.getByRole("button", { name: /EVM wallet/i });
     expect(evmChoice).toBeTruthy();
     expect(screen.getByRole("button", { name: /Solana wallet/i })).toBeTruthy();

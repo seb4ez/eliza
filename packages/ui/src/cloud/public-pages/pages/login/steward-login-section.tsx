@@ -4195,7 +4195,7 @@ export default function StewardLoginSection() {
                           recoveryIntent,
                         );
                       }}
-                      onError={(walletError) => {
+                      onError={(walletError, failedKind) => {
                         if (
                           walletIntentGeneration === null ||
                           !isProviderIntentCurrent(walletIntentGeneration)
@@ -4212,12 +4212,33 @@ export default function StewardLoginSection() {
                           );
                           walletRecoveryIntentRef.current = null;
                         }
+                        // The selected wallet boundary can issue another
+                        // signature without remounting. Once its recovery
+                        // receipt is retired, that direct retry has no durable
+                        // authority and its success would be dropped. Return
+                        // to the explicit chain choices instead: the next click
+                        // runs handleWalletIntent, which reserves a fresh
+                        // receipt before remounting and auto-starting.
+                        rotateProviderIntent();
+                        setWalletButtonsMounted(false);
+                        setMountedWalletKind(null);
+                        setAutoStartWallet(null);
+                        setWalletIntentGeneration(null);
+                        setLoading(null);
+                        setShowWalletOptions(true);
                         setError(
                           walletError.message ||
                             t("cloud.login.error.walletFailed", {
                               defaultValue: "Wallet sign-in failed",
                             }),
                         );
+                        window.setTimeout(() => {
+                          walletOptionsRegionRef.current
+                            ?.querySelector<HTMLButtonElement>(
+                              `[data-wallet-kind="${failedKind}"]:not([disabled])`,
+                            )
+                            ?.focus({ preventScroll: true });
+                        }, 0);
                       }}
                     />
                   </StewardWalletProviders>
@@ -4244,6 +4265,7 @@ export default function StewardLoginSection() {
                   <Button
                     variant="outlineMuted"
                     type="button"
+                    data-wallet-kind="ethereum"
                     onClick={() => handleWalletIntent("ethereum")}
                     disabled={providerActionsDisabled}
                     className="hosted-signin-focus-emphasis"
@@ -4257,6 +4279,7 @@ export default function StewardLoginSection() {
                   <Button
                     variant="outlineMuted"
                     type="button"
+                    data-wallet-kind="solana"
                     onClick={() => handleWalletIntent("solana")}
                     disabled={providerActionsDisabled}
                     className="hosted-signin-focus-emphasis"

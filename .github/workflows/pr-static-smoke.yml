@@ -1,8 +1,8 @@
 # This workflow is the sole pull-request and merge-candidate validation authority.
 # It checks mergeability, changed secrets and workflow syntax, then builds and
-# statically validates the affected workspace closure. A narrow, mock-backed
-# billing replay E2E and the bounded synthetic-world transaction suite are the
-# affected-path test exceptions; provider, device, deployment, and
+# statically validates the affected workspace closure. Narrow, keyless auth and
+# billing browser proofs plus the bounded synthetic-world transaction suite are
+# the affected-path test exceptions; live providers, devices, deployments, and
 # destructive-effect lanes remain excluded.
 name: PR Static Smoke
 
@@ -37,7 +37,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
           persist-credentials: false
           submodules: false
 
@@ -130,9 +130,10 @@ jobs:
       - name: Validate CI Bun version pin contract
         run: node packages/scripts/ci-bun-version-contract.mjs --inventory "$RUNNER_TEMP/bun-runtime-inventory.json"
 
-      - name: Test Cloud Pages workflow contracts
+      - name: Test PR admission and Cloud Pages workflow contracts
         run: >-
           bun test
+          packages/scripts/__tests__/pr-static-smoke-workflow.test.ts
           packages/scripts/__tests__/homepage-deploy-workflow.test.ts
           packages/scripts/__tests__/cloud-cf-canonical-source-guard-workflow.test.ts
           packages/scripts/__tests__/cloud-cf-voice-deploy-workflow.test.ts
@@ -216,7 +217,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
           persist-credentials: false
           submodules: false
       - name: Detect billing replay contract changes
@@ -320,6 +321,164 @@ jobs:
           include-hidden-files: true
           if-no-files-found: warn
 
+  auth-session-admission:
+    name: Auth/session exact-head admission
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      ELIZA_LIVE_TEST: "0"
+      ELIZAOS_CLOUD_API_KEY: ""
+      OPENAI_API_KEY: ""
+      ANTHROPIC_API_KEY: ""
+      AUTH_ADMISSION_PATH_INPUTS: >-
+        packages/app
+        packages/app-core
+        packages/shared
+        packages/ui
+        .github/actions/setup-bun-workspace
+        .github/scripts/install-playwright-browsers.sh
+        .github/workflows/pr-static-smoke.yml
+        .github/workflows/scenario-pr.yml
+        package.json
+        bun.lock
+        bunfig.toml
+        turbo.json
+        tsconfig.json
+        tsconfig.base.json
+    steps:
+      - name: Checkout candidate source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          persist-credentials: false
+          submodules: false
+
+      - name: Detect auth/session contract changes
+        id: auth-diff
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+          merge_base="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+          test -n "$merge_base"
+          read -r -a path_inputs <<< "$AUTH_ADMISSION_PATH_INPUTS"
+          if [ "${#path_inputs[@]}" -eq 0 ]; then
+            echo "::error::Auth admission path policy is empty."
+            exit 1
+          fi
+          if git diff --quiet "$merge_base"..."$HEAD_SHA" -- "${path_inputs[@]}"; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.auth-diff.outputs.run == 'true'
+        uses: ./.github/actions/setup-bun-workspace
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+          node-version: ${{ env.NODE_VERSION }}
+          install-command: bun install --frozen-lockfile --ignore-scripts
+          install-native-deps: "false"
+          install-protoc: "false"
+          setup-python: "false"
+          skip-avatar-clone: "true"
+          no-vision-deps: "true"
+
+      - name: Ensure generated shared i18n data
+        if: steps.auth-diff.outputs.run == 'true'
+        run: node packages/app-core/scripts/ensure-shared-i18n-data.mjs
+
+      - name: Install Playwright Chromium
+        if: steps.auth-diff.outputs.run == 'true'
+        run: .github/scripts/install-playwright-browsers.sh chromium
+
+      - name: Run shared Steward session authority tests
+        if: steps.auth-diff.outputs.run == 'true'
+        run: >-
+          bun run --cwd packages/shared test --
+          src/steward-session-client/index.test.ts
+
+      - name: Run native secure-store authority tests
+        if: steps.auth-diff.outputs.run == 'true'
+        run: >-
+          bun test
+          packages/app-core/platforms/electrobun/src/renderer-secure-store-authority.test.ts
+
+      - name: Run wallet recovery retry regression tests
+        if: steps.auth-diff.outputs.run == 'true'
+        run: >-
+          bun run --cwd packages/ui test --
+          src/cloud/public-pages/pages/login/steward-login-section.wallet-collapse.test.tsx
+
+      - name: Run production-mode hosted wallet authority proof
+        if: steps.auth-diff.outputs.run == 'true'
+        env:
+          VITE_PLAYWRIGHT_TEST_AUTH: "false"
+          ELIZA_UI_SMOKE_DISABLE_VIDEO: "1"
+          PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ runner.temp }}/hosted-wallet-authority.json
+        run: >-
+          bun run --cwd packages/app test:e2e
+          test/ui-smoke/hosted-signin-wallet-capability.spec.ts
+          --project=chromium --reporter=json
+
+      - name: Require non-vacuous hosted wallet authority proof
+        if: steps.auth-diff.outputs.run == 'true'
+        env:
+          PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ runner.temp }}/hosted-wallet-authority.json
+        run: >-
+          node packages/app/scripts/ui-smoke-pr-specs.mjs
+          --assert-report hosted-signin-wallet-capability
+          "$PLAYWRIGHT_JSON_OUTPUT_FILE"
+
+      - name: Run CLI auth completion proof
+        if: steps.auth-diff.outputs.run == 'true'
+        env:
+          VITE_PLAYWRIGHT_TEST_AUTH: "true"
+          ELIZA_UI_SMOKE_DISABLE_VIDEO: "1"
+          ELIZA_UI_SMOKE_SKIP_VIEW_BUILD: "1"
+          PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ runner.temp }}/cli-auth-completion.json
+        run: >-
+          bun run --cwd packages/app test:e2e
+          test/ui-smoke/cli-auth-completion.spec.ts
+          --project=chromium --reporter=json
+
+      - name: Require two CLI auth completions with zero skipped
+        if: steps.auth-diff.outputs.run == 'true'
+        env:
+          PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ runner.temp }}/cli-auth-completion.json
+        run: >-
+          node packages/app/scripts/ui-smoke-pr-specs.mjs
+          --assert-report cli-auth-completion
+          "$PLAYWRIGHT_JSON_OUTPUT_FILE"
+
+      - name: Run supplemental test-authenticated managed surfaces
+        if: steps.auth-diff.outputs.run == 'true'
+        env:
+          VITE_PLAYWRIGHT_TEST_AUTH: "true"
+          ELIZA_UI_SMOKE_DISABLE_VIDEO: "1"
+          ELIZA_UI_SMOKE_SKIP_VIEW_BUILD: "1"
+          PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ runner.temp }}/test-auth-supplemental.json
+        run: |
+          set -euo pipefail
+          specs="$(node packages/app/scripts/ui-smoke-pr-specs.mjs --list-test-auth-supplemental)"
+          test -n "$specs"
+          bun run --cwd packages/app test:e2e $specs \
+            --project=chromium \
+            --grep 'cloud console route wiring|authenticated login handoff|email callback reaches chat|messaging continuation opens chat' \
+            --reporter=json
+
+      - name: Require nine supplemental test-auth passes with zero skipped
+        if: steps.auth-diff.outputs.run == 'true'
+        env:
+          PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ runner.temp }}/test-auth-supplemental.json
+        run: >-
+          node packages/app/scripts/ui-smoke-pr-specs.mjs
+          --assert-report test-auth-supplemental
+          "$PLAYWRIGHT_JSON_OUTPUT_FILE"
+
   browser-bridge-windows-security:
     name: Browser bridge Windows security
     uses: ./.github/workflows/browser-bridge-windows-security.yml
@@ -327,7 +486,7 @@ jobs:
   static-smoke:
     name: All Tests Passed
     if: always()
-    needs: [source-smoke, browser-bridge-windows-security, billing-payment-replay-e2e]
+    needs: [source-smoke, browser-bridge-windows-security, billing-payment-replay-e2e, auth-session-admission]
     runs-on: ubuntu-24.04
     steps:
       - name: Require every admission lane
@@ -336,6 +495,7 @@ jobs:
             source-smoke=${{ needs.source-smoke.result }}
             browser-bridge-windows-security=${{ needs.browser-bridge-windows-security.result }}
             billing-payment-replay-e2e=${{ needs.billing-payment-replay-e2e.result }}
+            auth-session-admission=${{ needs.auth-session-admission.result }}
         run: |
           set -euo pipefail
           for pair in $RESULTS; do
