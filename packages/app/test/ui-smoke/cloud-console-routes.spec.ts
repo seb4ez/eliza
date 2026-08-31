@@ -112,7 +112,11 @@ test.describe("cloud console route wiring", () => {
     installPageDiagnosticsGuard(page);
     await installDefaultAppRoutes(page);
     await installCloudApiStubs(page);
-    await seedAppStorage(page);
+    // The loopback renderer explicitly scopes persisted Steward tokens to the
+    // configured production control plane before the provider reads them.
+    await seedAppStorage(page, {
+      steward_session_token_scope: "eliza-cloud:production",
+    });
     stewardToken = await seedStewardSession(page, {
       jwt: true,
       subject: "cloud-console-route-smoke-user",

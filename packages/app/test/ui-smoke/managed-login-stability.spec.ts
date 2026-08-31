@@ -45,6 +45,9 @@ async function installManagedOriginProxy(
 ): Promise<string> {
   const local = new URL(localBaseUrl);
   const managed = new URL(localBaseUrl);
+  // The real managed host is HTTPS; preserve that secure-context contract so
+  // production Web Locks and WebCrypto gates execute instead of failing shut.
+  managed.protocol = "https:";
   managed.hostname = "cloud.eliza.app";
 
   await page.route(`${managed.origin}/**`, async (route) => {
@@ -64,6 +67,20 @@ async function installManagedOriginProxy(
   });
 
   return managed.origin;
+}
+
+async function expectManagedSecureContext(page: Page): Promise<void> {
+  await expect
+    .poll(() =>
+      page.evaluate(() => ({
+        isSecureContext: window.isSecureContext,
+        webLocksRequest: typeof navigator.locks?.request,
+      })),
+    )
+    .toEqual({
+      isSecureContext: true,
+      webLocksRequest: "function",
+    });
 }
 
 async function installAuthenticatedPersonalRoutes(
@@ -259,6 +276,7 @@ for (const surface of SURFACES) {
       consoleMessages.push({ type: message.type(), text: message.text() });
     });
     await page.goto(`${managedOrigin}/join`);
+    await expectManagedSecureContext(page);
     await expect(page.getByText(/Opening your personal Eliza/)).toBeVisible();
     await page.evaluate(() => {
       document.documentElement.dataset.loginDocument = "survived";
@@ -348,6 +366,7 @@ for (const surface of SURFACES) {
       });
 
       await page.goto(`${managedOrigin}${entryPath}`);
+      await expectManagedSecureContext(page);
       const heading = page.getByRole("heading", { name: "Sign in" });
       await expect(heading).toBeVisible();
       await expect(page.getByText("Taking you to Eliza sign in")).toHaveCount(
@@ -470,8 +489,7 @@ for (const surface of SURFACES) {
     });
 
     // Loopback is a browser trustworthy origin, so this reaches the real
-    // WebCrypto-backed PKCE boundary. The canonical-host HTTP proxy used by
-    // the handoff tests is intentionally not secure and cannot expose subtle.
+    // WebCrypto-backed PKCE boundary without the managed-host route fixtures.
     await page.goto(new URL("/login?returnTo=%2F", baseURL).toString());
     const google = page.getByRole("button", { name: "Google", exact: true });
     await expect(google).toBeVisible();
@@ -600,6 +618,7 @@ for (const surface of SURFACES) {
     await page.goto(
       `${managedOrigin}/auth/callback/email?token=playwright-email-token&email=managed-handoff%40test.local`,
     );
+    await expectManagedSecureContext(page);
     await page.evaluate(() => {
       document.documentElement.dataset.emailCallbackDocument = "survived";
     });
@@ -710,6 +729,7 @@ for (const surface of SURFACES) {
     await page.goto(
       `${managedOrigin}/get-started?onboardingSession=${ONBOARDING_TOKEN}`,
     );
+    await expectManagedSecureContext(page);
     await page.evaluate(() => {
       document.documentElement.dataset.messagingContinuationDocument =
         "survived";
