@@ -21,7 +21,10 @@
  */
 
 import { useConnectModal } from "@rainbow-me/rainbowkit";
-import { useWallet } from "@solana/wallet-adapter-react";
+import {
+  useWallet,
+  type WalletContextState,
+} from "@solana/wallet-adapter-react";
 import { useWalletModal } from "@solana/wallet-adapter-react-ui";
 import type {
   StewardAuth,
@@ -51,6 +54,15 @@ interface Eip1193Provider {
 interface EvmWalletAuthority {
   address: HexAddress | null;
   chainId: number | null;
+}
+
+type SolanaSignMessage = NonNullable<WalletContextState["signMessage"]>;
+type SolanaWalletAdapter = NonNullable<WalletContextState["wallet"]>["adapter"];
+
+interface SolanaWalletAuthority {
+  adapter: SolanaWalletAdapter;
+  publicKey: string;
+  signMessage: SolanaSignMessage;
 }
 
 function getWindowEthereumProvider(): Eip1193Provider | null {
@@ -299,6 +311,60 @@ function throwIfWalletIntentExpired(
   if (!isIntentCurrent(generation)) {
     throw new Error("Wallet sign-in intent expired.");
   }
+}
+
+function readSolanaPublicKey(
+  publicKey: { toBase58(): string } | null | undefined,
+): string | null {
+  try {
+    const encoded = publicKey?.toBase58();
+    return typeof encoded === "string" && encoded.length > 0 ? encoded : null;
+  } catch {
+    return null;
+  }
+}
+
+function requireStableSolanaAuthority(
+  wallet: WalletContextState,
+  expected?: SolanaWalletAuthority,
+): SolanaWalletAuthority {
+  const adapter = wallet.wallet?.adapter ?? null;
+  if (expected && adapter !== expected.adapter) {
+    throw new Error(
+      "Solana wallet adapter changed before sign-in could be authorized.",
+    );
+  }
+  if (!wallet.connected || !adapter?.connected) {
+    throw new Error(
+      "Solana wallet connection changed before sign-in could be authorized.",
+    );
+  }
+
+  const publicKey = readSolanaPublicKey(wallet.publicKey);
+  const adapterPublicKey = readSolanaPublicKey(adapter.publicKey);
+  if (
+    !publicKey ||
+    adapterPublicKey !== publicKey ||
+    (expected && publicKey !== expected.publicKey)
+  ) {
+    throw new Error(
+      "Solana wallet account changed before sign-in could be authorized.",
+    );
+  }
+
+  const signMessage = wallet.signMessage;
+  if (
+    !signMessage ||
+    !("signMessage" in adapter) ||
+    typeof adapter.signMessage !== "function" ||
+    (expected && signMessage !== expected.signMessage)
+  ) {
+    throw new Error(
+      "Solana wallet message signing capability changed before sign-in could be authorized.",
+    );
+  }
+
+  return { adapter, publicKey, signMessage };
 }
 
 export function WalletButtons({
@@ -719,6 +785,8 @@ function SolanaButton({
 }) {
   const t = useCloudT();
   const wallet = useWallet();
+  const latestWalletRef = useRef(wallet);
+  latestWalletRef.current = wallet;
   const { setVisible, visible } = useWalletModal();
   const pendingSignRef = useRef(false);
   const pendingSignGenerationRef = useRef<number | null>(null);
@@ -739,7 +807,8 @@ function SolanaButton({
   const sign = useCallback(
     async (generation: number) => {
       if (!isIntentCurrent(generation)) return;
-      if (!wallet.publicKey || !wallet.signMessage) {
+      const liveWallet = latestWalletRef.current;
+      if (!liveWallet.publicKey || !liveWallet.signMessage) {
         invalidateSignIntent();
         onLoadingChange(false);
         onError(
@@ -754,22 +823,36 @@ function SolanaButton({
       }
       onLoadingChange(true);
       try {
-        const publicKey = wallet.publicKey.toBase58();
-        const signMessage = wallet.signMessage;
+        const initialAuthority = requireStableSolanaAuthority(liveWallet);
         const result = requireCompletedAuth(
-          await auth.signInWithSolana(publicKey, async (msg: Uint8Array) => {
-            throwIfWalletIntentExpired(isIntentCurrent, generation);
-            const out = await signMessage(msg);
-            throwIfWalletIntentExpired(isIntentCurrent, generation);
-            if (!out)
-              throw new Error(
-                t("cloud.login.wallet.error.emptySignature", {
-                  defaultValue: "Wallet returned an empty signature.",
-                }),
+          await auth.signInWithSolana(
+            initialAuthority.publicKey,
+            async (msg: Uint8Array) => {
+              throwIfWalletIntentExpired(isIntentCurrent, generation);
+              const authorityBeforeSign = requireStableSolanaAuthority(
+                latestWalletRef.current,
+                initialAuthority,
               );
-            return out;
-          }),
+              throwIfWalletIntentExpired(isIntentCurrent, generation);
+              const out = await authorityBeforeSign.signMessage(msg);
+              throwIfWalletIntentExpired(isIntentCurrent, generation);
+              requireStableSolanaAuthority(
+                latestWalletRef.current,
+                initialAuthority,
+              );
+              throwIfWalletIntentExpired(isIntentCurrent, generation);
+              if (!out)
+                throw new Error(
+                  t("cloud.login.wallet.error.emptySignature", {
+                    defaultValue: "Wallet returned an empty signature.",
+                  }),
+                );
+              return out;
+            },
+          ),
         );
+        throwIfWalletIntentExpired(isIntentCurrent, generation);
+        requireStableSolanaAuthority(latestWalletRef.current, initialAuthority);
         if (!isIntentCurrent(generation)) return;
         await onSuccess(result);
       } catch (e) {
@@ -787,7 +870,6 @@ function SolanaButton({
       auth,
       invalidateSignIntent,
       isIntentCurrent,
-      wallet,
       onSuccess,
       onError,
       onLoadingChange,

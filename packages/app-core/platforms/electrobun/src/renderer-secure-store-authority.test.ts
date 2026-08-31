@@ -27,6 +27,8 @@ class MemorySecureStore implements PlatformSecureStore {
   failNextGet = false;
   failNextSet = false;
   mutateThenFailNextSet = false;
+  throwNextDelete = false;
+  throwReadbackAfterNextDelete = false;
 
   constructor(public value: string | null = "prior-token") {}
 
@@ -72,6 +74,10 @@ class MemorySecureStore implements PlatformSecureStore {
     _kind: SecureStoreSecretKind,
   ): Promise<SecureStoreDeleteResult> {
     this.operations.push("delete");
+    if (this.throwNextDelete) {
+      this.throwNextDelete = false;
+      throw new Error("injected delete rejection");
+    }
     if (this.failNextDelete) {
       this.failNextDelete = false;
       return {
@@ -85,6 +91,10 @@ class MemorySecureStore implements PlatformSecureStore {
     }
     const deleted = this.value !== null;
     this.value = null;
+    if (this.throwReadbackAfterNextDelete) {
+      this.throwReadbackAfterNextDelete = false;
+      this.failNextGet = true;
+    }
     return { ok: true, deleted };
   }
 
@@ -1262,6 +1272,56 @@ describe("RendererSecureStoreAuthority", () => {
     });
     expect(store.value).toBe("renderer-b-token");
   });
+
+  it.each(["snapshot", "delete", "readback"] as const)(
+    "settles retry-journal capacity after a rejected compare-delete %s",
+    async (failurePoint) => {
+      const store = new MemorySecureStore("renderer-a-token");
+      let now = 1_000;
+      const authority = new RendererSecureStoreAuthority(
+        store,
+        () => "unused-receipt",
+        { journalCapacity: 1, journalTtlMs: 1, now: () => now },
+      );
+      if (failurePoint === "snapshot") store.failNextGet = true;
+      if (failurePoint === "delete") store.throwNextDelete = true;
+      if (failurePoint === "readback") {
+        store.throwReadbackAfterNextDelete = true;
+      }
+
+      await expect(
+        authority.compareAndDelete(
+          VAULT_ID,
+          TOKEN_KIND,
+          "renderer-a-token",
+          8,
+          8,
+          createRendererSecureStoreOwner(`renderer-${failurePoint}`),
+          `failed-${failurePoint}`,
+        ),
+      ).resolves.toMatchObject({ ok: false, reason: "error" });
+
+      // The error tombstone may occupy the bounded journal until its TTL, but
+      // the in-flight reservation must be settled so capacity recovers after
+      // pruning instead of remaining exhausted for the process lifetime.
+      now += 2;
+      const currentValue = store.value;
+      await expect(
+        authority.compareAndDelete(
+          VAULT_ID,
+          TOKEN_KIND,
+          currentValue,
+          9,
+          9,
+          createRendererSecureStoreOwner(`renderer-${failurePoint}-retry`),
+          `recovered-${failurePoint}`,
+        ),
+      ).resolves.not.toMatchObject({
+        ok: false,
+        reason: "unavailable",
+      });
+    },
+  );
 
   it("replays an exact CAS deletion after its first response is lost", async () => {
     const store = new MemorySecureStore("renderer-a-token");

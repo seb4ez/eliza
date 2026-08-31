@@ -89,7 +89,12 @@ export type PreparedOidcResumeTarget =
 
 export interface OidcIssuerSessionDependencies {
   readToken?: () => string | null;
-  syncSession?: (token: string, endpoint: string) => Promise<unknown>;
+  signal?: AbortSignal;
+  syncSession?: (
+    token: string,
+    endpoint: string,
+    signal?: AbortSignal,
+  ) => Promise<unknown>;
 }
 
 /**
@@ -169,6 +174,8 @@ export async function prepareOidcResumeTarget(
 ): Promise<PreparedOidcResumeTarget> {
   const target = buildOidcResumeTarget(requestId, hostname, currentOrigin);
   if (target.status !== "ok") return target;
+  const signal = dependencies.signal;
+  if (signal?.aborted) return { status: "session_sync_failed" };
 
   const readToken = dependencies.readToken ?? readStoredStewardToken;
   const token = readToken()?.trim();
@@ -185,9 +192,14 @@ export async function prepareOidcResumeTarget(
   }
   const syncSession =
     dependencies.syncSession ??
-    ((stewardToken: string, sessionEndpoint: string) =>
+    ((
+      stewardToken: string,
+      sessionEndpoint: string,
+      abortSignal?: AbortSignal,
+    ) =>
       syncStewardSession(stewardToken, null, {
         endpoint: sessionEndpoint,
+        signal: abortSignal,
         sessionMutationProtocol: STEWARD_SESSION_MUTATION_PROTOCOL_VALUE,
       }));
 
@@ -199,6 +211,7 @@ export async function prepareOidcResumeTarget(
   if (hasStewardSessionRecovery(STEWARD_TENANT_ID)) {
     return { status: "session_sync_failed" };
   }
+  if (signal?.aborted) return { status: "session_sync_failed" };
   let recoveryReceipt: ReturnType<typeof beginStewardSessionRecovery>;
   let sessionMutationDispatched = false;
   try {
@@ -214,10 +227,19 @@ export async function prepareOidcResumeTarget(
     return { status: "session_sync_failed" };
   }
 
+  if (signal?.aborted) {
+    rejectStewardSessionRecovery(recoveryReceipt);
+    return { status: "session_sync_failed" };
+  }
+
   try {
     const committed = await enqueueStewardSessionMutation(async () => {
       const recoveryPublication =
         createStewardSessionRecoveryPublicationFence(recoveryReceipt);
+      if (signal?.aborted) {
+        rejectStewardSessionRecovery(recoveryReceipt);
+        return null;
+      }
       if (!recoveryPublication.validate()) return null;
       // The token was read before waiting for another tab's cookie mutation.
       // Only that exact bearer may be mirrored to the issuer once this lease is
@@ -228,15 +250,27 @@ export async function prepareOidcResumeTarget(
       }
       markStewardSessionRecoveryCookiePending(recoveryReceipt, token);
       sessionMutationDispatched = true;
-      await syncSession(token, endpoint);
-      if (!recoveryPublication.validate() || readToken()?.trim() !== token) {
+      if (signal) {
+        await syncSession(token, endpoint, signal);
+      } else {
+        await syncSession(token, endpoint);
+      }
+      if (
+        signal?.aborted ||
+        !recoveryPublication.validate() ||
+        readToken()?.trim() !== token
+      ) {
         // The issuer POST may already have committed. Keep a still-live receipt
         // for cookie-first reconciliation rather than pretending the stale
         // continuation can prove which account now owns the browser.
         return null;
       }
       const rollback = recoveryPublication.finalizeBeforePublish();
-      if (!recoveryPublication.isFinalized() || readToken()?.trim() !== token) {
+      if (
+        signal?.aborted ||
+        !recoveryPublication.isFinalized() ||
+        readToken()?.trim() !== token
+      ) {
         rollback(false);
         return null;
       }
@@ -253,7 +287,7 @@ export async function prepareOidcResumeTarget(
         rollback,
       };
     });
-    if (!committed?.authority.isCurrent()) {
+    if (signal?.aborted || !committed?.authority.isCurrent()) {
       committed?.rollback(false);
       return { status: "session_sync_failed" };
     }

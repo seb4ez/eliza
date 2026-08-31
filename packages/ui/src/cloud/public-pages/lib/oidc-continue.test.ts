@@ -365,6 +365,40 @@ describe("prepareOidcResumeTarget", () => {
     expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([]);
   });
 
+  it("retires preparation without syncing when its route aborts while queued", async () => {
+    withIssuer("https://api-staging.eliza.app");
+    let releaseLease: () => void = () => {};
+    const leaseAcquired = deferred<void>();
+    const heldLease = enqueueStewardSessionMutation(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseLease = resolve;
+          leaseAcquired.resolve();
+        }),
+    );
+    await leaseAcquired.promise;
+    const controller = new AbortController();
+    const syncSession = vi.fn(async () => undefined);
+    const pending = prepareOidcResumeTarget(
+      RID,
+      "staging.eliza.app",
+      "https://staging.eliza.app",
+      {
+        readToken: () => "account-a",
+        signal: controller.signal,
+        syncSession,
+      },
+    );
+
+    controller.abort();
+    releaseLease();
+    await heldLease;
+
+    await expect(pending).resolves.toEqual({ status: "session_sync_failed" });
+    expect(syncSession).not.toHaveBeenCalled();
+    expect(readStewardSessionRecovery("elizacloud").receipts).toEqual([]);
+  });
+
   it("keeps ambiguity when the exact token changes after issuer commit", async () => {
     withIssuer("https://api-staging.eliza.app");
     let storedToken = "account-a";

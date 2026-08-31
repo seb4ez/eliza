@@ -13,46 +13,75 @@ import {
 import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const walletHooks = vi.hoisted(() => ({
-  connectAsync: vi.fn(),
-  connectors: [] as Array<{
-    getAccounts?: () => Promise<readonly `0x${string}`[]>;
-    getChainId?: () => Promise<number>;
-    getProvider: () => Promise<unknown>;
-    id: string;
-    name: string;
-    type: string;
-  }>,
-  connectModalAvailable: true,
-  connectModalOpen: false,
-  evmAccount: {
-    address: undefined as `0x${string}` | undefined,
-    connector: undefined as
-      | {
-          getAccounts: () => Promise<readonly `0x${string}`[]>;
-          getChainId: () => Promise<number>;
-          getProvider: () => Promise<unknown>;
-          id: string;
-          name: string;
-          type: string;
-        }
-      | undefined,
-    isConnected: false,
-    isConnecting: false,
-  },
-  openConnectModal: vi.fn(),
-  solanaModalVisible: false,
-  solanaWallet: {
+const walletHooks = vi.hoisted(() => {
+  type SolanaPublicKey = { toBase58: () => string };
+  type SolanaSigner = (message: Uint8Array) => Promise<Uint8Array>;
+  type SolanaAdapter = {
+    connected: boolean;
+    publicKey: SolanaPublicKey | null;
+    signMessage: SolanaSigner | undefined;
+  };
+  const solanaWallet: {
+    connected: boolean;
+    connecting: boolean;
+    publicKey: SolanaPublicKey | null;
+    signMessage: SolanaSigner | undefined;
+    wallet: { adapter: SolanaAdapter } | null;
+  } = {
     connected: false,
     connecting: false,
-    publicKey: null as { toBase58: () => string } | null,
-    signMessage: undefined as
-      | ((message: Uint8Array) => Promise<Uint8Array>)
-      | undefined,
-  },
-  setSolanaModalVisible: vi.fn(),
-  signMessageAsync: vi.fn(),
-}));
+    publicKey: null,
+    signMessage: undefined,
+    wallet: null,
+  };
+  const solanaAdapter: SolanaAdapter = {
+    get connected() {
+      return solanaWallet.connected;
+    },
+    get publicKey() {
+      return solanaWallet.publicKey;
+    },
+    get signMessage() {
+      return solanaWallet.signMessage;
+    },
+  };
+  solanaWallet.wallet = { adapter: solanaAdapter };
+
+  return {
+    connectAsync: vi.fn(),
+    connectors: [] as Array<{
+      getAccounts?: () => Promise<readonly `0x${string}`[]>;
+      getChainId?: () => Promise<number>;
+      getProvider: () => Promise<unknown>;
+      id: string;
+      name: string;
+      type: string;
+    }>,
+    connectModalAvailable: true,
+    connectModalOpen: false,
+    evmAccount: {
+      address: undefined as `0x${string}` | undefined,
+      connector: undefined as
+        | {
+            getAccounts: () => Promise<readonly `0x${string}`[]>;
+            getChainId: () => Promise<number>;
+            getProvider: () => Promise<unknown>;
+            id: string;
+            name: string;
+            type: string;
+          }
+        | undefined,
+      isConnected: false,
+      isConnecting: false,
+    },
+    openConnectModal: vi.fn(),
+    solanaAdapter,
+    solanaModalVisible: false,
+    solanaWallet,
+    setSolanaModalVisible: vi.fn(),
+    signMessageAsync: vi.fn(),
+  };
+});
 
 vi.mock("@rainbow-me/rainbowkit", () => ({
   useConnectModal: () => ({
@@ -107,6 +136,7 @@ function resetWalletHooks() {
   walletHooks.solanaWallet.connecting = false;
   walletHooks.solanaWallet.publicKey = null;
   walletHooks.solanaWallet.signMessage = undefined;
+  walletHooks.solanaWallet.wallet = { adapter: walletHooks.solanaAdapter };
   Reflect.deleteProperty(window, "ethereum");
 }
 
@@ -963,6 +993,108 @@ describe("WalletButtons modal intent lifecycle", () => {
     await waitFor(() =>
       expect(props.onLoadingChange).toHaveBeenLastCalledWith(null),
     );
+  });
+
+  it("fails SIWS closed when the Solana account changes before signing", async () => {
+    const initialPublicKey = {
+      toBase58: () => "initial-solana-account",
+    };
+    const initialSigner = vi.fn().mockResolvedValue(new Uint8Array([1, 2, 3]));
+    walletHooks.solanaWallet.connected = true;
+    walletHooks.solanaWallet.publicKey = initialPublicKey;
+    walletHooks.solanaWallet.signMessage = initialSigner;
+
+    const sdkResult = createDeferred<Record<string, never>>();
+    let sdkSigner: ((message: Uint8Array) => Promise<Uint8Array>) | undefined;
+    const signInWithSolana = vi.fn(
+      (
+        _publicKey: string,
+        signer: (message: Uint8Array) => Promise<Uint8Array>,
+      ) => {
+        sdkSigner = signer;
+        return sdkResult.promise;
+      },
+    );
+    const { props, rerenderWalletButtons } = renderWalletButtons({
+      authOverride: { signInWithSolana } as unknown as StewardAuth,
+      siws: true,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /Solana wallet/i }));
+    await waitFor(() => expect(sdkSigner).toBeTypeOf("function"));
+
+    walletHooks.solanaWallet.publicKey = {
+      toBase58: () => "competing-solana-account",
+    };
+    rerenderWalletButtons();
+
+    await expect(sdkSigner?.(new Uint8Array([4, 5, 6]))).rejects.toThrow(
+      "Solana wallet account changed before sign-in could be authorized.",
+    );
+    expect(initialSigner).not.toHaveBeenCalled();
+
+    await act(async () => {
+      sdkResult.resolve({});
+      await sdkResult.promise;
+    });
+    await waitFor(() => expect(props.onError).toHaveBeenCalledTimes(1));
+    expect(props.onError.mock.calls[0]?.[0]).toMatchObject({
+      message:
+        "Solana wallet account changed before sign-in could be authorized.",
+    });
+    expect(props.onSuccess).not.toHaveBeenCalled();
+  });
+
+  it("fails SIWS closed when the Solana adapter changes while signing", async () => {
+    const publicKey = { toBase58: () => "stable-solana-account" };
+    const signature = createDeferred<Uint8Array>();
+    const initialSigner = vi.fn(() => signature.promise);
+    walletHooks.solanaWallet.connected = true;
+    walletHooks.solanaWallet.publicKey = publicKey;
+    walletHooks.solanaWallet.signMessage = initialSigner;
+
+    const signInWithSolana = vi.fn(
+      async (
+        _publicKey: string,
+        signer: (message: Uint8Array) => Promise<Uint8Array>,
+      ) => {
+        await signer(new Uint8Array([7, 8, 9]));
+        return {};
+      },
+    );
+    const { props, rerenderWalletButtons } = renderWalletButtons({
+      authOverride: { signInWithSolana } as unknown as StewardAuth,
+      siws: true,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /Solana wallet/i }));
+    await waitFor(() => expect(initialSigner).toHaveBeenCalledTimes(1));
+
+    const competingSigner = vi
+      .fn()
+      .mockResolvedValue(new Uint8Array([10, 11, 12]));
+    walletHooks.solanaWallet.signMessage = competingSigner;
+    walletHooks.solanaWallet.wallet = {
+      adapter: {
+        connected: true,
+        publicKey,
+        signMessage: competingSigner,
+      },
+    };
+    rerenderWalletButtons();
+
+    await act(async () => {
+      signature.resolve(new Uint8Array([13, 14, 15]));
+      await signature.promise;
+    });
+
+    await waitFor(() => expect(props.onError).toHaveBeenCalledTimes(1));
+    expect(props.onError.mock.calls[0]?.[0]).toMatchObject({
+      message:
+        "Solana wallet adapter changed before sign-in could be authorized.",
+    });
+    expect(competingSigner).not.toHaveBeenCalled();
+    expect(props.onSuccess).not.toHaveBeenCalled();
   });
 });
 

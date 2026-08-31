@@ -77,6 +77,22 @@ describe("Steward session client CSRF marker header", () => {
     expect(headers.get("content-type")).toBe("application/json");
   });
 
+  it("syncStewardSession forwards caller cancellation authority", async () => {
+    let seen: RequestInit | undefined;
+    const fetchImpl = (async (_input: unknown, init?: RequestInit) => {
+      seen = init;
+      return jsonResponse({ ok: true, userId: "u", stewardUserId: "s" });
+    }) as typeof fetch;
+    const controller = new AbortController();
+
+    await syncStewardSession("token", null, {
+      fetchImpl,
+      signal: controller.signal,
+    });
+
+    expect(seen?.signal).toBe(controller.signal);
+  });
+
   it("exchangeStewardCode sends the marker header with its JSON POST", async () => {
     let seen: RequestInit | undefined;
     const fetchImpl = (async (_input: unknown, init?: RequestInit) => {
@@ -1293,6 +1309,61 @@ describe("Steward session storage transitions", () => {
       window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
     }
   });
+
+  it.each([null, "account-b-newer"])(
+    "does not publish a refreshed replacement invalidated during commit by %s",
+    async (successor) => {
+      localStorage.setItem(STEWARD_TOKEN_KEY, "account-a-old");
+      let markCommitStarted: () => void = () => {};
+      const commitStarted = new Promise<void>((resolve) => {
+        markCommitStarted = resolve;
+      });
+      let releaseCommit: () => void = () => {};
+      const commitWait = new Promise<void>((resolve) => {
+        releaseCommit = resolve;
+      });
+      const restorePredecessor = vi.fn(async () => false);
+      const unregister = registerStewardTokenPersistence(async (token) => {
+        localStorage.setItem(STEWARD_TOKEN_KEY, token);
+        return {
+          commit: async () => {
+            markCommitStarted();
+            await commitWait;
+          },
+          restorePredecessor,
+        };
+      });
+      const transitions: StewardSessionChangeDetail[] = [];
+      const listener = (event: Event) => {
+        transitions.push(
+          (event as CustomEvent<StewardSessionChangeDetail>).detail,
+        );
+      };
+      window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+
+      try {
+        const replacement = replaceStoredStewardTokenIfCurrent(
+          "account-a-old",
+          "account-a-refreshed",
+        );
+        await commitStarted;
+        if (successor === null) {
+          localStorage.removeItem(STEWARD_TOKEN_KEY);
+        } else {
+          localStorage.setItem(STEWARD_TOKEN_KEY, successor);
+        }
+        releaseCommit();
+
+        await expect(replacement).resolves.toBe(false);
+        expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(successor);
+        expect(restorePredecessor).toHaveBeenCalledOnce();
+        expect(transitions).toEqual([]);
+      } finally {
+        unregister();
+        window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+      }
+    },
+  );
 
   it("lets a newer queued write survive an aborted predecessor rollback", async () => {
     let markFirstStarted: () => void = () => {};

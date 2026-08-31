@@ -1005,7 +1005,16 @@ export class RendererSecureStoreAuthority {
           return changedResult;
         };
 
-        const current = await this.store.get(vaultId, kind);
+        let current: SecureStoreGetResult;
+        try {
+          current = await this.store.get(vaultId, kind);
+        } catch {
+          return finish({
+            ok: false,
+            reason: "error",
+            message: "Secure credential snapshot could not be read.",
+          });
+        }
         if (!current.ok && current.reason === "not_found") {
           return finish({
             ok: true,
@@ -1031,8 +1040,26 @@ export class RendererSecureStoreAuthority {
           return finish(releasedOwnerFailure);
         }
 
-        const deletion = await this.store.delete(vaultId, kind);
-        const verified = await this.store.get(vaultId, kind);
+        let deletion: SecureStoreDeleteResult;
+        try {
+          deletion = await this.store.delete(vaultId, kind);
+        } catch {
+          deletion = {
+            ok: false,
+            reason: "error",
+            message: "Secure credential backend delete failed.",
+          };
+        }
+        let verified: SecureStoreGetResult;
+        try {
+          verified = await this.store.get(vaultId, kind);
+        } catch {
+          verified = {
+            ok: false,
+            reason: "error",
+            message: "Secure credential readback failed.",
+          };
+        }
         if (!verified.ok && verified.reason === "not_found") {
           const state = this.stateFor(
             this.slotKey(vaultId, kind),

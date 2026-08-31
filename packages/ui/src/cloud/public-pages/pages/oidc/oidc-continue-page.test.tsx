@@ -54,6 +54,11 @@ describe("OidcContinuePage", () => {
     await vi.waitFor(() =>
       expect(prepareOidcResumeTargetMock).toHaveBeenCalledOnce(),
     );
+    await new Promise<void>((resolve) => queueMicrotask(resolve));
+    const dependencies = prepareOidcResumeTargetMock.mock.calls[0]?.[3] as
+      | { signal?: AbortSignal }
+      | undefined;
+    expect(dependencies?.signal?.aborted).toBe(false);
     resolvePreparation({ status: "session_sync_failed" });
 
     expect(
@@ -62,6 +67,30 @@ describe("OidcContinuePage", () => {
       ),
     ).toBeTruthy();
     expect(prepareOidcResumeTargetMock).toHaveBeenCalledOnce();
+  });
+
+  it("aborts issuer-session preparation after an actual route unmount", async () => {
+    prepareOidcResumeTargetMock.mockReturnValue(
+      new Promise<PreparedOidcResumeTarget>(() => {}),
+    );
+    const view = render(
+      <MemoryRouter
+        initialEntries={[`/oidc/continue?rid=eoq_${"a".repeat(64)}`]}
+      >
+        <OidcContinuePage />
+      </MemoryRouter>,
+    );
+
+    await vi.waitFor(() =>
+      expect(prepareOidcResumeTargetMock).toHaveBeenCalledOnce(),
+    );
+    const dependencies = prepareOidcResumeTargetMock.mock.calls[0]?.[3] as
+      | { signal?: AbortSignal }
+      | undefined;
+    expect(dependencies?.signal?.aborted).toBe(false);
+
+    view.unmount();
+    await vi.waitFor(() => expect(dependencies?.signal?.aborted).toBe(true));
   });
 
   it.each(["/oidc/continue", "/oidc/continue?rid=%20"])(

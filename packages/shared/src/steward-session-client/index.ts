@@ -434,6 +434,8 @@ export interface SyncOpts {
    * Override the global fetch (mainly for tests and SSR shims).
    */
   fetchImpl?: typeof fetch;
+  /** Cancels an in-flight session synchronization when caller authority ends. */
+  signal?: AbortSignal;
   /**
    * Present only when the caller owns the origin-wide Steward mutation lease.
    * Omitting it deliberately emits the legacy marker. That marker may mutate
@@ -1179,7 +1181,10 @@ export async function replaceStoredStewardTokenIfCurrent(
       previousToken,
       previousScope,
     );
-    if (options?.validate?.() === false) {
+    if (
+      options?.validate?.() === false ||
+      !exactStoredStewardTokenIsCurrent(token, requiredScope)
+    ) {
       await compensateUnpublishedStewardTokenWrite(
         token,
         previousToken,
@@ -1216,7 +1221,10 @@ export async function replaceStoredStewardTokenIfCurrent(
       }
       throw new StewardTokenPersistenceError(error);
     }
-    if (options?.validate?.() === false) {
+    if (
+      options?.validate?.() === false ||
+      !exactStoredStewardTokenIsCurrent(token, requiredScope)
+    ) {
       await compensateUnpublishedStewardTokenWrite(
         token,
         previousToken,
@@ -1389,6 +1397,7 @@ export async function syncStewardSession(
   const response = await f(endpoint, {
     method: "POST",
     credentials: "include",
+    signal: opts.signal,
     headers: {
       "Content-Type": "application/json",
       [STEWARD_CSRF_HEADER]:

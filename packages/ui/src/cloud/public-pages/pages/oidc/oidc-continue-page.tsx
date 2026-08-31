@@ -33,6 +33,8 @@ export default function OidcContinuePage() {
     PreparedOidcResumeTarget["status"] | null
   >(null);
   const operationRef = useRef<{
+    activation: number;
+    controller: AbortController;
     key: string;
     promise: Promise<PreparedOidcResumeTarget>;
   } | null>(null);
@@ -60,15 +62,28 @@ export default function OidcContinuePage() {
       window.location.hostname,
       window.location.origin,
     ]);
-    const operation =
-      operationRef.current?.key === operationKey
-        ? operationRef.current.promise
-        : prepareOidcResumeTarget(
-            requestId,
-            window.location.hostname,
-            window.location.origin,
-          );
-    operationRef.current = { key: operationKey, promise: operation };
+    let operationState = operationRef.current;
+    if (
+      operationState?.key !== operationKey ||
+      operationState.controller.signal.aborted
+    ) {
+      const controller = new AbortController();
+      operationState = {
+        activation: 0,
+        controller,
+        key: operationKey,
+        promise: prepareOidcResumeTarget(
+          requestId,
+          window.location.hostname,
+          window.location.origin,
+          { signal: controller.signal },
+        ),
+      };
+      operationRef.current = operationState;
+    }
+    operationState.activation += 1;
+    const operationActivation = operationState.activation;
+    const operation = operationState.promise;
 
     void operation
       .then((target) => {
@@ -95,6 +110,15 @@ export default function OidcContinuePage() {
       if (effectIsCurrent()) {
         effectGenerationRef.current = effectGeneration + 1;
       }
+      // React StrictMode immediately replays setup after cleanup while keeping
+      // refs alive. Defer cancellation by one microtask so that replay can
+      // claim the same one-time operation; a real unmount or route change has
+      // no successor activation and therefore aborts every remaining mutation.
+      queueMicrotask(() => {
+        if (operationState.activation === operationActivation) {
+          operationState.controller.abort();
+        }
+      });
     };
   }, [requestId]);
 
