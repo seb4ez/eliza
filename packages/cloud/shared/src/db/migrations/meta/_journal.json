@@ -2472,6 +2472,13 @@
       "when": 1794254400060,
       "tag": "0369_agent_backup_admission_recovery_cursor",
       "breakpoints": true
+    },
+    {
+      "idx": 353,
+      "version": "7",
+      "when": 1796083200000,
+      "tag": "0370_subscription_authority",
+      "breakpoints": true
     }
   ]
 }
