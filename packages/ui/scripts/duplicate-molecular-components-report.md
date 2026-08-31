@@ -107,7 +107,7 @@ These owners are fail-closed contracts. The audit fails if an owner disappears, 
 ### panel: badge + button + input
 
 - `AgentSection` in `packages/ui/src/components/settings/cloud-panel/sections/AgentSection.tsx:109`
-- `CloudAgentsSection` in `packages/ui/src/components/settings/CloudAgentsSection.tsx:77`
+- `CloudAgentsSection` in `packages/ui/src/components/settings/CloudAgentsSection.tsx:74`
 - Fingerprint: `sha256:f0e0a109e0fab258115f7e1cc83319bae2890d554c23083a69f95a6700db6757`
 - Decision: **shared-lifecycle-owner**. The cloud-panel-owned useCloudAgentManagement pattern owns list refresh, create, rename, suspend/resume, delete polling, wake-and-switch, persistence, and notices; AgentSection and CloudAgentsSection are distinct presentation adapters with explicit management-token providers.
 
