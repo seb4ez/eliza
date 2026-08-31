@@ -54,6 +54,8 @@ const mockDesktopSecure = {
   },
   connectionTransactionCalls: [] as string[],
   connectionBeginResponseLossesRemaining: 0,
+  connectionActiveStatusResponseLossesRemaining: 0,
+  connectionTerminalStatusResponseLossesRemaining: 0,
   connectionFinishResponseLossesRemaining: 0,
   connectionAbortResponseLossesRemaining: 0,
   connectionCompensateResponseLossesRemaining: 0,
@@ -694,7 +696,7 @@ vi.mock("./electrobun-rpc", () => ({
   ) => {
     mockDesktopSecure.connectionTransactionCalls.push("begin");
     const existing = mockDesktopSecure.connectionTransaction;
-    if (existing && existing.id !== transactionId) {
+    if (existing) {
       throw new Error("mock transaction is already active");
     }
     mockDesktopSecure.connectionTransaction ??= {
@@ -903,6 +905,10 @@ vi.mock("./electrobun-rpc", () => ({
       active?.id === transactionId &&
       (epoch === undefined || active.epoch === epoch)
     ) {
+      if (mockDesktopSecure.connectionActiveStatusResponseLossesRemaining > 0) {
+        mockDesktopSecure.connectionActiveStatusResponseLossesRemaining -= 1;
+        throw new Error("deterministic lost active STATUS response");
+      }
       return {
         ok: true as const,
         epoch: active.epoch,
@@ -914,6 +920,12 @@ vi.mock("./electrobun-rpc", () => ({
       completed?.id === transactionId &&
       (epoch === undefined || completed.epoch === epoch)
     ) {
+      if (
+        mockDesktopSecure.connectionTerminalStatusResponseLossesRemaining > 0
+      ) {
+        mockDesktopSecure.connectionTerminalStatusResponseLossesRemaining -= 1;
+        throw new Error("deterministic lost terminal STATUS response");
+      }
       return {
         ok: true as const,
         epoch: completed.epoch,
@@ -1032,6 +1044,8 @@ beforeEach(() => {
   mockDesktopSecure.completedConnectionTransaction = null;
   mockDesktopSecure.connectionTransactionCalls.length = 0;
   mockDesktopSecure.connectionBeginResponseLossesRemaining = 0;
+  mockDesktopSecure.connectionActiveStatusResponseLossesRemaining = 0;
+  mockDesktopSecure.connectionTerminalStatusResponseLossesRemaining = 0;
   mockDesktopSecure.connectionFinishResponseLossesRemaining = 0;
   mockDesktopSecure.connectionAbortResponseLossesRemaining = 0;
   mockDesktopSecure.connectionCompensateResponseLossesRemaining = 0;
@@ -1197,6 +1211,91 @@ describe("storage bridge on the electrobun desktop runtime", () => {
     expect(mockDesktopSecure.connectionTransaction?.phase).toBe("prepared");
     await expect(
       bridge.abortRuntimeConnectionStorageTransaction(transaction),
+    ).resolves.toBe(true);
+    expect(mockDesktopSecure.connectionTransaction).toBeNull();
+  });
+
+  it("rejects invalid participants without poisoning a later transaction", async () => {
+    await expect(
+      bridge.beginRuntimeConnectionStorageTransaction([]),
+    ).rejects.toThrow("participants are missing");
+    await expect(
+      bridge.beginRuntimeConnectionStorageTransaction([
+        { key: "elizaos:active-server", value: "" },
+      ]),
+    ).rejects.toThrow("value is missing or too large");
+    await expect(
+      bridge.beginRuntimeConnectionStorageTransaction([
+        {
+          key: "elizaos:active-server",
+          value: "é".repeat(131_073),
+        },
+      ]),
+    ).rejects.toThrow("value is missing or too large");
+    expect(mockDesktopSecure.connectionTransactionCalls).toEqual([]);
+
+    const transaction = await bridge.beginRuntimeConnectionStorageTransaction([
+      { key: "elizaos:active-server", value: "server-b" },
+    ]);
+    if (!transaction) throw new Error("valid transaction was not prepared");
+    await bridge.abortRuntimeConnectionStorageTransaction(transaction);
+  });
+
+  it("retires an ambiguous prepared WAL before starting a new transaction", async () => {
+    mockDesktopSecure.connectionBeginResponseLossesRemaining = 3;
+    mockDesktopSecure.connectionActiveStatusResponseLossesRemaining = 3;
+
+    await expect(
+      bridge.beginRuntimeConnectionStorageTransaction([
+        { key: "elizaos:active-server", value: "server-b" },
+      ]),
+    ).rejects.toThrow(
+      "Desktop runtime connection transaction prepare outcome is ambiguous",
+    );
+
+    const stranded = mockDesktopSecure.connectionTransaction;
+    if (!stranded) throw new Error("ambiguous transaction was not prepared");
+    const strandedId = stranded.id;
+    expect(stranded.phase).toBe("prepared");
+    expect(stranded.participants.get("runtime.active_server")).toBe("server-b");
+
+    mockDesktopSecure.connectionAbortResponseLossesRemaining = 3;
+    mockDesktopSecure.connectionTerminalStatusResponseLossesRemaining = 3;
+    await expect(
+      bridge.beginRuntimeConnectionStorageTransaction([
+        { key: "elizaos:active-server", value: "server-c" },
+      ]),
+    ).rejects.toThrow(
+      "Desktop runtime connection transaction retirement outcome is ambiguous",
+    );
+
+    const next = await bridge.beginRuntimeConnectionStorageTransaction([
+      { key: "elizaos:active-server", value: "server-c" },
+    ]);
+    if (!next) throw new Error("next transaction was not prepared");
+
+    expect(mockDesktopSecure.completedConnectionTransaction).toMatchObject({
+      id: strandedId,
+      status: "aborted",
+    });
+    expect(
+      mockDesktopSecure.completedConnectionTransaction?.participants.get(
+        "runtime.active_server",
+      ),
+    ).toBe("server-b");
+    expect(mockDesktopSecure.connectionTransaction?.id).toBe(
+      next.transactionId,
+    );
+    expect(next.transactionId).not.toBe(strandedId);
+    expect(
+      mockDesktopSecure.connectionTransaction?.participants.get(
+        "runtime.active_server",
+      ),
+    ).toBe("server-c");
+    expect(mockDesktopStore.has("runtime.active_server")).toBe(false);
+
+    await expect(
+      bridge.abortRuntimeConnectionStorageTransaction(next),
     ).resolves.toBe(true);
     expect(mockDesktopSecure.connectionTransaction).toBeNull();
   });

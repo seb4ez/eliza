@@ -316,10 +316,23 @@ interface RuntimeConnectionStorageTransactionState
   stewardPredecessorScope: { value: string | null } | null;
 }
 
+interface PendingRuntimeConnectionTransactionPrepare {
+  epoch: string | null;
+  inFlight: boolean;
+  participants: Array<{
+    kind: DesktopConnectionTransactionKind;
+    value: string;
+  }>;
+  transactionId: string;
+}
+
 let activeRuntimeConnectionTransaction: RuntimeConnectionStorageTransactionState | null =
+  null;
+let pendingRuntimeConnectionTransactionPrepare: PendingRuntimeConnectionTransactionPrepare | null =
   null;
 
 const DESKTOP_SECURE_STORE_RPC_ATTEMPTS = 3;
+const DESKTOP_SECURE_STORE_MAX_VALUE_BYTES = 256 * 1024;
 export const PROTECTED_STORAGE_CACHE_LEASE_MS = 30_000;
 const PROTECTED_STORAGE_CACHE_RENEW_AFTER_MS =
   PROTECTED_STORAGE_CACHE_LEASE_MS / 2;
@@ -380,6 +393,130 @@ async function retryDesktopConnectionTransactionRequest<T>(
   throw lastError;
 }
 
+async function prepareRuntimeConnectionTransaction(
+  pending: PendingRuntimeConnectionTransactionPrepare,
+): Promise<{ ok: true; epoch: string }> {
+  try {
+    return await retryDesktopConnectionTransactionRequest(
+      () =>
+        desktopConnectionTransactionBegin(
+          pending.transactionId,
+          pending.participants,
+        ),
+      "Desktop runtime connection transaction prepare is unavailable",
+    );
+  } catch (beginError) {
+    // error-policy:J2 BEGIN may have durably prepared the WAL even when every
+    // response was lost, so recover its owner-scoped epoch before rethrowing.
+    let status: NonNullable<
+      Awaited<ReturnType<typeof desktopConnectionTransactionStatus>>
+    >;
+    try {
+      status = await retryDesktopConnectionTransactionRequest(
+        () => desktopConnectionTransactionStatus(pending.transactionId),
+        "Desktop runtime connection transaction status is unavailable",
+      );
+    } catch (statusError) {
+      // error-policy:J2 preserve both transport failures while the caller
+      // retains the transaction identity for a later recovery attempt.
+      throw new AggregateError(
+        [beginError, statusError],
+        "Desktop runtime connection transaction prepare outcome is ambiguous",
+      );
+    }
+    if (status.status !== "prepared") throw beginError;
+    return { ok: true, epoch: status.epoch };
+  }
+}
+
+async function retirePendingRuntimeConnectionTransaction(): Promise<void> {
+  const pending = pendingRuntimeConnectionTransactionPrepare;
+  if (!pending) return;
+  if (pending.inFlight) {
+    throw new Error(
+      "A runtime connection storage transaction prepare is already in progress",
+    );
+  }
+  pending.inFlight = true;
+  try {
+    let epoch = pending.epoch;
+    if (!epoch) {
+      try {
+        const status = await retryDesktopConnectionTransactionRequest(
+          () => desktopConnectionTransactionStatus(pending.transactionId),
+          "Desktop runtime connection transaction status is unavailable",
+        );
+        if (status.status === "aborted") {
+          if (pendingRuntimeConnectionTransactionPrepare === pending) {
+            pendingRuntimeConnectionTransactionPrepare = null;
+          }
+          return;
+        }
+        if (status.status !== "prepared") {
+          throw new Error(
+            `Ambiguous runtime connection transaction cannot be retired from ${status.status}`,
+          );
+        }
+        epoch = status.epoch;
+      } catch (statusError) {
+        // error-policy:J2 STATUS is attempted before replaying BEGIN because the
+        // production handler fences BEGIN while this owner's WAL is active. If
+        // no WAL was written, replaying the exact validated intent can create a
+        // transaction that is immediately retired instead.
+        try {
+          epoch = (await prepareRuntimeConnectionTransaction(pending)).epoch;
+        } catch (prepareError) {
+          throw new AggregateError(
+            [statusError, prepareError],
+            "Desktop runtime connection transaction retirement outcome is ambiguous",
+          );
+        }
+      }
+    }
+    pending.epoch = epoch;
+    try {
+      const result = await retryDesktopConnectionTransactionRequest(
+        () =>
+          desktopConnectionTransactionAbort(pending.transactionId, epoch, []),
+        "Desktop runtime connection transaction abort is unavailable",
+      );
+      if (!result.aborted || result.committed) {
+        throw new Error(
+          "Ambiguous runtime connection transaction could not be aborted",
+        );
+      }
+    } catch (abortError) {
+      // error-policy:J2 ABORT may have released the WAL after every response
+      // was lost; confirm the owner/epoch-bound terminal state before clearing.
+      let status: NonNullable<
+        Awaited<ReturnType<typeof desktopConnectionTransactionStatus>>
+      >;
+      try {
+        status = await retryDesktopConnectionTransactionRequest(
+          () =>
+            desktopConnectionTransactionStatus(pending.transactionId, epoch),
+          "Desktop runtime connection transaction status is unavailable",
+        );
+      } catch (statusError) {
+        // error-policy:J2 keep the pending identity and epoch retryable while
+        // reporting both failures to the caller.
+        throw new AggregateError(
+          [abortError, statusError],
+          "Desktop runtime connection transaction retirement outcome is ambiguous",
+        );
+      }
+      if (status.status !== "aborted") throw abortError;
+    }
+    if (pendingRuntimeConnectionTransactionPrepare === pending) {
+      pendingRuntimeConnectionTransactionPrepare = null;
+    }
+  } finally {
+    if (pendingRuntimeConnectionTransactionPrepare === pending) {
+      pending.inFlight = false;
+    }
+  }
+}
+
 function requireActiveRuntimeConnectionTransaction(
   transaction: RuntimeConnectionStorageTransaction,
 ): RuntimeConnectionStorageTransactionState {
@@ -400,6 +537,9 @@ export async function beginRuntimeConnectionStorageTransaction(
   participants: readonly RuntimeConnectionStorageParticipant[],
 ): Promise<RuntimeConnectionStorageTransaction | null> {
   if (isNativePlatform() || !isElectrobunRuntime()) return null;
+  if (pendingRuntimeConnectionTransactionPrepare) {
+    await retirePendingRuntimeConnectionTransaction();
+  }
   if (activeRuntimeConnectionTransaction) {
     throw new Error(
       "A runtime connection storage transaction is already active",
@@ -412,8 +552,21 @@ export async function beginRuntimeConnectionStorageTransaction(
         `Protected storage key cannot join a runtime connection transaction: ${participant.key}`,
       );
     }
+    if (
+      typeof participant.value !== "string" ||
+      participant.value.length === 0 ||
+      new TextEncoder().encode(participant.value).byteLength >
+        DESKTOP_SECURE_STORE_MAX_VALUE_BYTES
+    ) {
+      throw new Error(
+        "Runtime connection transaction participant value is missing or too large",
+      );
+    }
     return { key: participant.key, kind, value: participant.value };
   });
+  if (mapped.length === 0) {
+    throw new Error("Runtime connection transaction participants are missing");
+  }
   if (
     new Set(mapped.map((participant) => participant.kind)).size !==
     mapped.length
@@ -422,35 +575,21 @@ export async function beginRuntimeConnectionStorageTransaction(
       "Runtime connection transaction contains duplicate participants",
     );
   }
-  const transactionId = crypto.randomUUID();
+  const pending: PendingRuntimeConnectionTransactionPrepare = {
+    epoch: null,
+    inFlight: true,
+    participants: mapped.map(({ kind, value }) => ({ kind, value })),
+    transactionId: crypto.randomUUID(),
+  };
+  pendingRuntimeConnectionTransactionPrepare = pending;
   let result: { ok: true; epoch: string };
   try {
-    result = await retryDesktopConnectionTransactionRequest(
-      () =>
-        desktopConnectionTransactionBegin(
-          transactionId,
-          mapped.map(({ kind, value }) => ({ kind, value })),
-        ),
-      "Desktop runtime connection transaction prepare is unavailable",
-    );
-  } catch (beginError) {
-    // BEGIN may have durably prepared the WAL even when every response was
-    // lost. Recover its owner-scoped epoch instead of abandoning an invisible
-    // host lock until the renderer reloads.
-    try {
-      const status = await retryDesktopConnectionTransactionRequest(
-        () => desktopConnectionTransactionStatus(transactionId),
-        "Desktop runtime connection transaction status is unavailable",
-      );
-      if (status.status !== "prepared") throw beginError;
-      result = { ok: true, epoch: status.epoch };
-    } catch (statusError) {
-      throw new AggregateError(
-        [beginError, statusError],
-        "Desktop runtime connection transaction prepare outcome is ambiguous",
-      );
-    }
+    result = await prepareRuntimeConnectionTransaction(pending);
+    pending.epoch = result.epoch;
+  } finally {
+    pending.inFlight = false;
   }
+  pendingRuntimeConnectionTransactionPrepare = null;
   const transaction: RuntimeConnectionStorageTransactionState = {
     [RUNTIME_CONNECTION_STORAGE_TRANSACTION]: true,
     abortPromise: null,
@@ -463,7 +602,7 @@ export async function beginRuntimeConnectionStorageTransaction(
     receipts: new Map(),
     sealedMutationVersions: null,
     stewardPredecessorScope: null,
-    transactionId,
+    transactionId: pending.transactionId,
   };
   activeRuntimeConnectionTransaction = transaction;
   return transaction;
