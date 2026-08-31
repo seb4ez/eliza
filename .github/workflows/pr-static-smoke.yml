@@ -333,8 +333,11 @@ jobs:
       AUTH_ADMISSION_PATH_INPUTS: >-
         packages/app
         packages/app-core
+        packages/auth
+        packages/cloud
         packages/shared
         packages/ui
+        patches
         .github/actions/setup-bun-workspace
         .github/scripts/install-playwright-browsers.sh
         .github/workflows/pr-static-smoke.yml
@@ -403,9 +406,11 @@ jobs:
 
       - name: Run native secure-store authority tests
         if: steps.auth-diff.outputs.run == 'true'
-        run: >-
-          bun test
-          packages/app-core/platforms/electrobun/src/renderer-secure-store-authority.test.ts
+        run: |
+          bun test \
+            packages/app-core/platforms/electrobun/src/renderer-secure-store-authority.test.ts \
+            packages/app-core/platforms/electrobun/src/renderer-secure-store-transaction.test.ts \
+            packages/app-core/platforms/electrobun/src/renderer-secure-store-revisions.test.ts
 
       - name: Run wallet recovery retry regression tests
         if: steps.auth-diff.outputs.run == 'true'

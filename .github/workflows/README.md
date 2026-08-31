@@ -14,16 +14,17 @@ building plus linting and typechecking the affected workspace closure. When the
 Billing replay runtime workspace closure changes, it also runs the keyless,
 mock-backed payment replay Playwright proof and requires that job in the same
 aggregate. When the app/auth/session contract surface changes, a second keyless
-lane runs the shared-session, native secure-store, and wallet-retry regressions,
+lane runs the shared-session, native secure-store authority/transaction/revision,
+and wallet-retry regressions,
 then exercises the production-mode hosted-wallet boundary and the explicitly
 test-authenticated CLI completion flow against the exact candidate. A
 supplemental test-auth pass preserves the managed-login and Cloud Console route
 coverage that cannot execute against the production-auth renderer. Every
 targeted browser proof emits JSON that must contain its exact expected per-file
 pass count with zero skips; a Playwright exit that asserted nothing is rejected.
-The lane has no live provider credential and does not run scenarios, devices, deployments, or
-destructive effects. New commits cancel stale work for the same pull request or
-merge group.
+The lane has no live provider credential and does not run scenarios, devices,
+deployments, or destructive effects. New commits cancel stale work for the same
+pull request or merge group.
 
 `develop-full.yml` is the sole develop-push workflow. Its stable concurrency
 group cancels the complete read-only graph for a superseded tip, delegates each

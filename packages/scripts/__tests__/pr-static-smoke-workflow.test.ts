@@ -184,8 +184,11 @@ describe("PR Static Smoke workflow", () => {
       expect.arrayContaining([
         "packages/app",
         "packages/app-core",
+        "packages/auth",
+        "packages/cloud",
         "packages/shared",
         "packages/ui",
+        "patches",
         ".github/workflows/pr-static-smoke.yml",
         ".github/workflows/scenario-pr.yml",
       ]),
@@ -196,10 +199,18 @@ describe("PR Static Smoke workflow", () => {
     ).toContain(
       "bun run --cwd packages/shared test -- src/steward-session-client/index.test.ts",
     );
-    expect(
-      requireStep(authJob, "Run native secure-store authority tests").run,
-    ).toContain(
-      "bun test packages/app-core/platforms/electrobun/src/renderer-secure-store-authority.test.ts",
+    const nativeSecureStore = requireStep(
+      authJob,
+      "Run native secure-store authority tests",
+    ).run;
+    expect(nativeSecureStore).toContain(
+      "packages/app-core/platforms/electrobun/src/renderer-secure-store-authority.test.ts",
+    );
+    expect(nativeSecureStore).toContain(
+      "packages/app-core/platforms/electrobun/src/renderer-secure-store-transaction.test.ts",
+    );
+    expect(nativeSecureStore).toContain(
+      "packages/app-core/platforms/electrobun/src/renderer-secure-store-revisions.test.ts",
     );
     expect(
       requireStep(authJob, "Run wallet recovery retry regression tests").run,
